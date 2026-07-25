@@ -62,9 +62,9 @@ mod build_info;
 mod checksum;
 mod cli;
 mod client;
-// Consumed by the experimental pure-client run path wired in a later stage
-// of #20; until then only unit tests exercise this module.
-#[cfg_attr(not(test), allow(dead_code))]
+// The pure-client run path is unix-only; Windows compiles the mirror for
+// future use but has no production consumer of it yet (#20).
+#[cfg_attr(windows, allow(dead_code))]
 mod client_state;
 mod config;
 mod detect;
@@ -401,6 +401,8 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # kitty_graphics = false
 # Save recent pane screen history across full server restarts.
 pane_history = false
+# Run the TUI as a pure client of the local server (unified protocol).
+# pure_client = false
 # While prefix mode is active, temporarily switch the macOS host input
 # source to an ASCII-capable keyboard layout so prefix commands register
 # even when a CJK IME is active, then restore the previous input source

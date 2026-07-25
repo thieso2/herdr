@@ -52,6 +52,35 @@ pub struct Tab {
 }
 
 impl Tab {
+    /// Plain-data tab projected from a remote session catalog: panes exist
+    /// as state only, with no local runtimes, and the event channel is a
+    /// dead end because no local PTY ever reports through it.
+    // Consumed only by the unix-only pure-client run path (#20).
+    #[cfg_attr(windows, allow(dead_code))]
+    pub(crate) fn client_projection(
+        number: usize,
+        custom_name: Option<String>,
+        root_pane: PaneId,
+        layout: TileLayout,
+        panes: HashMap<PaneId, PaneState>,
+        zoomed: bool,
+    ) -> Self {
+        let (events, _) = tokio::sync::mpsc::channel(1);
+        Self {
+            custom_name,
+            number,
+            root_pane,
+            layout,
+            panes,
+            #[cfg(test)]
+            runtimes: HashMap::new(),
+            zoomed,
+            events,
+            render_notify: Arc::new(tokio::sync::Notify::new()),
+            render_dirty: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+
     pub fn new(
         number: usize,
         initial_cwd: PathBuf,

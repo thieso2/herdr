@@ -200,6 +200,50 @@ pub struct Workspace {
     pub(crate) test_runtimes: HashMap<PaneId, TerminalRuntime>,
 }
 
+impl Workspace {
+    /// Plain-data workspace projected from a remote session catalog: labels
+    /// and metadata are server facts, so no local git probing or cwd
+    /// resolution runs, and the id mirrors the server's workspace id.
+    // Consumed only by the unix-only pure-client run path (#20).
+    #[cfg_attr(windows, allow(dead_code))]
+    pub(crate) fn client_projection(
+        id: String,
+        label: String,
+        tabs: Vec<Tab>,
+        active_tab: usize,
+        public_pane_numbers: HashMap<PaneId, usize>,
+    ) -> Self {
+        let identity_cwd = PathBuf::from("/");
+        let next_public_pane_number = public_pane_numbers
+            .values()
+            .max()
+            .map_or(1, |max| max.saturating_add(1));
+        let next_public_tab_number = tabs.len().saturating_add(1);
+        let active_tab = active_tab.min(tabs.len().saturating_sub(1));
+        Self {
+            id,
+            custom_name: Some(label),
+            identity_cwd: identity_cwd.clone(),
+            cached_identity_cwd: identity_cwd.clone(),
+            cached_auto_label: String::new(),
+            cached_git_status_key: identity_cwd,
+            cached_git_branch: None,
+            cached_git_ahead_behind: None,
+            cached_git_space: None,
+            worktree_space: None,
+            metadata_tokens: crate::metadata_tokens::MetadataTokens::default(),
+            metadata_token_sequences: HashMap::new(),
+            public_pane_numbers,
+            next_public_pane_number,
+            next_public_tab_number,
+            tabs,
+            active_tab,
+            #[cfg(test)]
+            test_runtimes: HashMap::new(),
+        }
+    }
+}
+
 impl Deref for Workspace {
     type Target = Tab;
 

@@ -41,11 +41,16 @@ use self::agent_detection::{
     DetectionScreenReadInput, PendingIdleConfirmation, ScreenDetectionPublishInput,
     AGENT_PENDING_IDLE_RECHECK, AGENT_STARTUP_GRACE_WINDOW,
 };
-use self::terminal::{GhosttyPaneTerminal, PaneTerminal};
+// The input-state projection is consumed only by the unix-only pure-client
+// run path (#20).
+#[cfg_attr(windows, allow(unused_imports))]
+pub(crate) use self::terminal::plain_terminal_input_state;
 pub(crate) use self::terminal::{
+    plain_terminal_cursor_state, plain_terminal_visible_hyperlinks, render_plain_terminal,
     TerminalDirtyPatch, TerminalDirtyPatchOutcome, TerminalReadSnapshot, TerminalTextMatch,
     TerminalTextPoint, TerminalWordMotion,
 };
+use self::terminal::{GhosttyPaneTerminal, PaneTerminal};
 pub use self::{
     state::PaneState,
     terminal::{InputState, ScrollMetrics, TerminalCursorState},

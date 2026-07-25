@@ -12,7 +12,10 @@
 
 pub(crate) mod catalog;
 pub(crate) mod chrome;
+pub(crate) mod compose;
 pub(crate) mod connection;
+#[cfg(unix)]
+pub(crate) mod run;
 
 use std::collections::BTreeMap;
 
@@ -72,6 +75,10 @@ impl RemoteMirror {
     /// Drops connection-scoped state when the session ends. Stream ids and
     /// replicas are meaningless across connections.
     pub(crate) fn connection_lost(&mut self, error: impl Into<String>) {
+        debug_assert!(
+            self.connection.is_connected() || self.replicas.is_empty(),
+            "streams must not outlive their connection"
+        );
         self.connection.connection_failed(error);
         self.replicas.clear();
         self.pane_streams.clear();
@@ -269,6 +276,9 @@ impl RemoteMirrors {
             .expect("local mirror always exists")
     }
 
+    // Multi-remote iteration is wired by the fleet client (#23); until then
+    // only tests walk the collection.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn iter(&self) -> impl Iterator<Item = &RemoteMirror> {
         self.mirrors.values()
     }

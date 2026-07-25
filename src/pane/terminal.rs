@@ -1940,6 +1940,194 @@ impl GhosttyPaneTerminal {
     }
 }
 
+/// Renders a plain replicated terminal (a bare ghostty [`Terminal`] with no
+/// [`GhosttyPaneCore`]) into a frame region. Used by the pure client for pane
+/// replicas: colors resolve without a host theme or initial defaults, and a
+/// fresh render state is built per call.
+pub(crate) fn render_plain_terminal(
+    terminal: &crate::ghostty::Terminal,
+    frame: &mut Frame,
+    area: Rect,
+) {
+    let Ok(mut render_state) = crate::ghostty::RenderState::new() else {
+        return;
+    };
+    if render_state.update(terminal).is_err() {
+        return;
+    }
+    let host_theme = crate::terminal_theme::TerminalTheme::default();
+    let colors = render_state.colors().ok();
+    let default_bg = colors.and_then(|c| ghostty_default_bg(c.background, host_theme, None));
+    let default_fg = colors.and_then(|c| ghostty_default_fg(c.foreground, host_theme, None));
+    let resolved_fg = colors.map(|c| ghostty_color(c.foreground));
+    let resolved_bg = colors.map(|c| ghostty_color(c.background));
+    let hide_kitty_placeholders = crate::kitty_graphics::is_enabled();
+
+    let Ok(mut row_iterator) = crate::ghostty::RowIterator::new() else {
+        return;
+    };
+    let Ok(mut row_cells) = crate::ghostty::RowCells::new() else {
+        return;
+    };
+    let buf = frame.buffer_mut();
+    let Ok(mut rows) = render_state.populate_row_iterator(&mut row_iterator) else {
+        return;
+    };
+    let mut grapheme_bytes = Vec::new();
+    let mut symbol_scratch = String::new();
+    let mut y = 0u16;
+    while y < area.height && rows.next() {
+        let Ok(mut cells) = rows.populate_cells(&mut row_cells) else {
+            break;
+        };
+        let mut x = 0u16;
+        while x < area.width && cells.next() {
+            let basic = cells.basic_data().unwrap_or_default();
+            let style = ghostty_cell_style(
+                &cells,
+                &basic,
+                default_fg,
+                default_bg,
+                resolved_fg,
+                resolved_bg,
+            );
+            let symbol = match ghostty_buffer_symbol_into(
+                &cells,
+                basic.wide,
+                hide_kitty_placeholders,
+                &mut grapheme_bytes,
+                &mut symbol_scratch,
+            ) {
+                Ok(symbol) => symbol,
+                Err(_) => {
+                    symbol_scratch.clear();
+                    symbol_scratch.push_str(ghostty_blank_symbol_for_width(basic.wide));
+                    symbol_scratch.as_str()
+                }
+            };
+            let cell = &mut buf[(area.x + x, area.y + y)];
+            cell.reset();
+            cell.set_symbol(symbol);
+            cell.set_style(style);
+            x += 1;
+        }
+        while x < area.width {
+            let cell = &mut buf[(area.x + x, area.y + y)];
+            ghostty_reset_cell(cell, default_fg, default_bg);
+            x += 1;
+        }
+        y += 1;
+    }
+    while y < area.height {
+        for x in 0..area.width {
+            let cell = &mut buf[(area.x + x, area.y + y)];
+            ghostty_reset_cell(cell, default_fg, default_bg);
+        }
+        y += 1;
+    }
+}
+
+/// Input-affecting terminal modes of a plain replicated terminal, shaped
+/// like the pane runtime's [`InputState`] so client-side input encoding can
+/// route keys, paste, and mouse the same way.
+// Consumed only by the unix-only pure-client run path (#20).
+#[cfg_attr(windows, allow(dead_code))]
+pub(crate) fn plain_terminal_input_state(
+    terminal: &crate::ghostty::Terminal,
+) -> Option<InputState> {
+    let alternate_screen =
+        terminal.active_screen().ok()? == crate::ghostty::ActiveScreen::Alternate;
+    let application_cursor = terminal
+        .mode_get(crate::ghostty::MODE_APPLICATION_CURSOR_KEYS)
+        .ok()?;
+    let bracketed_paste = terminal
+        .mode_get(crate::ghostty::MODE_BRACKETED_PASTE)
+        .ok()?;
+    let focus_reporting = terminal.mode_get(crate::ghostty::MODE_FOCUS_EVENT).ok()?;
+    let mouse_sgr = terminal.mode_get(crate::ghostty::MODE_MOUSE_SGR).ok()?;
+    let mouse_utf8 = terminal.mode_get(crate::ghostty::MODE_MOUSE_UTF8).ok()?;
+    let mouse_alternate_scroll = terminal
+        .mode_get(crate::ghostty::MODE_MOUSE_ALTERNATE_SCROLL)
+        .ok()?;
+    let mouse_protocol_mode = if terminal.mode_get(MODE_MOUSE_ANY_MOTION).ok()? {
+        crate::input::MouseProtocolMode::AnyMotion
+    } else if terminal.mode_get(MODE_MOUSE_BUTTON_MOTION).ok()? {
+        crate::input::MouseProtocolMode::ButtonMotion
+    } else if terminal.mode_get(MODE_MOUSE_PRESS_RELEASE).ok()? {
+        crate::input::MouseProtocolMode::PressRelease
+    } else if terminal.mode_get(MODE_MOUSE_X10).ok()? {
+        crate::input::MouseProtocolMode::Press
+    } else {
+        crate::input::MouseProtocolMode::None
+    };
+    let mouse_protocol_encoding = if mouse_sgr {
+        crate::input::MouseProtocolEncoding::Sgr
+    } else if mouse_utf8 {
+        crate::input::MouseProtocolEncoding::Utf8
+    } else {
+        crate::input::MouseProtocolEncoding::Default
+    };
+    Some(InputState {
+        alternate_screen,
+        application_cursor,
+        bracketed_paste,
+        focus_reporting,
+        mouse_protocol_mode,
+        mouse_protocol_encoding,
+        mouse_alternate_scroll,
+        modify_other_keys: false,
+    })
+}
+
+/// Cursor state of a plain replicated terminal.
+pub(crate) fn plain_terminal_cursor_state(
+    terminal: &crate::ghostty::Terminal,
+) -> Option<TerminalCursorState> {
+    let mut render_state = crate::ghostty::RenderState::new().ok()?;
+    render_state.update(terminal).ok()?;
+    let cursor = render_state.cursor_viewport().ok()??;
+    Some(TerminalCursorState {
+        x: cursor.x,
+        y: cursor.y,
+        visible: render_state.cursor_visible().ok()?,
+        shape: 0,
+    })
+}
+
+/// Visible OSC 8 hyperlinks of a plain replicated terminal.
+pub(crate) fn plain_terminal_visible_hyperlinks(
+    terminal: &crate::ghostty::Terminal,
+    area: Rect,
+) -> Vec<((u16, u16), String, String)> {
+    fn collect(
+        terminal: &crate::ghostty::Terminal,
+        area: Rect,
+    ) -> Result<VisibleHyperlinks, crate::ghostty::Error> {
+        let mut render_state = crate::ghostty::RenderState::new()?;
+        render_state.update(terminal)?;
+        let mut row_iterator = crate::ghostty::RowIterator::new()?;
+        let mut row_cells = crate::ghostty::RowCells::new()?;
+        let mut rows = render_state.populate_row_iterator(&mut row_iterator)?;
+        let mut links = Vec::new();
+        let mut y = 0u16;
+        while y < area.height && rows.next() {
+            let mut cells = rows.populate_cells(&mut row_cells)?;
+            let mut x = 0u16;
+            while x < area.width && cells.next() {
+                if cells.has_hyperlink()? {
+                    if let Some(uri) = terminal.viewport_hyperlink_uri(x, y.into())? {
+                        links.push(((area.x + x, area.y + y), ghostty_cell_symbol(&cells)?, uri));
+                    }
+                }
+                x += 1;
+            }
+            y += 1;
+        }
+        Ok(links)
+    }
+    collect(terminal, area).unwrap_or_default()
+}
+
 fn encoded_key_preserves_event_kind(
     bytes: &[u8],
     key: crate::input::TerminalKey,

@@ -1084,6 +1084,12 @@
           "description": "Persist pane screen history to session-history.json."
         },
         {
+          "key": "experimental.pure_client",
+          "type": "boolean",
+          "default": "false",
+          "description": "Run the TUI as a pure client of the local server: the sidebar is driven by the server's session catalog, pane content renders from streamed replicas, and input is interpreted client-side into control-plane methods."
+        },
+        {
           "key": "experimental.reveal_hidden_cursor_for_cjk_ime",
           "type": "boolean",
           "default": "false",

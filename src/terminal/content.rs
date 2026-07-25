@@ -83,6 +83,56 @@ impl PaneContent for TerminalRuntime {
     }
 }
 
+impl PaneContent for super::replica::PaneReplica {
+    fn render(&self, frame: &mut Frame, area: Rect, _show_cursor: bool) {
+        crate::pane::render_plain_terminal(self.terminal(), frame, area);
+    }
+
+    fn cursor_state(
+        &self,
+        area: Rect,
+        show_cursor: bool,
+    ) -> Option<crate::pane::TerminalCursorState> {
+        if !show_cursor {
+            return None;
+        }
+        let cursor = crate::pane::plain_terminal_cursor_state(self.terminal())?;
+        if cursor.x >= area.width || cursor.y >= area.height {
+            return None;
+        }
+        Some(cursor)
+    }
+
+    fn scroll_metrics(&self) -> Option<crate::pane::ScrollMetrics> {
+        super::replica::PaneReplica::scroll_metrics(self).ok()
+    }
+
+    fn synchronized_output_active(&self) -> bool {
+        self.terminal()
+            .mode_get(crate::ghostty::MODE_SYNCHRONIZED_OUTPUT)
+            .unwrap_or(false)
+    }
+
+    fn visible_hyperlinks(&self, area: Rect) -> Vec<((u16, u16), String, String)> {
+        crate::pane::plain_terminal_visible_hyperlinks(self.terminal(), area)
+    }
+
+    fn text_matches_are_current(
+        &self,
+        text_matches: &[crate::pane::TerminalTextMatch],
+    ) -> Vec<bool> {
+        // Copy-mode search runs against live runtimes only; a replica has no
+        // search index yet, so no candidate can be confirmed current.
+        vec![false; text_matches.len()]
+    }
+
+    fn cwd(&self) -> Option<std::path::PathBuf> {
+        // The catalog carries the pane cwd as a server fact; the replica has
+        // no live process to ask.
+        None
+    }
+}
+
 /// Lookup of read-only pane content by durable terminal id.
 pub(crate) trait PaneContentSource {
     fn pane_content(&self, terminal_id: &TerminalId) -> Option<&dyn PaneContent>;

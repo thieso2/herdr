@@ -1882,10 +1882,14 @@ pub fn key_matches(
 // Test helpers
 // ---------------------------------------------------------------------------
 
-#[cfg(test)]
 impl AppState {
-    /// Create an AppState for testing — no channels, no PTYs.
-    pub fn test_new() -> Self {
+    /// Plain empty AppState with default chrome and the dark palette — no
+    /// channels, no PTYs. Base state for tests, and for the pure client,
+    /// which projects the server catalog into it and applies config-derived
+    /// presentation on top.
+    // Consumed in production only by the unix-only pure-client run path (#20).
+    #[cfg_attr(windows, allow(dead_code))]
+    pub(crate) fn empty() -> Self {
         Self {
             terminals: std::collections::HashMap::new(),
             direct_attach_resize_locks: std::collections::HashSet::new(),
@@ -2053,7 +2057,14 @@ impl AppState {
             terminal_runtime_shutdowns: Vec::new(),
         }
     }
+}
 
+#[cfg(test)]
+impl AppState {
+    /// Create an AppState for testing — no channels, no PTYs.
+    pub fn test_new() -> Self {
+        Self::empty()
+    }
     /// Populate missing `TerminalState` entries for every pane so tests that
     /// read or write terminal metadata don't need to manually create them.
     pub fn ensure_test_terminals(&mut self) {

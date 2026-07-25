@@ -885,6 +885,11 @@ pub struct ExperimentalConfig {
     pub kitty_graphics: bool,
     /// Persist pane screen history to session-history.json. Default: false.
     pub pane_history: bool,
+    /// Run the TUI as a pure client of the local server: the sidebar is
+    /// driven by the server's session catalog, pane content renders from
+    /// streamed replicas, and input is interpreted client-side into
+    /// control-plane methods. Default: false.
+    pub pure_client: bool,
     /// Expose the focused pane's cursor anchor to the outer terminal even when
     /// the pane requested `?25l`, so macOS native input methods keep tracking
     /// the candidate window when TUIs paint their own cursor (Claude Code, pi,

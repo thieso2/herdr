@@ -14,7 +14,7 @@
 
 mod framed_attach;
 mod host_terminal;
-mod input;
+pub(crate) mod input;
 
 use std::collections::HashSet;
 use std::io::{self, BufRead, Write as _};
@@ -487,7 +487,7 @@ fn do_handshake(
 // ---------------------------------------------------------------------------
 
 /// Internal events for the client event loop.
-enum ClientLoopEvent {
+pub(crate) enum ClientLoopEvent {
     /// Raw input bytes from stdin.
     #[cfg(unix)]
     StdinInput(Vec<u8>),
@@ -934,6 +934,12 @@ fn run_client_with_mode(
     init_logging();
 
     let loaded_config = crate::config::Config::load();
+    #[cfg(unix)]
+    if attach_request.is_none()
+        && crate::client_state::run::pure_client_enabled(&loaded_config.config)
+    {
+        return crate::client_state::run::run_pure_client(&loaded_config.config);
+    }
     crate::terminal_modes::clear_host_mouse_reporting(&mut io::stdout())?;
     let mouse_capture = loaded_config.config.ui.mouse_capture;
     let mouse_scroll_lines = loaded_config.config.ui.mouse_scroll_lines();
@@ -1913,7 +1919,7 @@ fn current_terminal_geometry(kitty_graphics_enabled: bool) -> (u16, u16, u32, u3
 }
 
 /// Polls the terminal size and sends resize events when it changes.
-fn resize_poll_loop(
+pub(crate) fn resize_poll_loop(
     resize_tx: tokio::sync::mpsc::Sender<ClientLoopEvent>,
     initial_cols: u16,
     initial_rows: u16,

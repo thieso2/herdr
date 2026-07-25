@@ -48,15 +48,31 @@ const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
 /// Idle poll tick of the run loop.
 const LOOP_TICK: Duration = Duration::from_millis(30);
 
+/// Release default of the pure-client mode when `[experimental]
+/// pure_client` is not set explicitly.
+///
+/// FLIP PROCEDURE (release-gated): after the pure client has soaked on at
+/// least two preview releases, flip this constant to `true` in its own
+/// commit ("feat: default the tui to the pure client"). Nothing else
+/// changes: an explicit `pure_client = true`/`false` in the user's config
+/// always wins over this default (see [`pure_client_enabled`]), so early
+/// adopters and opt-outs keep their behavior, and the legacy path remains
+/// reachable with `pure_client = false` until it is deleted. Windows keeps
+/// ignoring the flag entirely (`run_client_with_mode` only consults it on
+/// unix) — flipping this constant does not change Windows behavior.
+pub(crate) const PURE_CLIENT_DEFAULT: bool = false;
+
 /// Whether the pure-client run path is enabled for this process.
 ///
-/// `HERDR_PURE_CLIENT=1`/`0` overrides the `[experimental] pure_client`
-/// config flag, following the `HERDR_RENDER_ENCODING` override precedent.
+/// Resolution order: `HERDR_PURE_CLIENT=1`/`0` (test/dev override,
+/// following the `HERDR_RENDER_ENCODING` precedent) beats the explicit
+/// `[experimental] pure_client` setting, which beats
+/// [`PURE_CLIENT_DEFAULT`].
 pub(crate) fn pure_client_enabled(config: &crate::config::Config) -> bool {
     match std::env::var("HERDR_PURE_CLIENT") {
         Ok(value) if value == "1" => true,
         Ok(value) if value == "0" => false,
-        _ => config.experimental.pure_client,
+        _ => config.experimental.pure_client.unwrap_or(PURE_CLIENT_DEFAULT),
     }
 }
 
@@ -1574,6 +1590,35 @@ mod tests {
             &mut app,
         );
         assert!(app.should_quit);
+    }
+
+    #[test]
+    fn pure_client_default_resolution_honors_explicit_setting() {
+        // nextest runs each test in its own process, so env mutation here
+        // cannot race other tests.
+        std::env::remove_var("HERDR_PURE_CLIENT");
+        let mut config = crate::config::Config::default();
+        assert_eq!(
+            config.experimental.pure_client, None,
+            "unset by default so the release default applies"
+        );
+        assert_eq!(pure_client_enabled(&config), PURE_CLIENT_DEFAULT);
+        assert!(!PURE_CLIENT_DEFAULT, "default stays legacy until the flip");
+
+        // An explicit user setting always wins over the release default —
+        // in both directions, so opt-ins and opt-outs survive the flip.
+        config.experimental.pure_client = Some(true);
+        assert!(pure_client_enabled(&config));
+        config.experimental.pure_client = Some(false);
+        assert!(!pure_client_enabled(&config));
+
+        // The env override beats even explicit settings (test/dev hook).
+        std::env::set_var("HERDR_PURE_CLIENT", "1");
+        assert!(pure_client_enabled(&config));
+        config.experimental.pure_client = Some(true);
+        std::env::set_var("HERDR_PURE_CLIENT", "0");
+        assert!(!pure_client_enabled(&config));
+        std::env::remove_var("HERDR_PURE_CLIENT");
     }
 
     #[tokio::test]

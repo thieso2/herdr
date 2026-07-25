@@ -402,6 +402,8 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # Save recent pane screen history across full server restarts.
 pane_history = false
 # Run the TUI as a pure client of the local server (unified protocol).
+# Unset uses the release default (currently the legacy client path); an
+# explicit true/false pins your choice across default changes.
 # pure_client = false
 # While prefix mode is active, temporarily switch the macOS host input
 # source to an ASCII-capable keyboard layout so prefix commands register

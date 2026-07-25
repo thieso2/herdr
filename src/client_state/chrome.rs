@@ -19,6 +19,12 @@ pub(crate) struct GlobalChrome {
     /// One-line connection status surfaced while the remote is not
     /// connected (connecting, offline with retry, or incompatible).
     pub(crate) connection_status: Option<String>,
+    /// Which remotes are in view and which remote holds the focus. Pure
+    /// presentation: never affects connections.
+    pub(crate) selection: super::fleet_view::FleetSelection,
+    /// Last window title pushed by each remote; the focused remote's title
+    /// wins the host terminal.
+    pub(crate) window_titles: std::collections::BTreeMap<usize, String>,
 }
 
 impl GlobalChrome {

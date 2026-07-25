@@ -36,45 +36,59 @@ pub(super) fn dispatch_prefix_intent(
         return;
     }
 
-    let Some(method) = prefix_intent_method(key, mirrors, ids, app) else {
+    let Some((_remote, method)) = prefix_intent_method(key, mirrors, ids, app) else {
         return;
     };
     super::run::send_api_request(link, method);
 }
 
-/// The JSON API method a prefix-mode key maps to, if any. Pure: reads the
-/// keybinds, the composed state, and the catalog.
+/// The owning remote and JSON API method a prefix-mode key maps to, if any.
+/// Pure: reads the keybinds, the composed state, and the owning remote's
+/// catalog. Spaces, tabs, and panes belong to exactly one remote, so every
+/// method targets the remote that owns the focused space or pane; creation
+/// goes to the same owner (the focused context).
 pub(super) fn prefix_intent_method(
     key: TerminalKey,
     mirrors: &RemoteMirrors,
     ids: &ComposeIds,
     app: &AppState,
-) -> Option<Method> {
-    let catalog = &mirrors.local().catalog;
+) -> Option<(usize, Method)> {
+    let target_remote =
+        super::fleet_view::creation_target_remote(app, ids, super::LOCAL_REMOTE_INDEX);
+    let catalog = &mirrors.get(target_remote)?.catalog;
     let keybinds = &app.keybinds;
+    // Control-plane calls carry the remote's own public ids, never the
+    // composed (remote-scoped) ids.
     let focused_workspace = app
         .active
-        .and_then(|idx| app.workspaces.get(idx))
-        .map(|ws| ws.id.clone());
+        .and_then(|ws_idx| ids.workspace_owner(ws_idx))
+        .map(|(_, public)| public.to_owned());
     let focused_pane = app
         .active
         .and_then(|idx| app.workspaces.get(idx))
         .and_then(|ws| ws.focused_pane_id())
         .and_then(|pane_id| ids.public_pane_id(pane_id))
-        .map(str::to_owned);
+        .filter(|(remote, _)| *remote == target_remote)
+        .map(|(_, public)| public.to_owned());
 
     if keybinds.new_workspace.matches_prefix_key(key) {
-        return Some(Method::WorkspaceCreate(WorkspaceCreateParams {
-            cwd: None,
-            focus: true,
-            label: None,
-            env: Default::default(),
-        }));
+        return Some((
+            target_remote,
+            Method::WorkspaceCreate(WorkspaceCreateParams {
+                cwd: None,
+                focus: true,
+                label: None,
+                env: Default::default(),
+            }),
+        ));
     }
     if keybinds.close_workspace.matches_prefix_key(key) {
-        return Some(Method::WorkspaceClose(WorkspaceTarget {
-            workspace_id: focused_workspace?,
-        }));
+        return Some((
+            target_remote,
+            Method::WorkspaceClose(WorkspaceTarget {
+                workspace_id: focused_workspace?,
+            }),
+        ));
     }
     if keybinds.previous_workspace.matches_prefix_key(key)
         || keybinds.next_workspace.matches_prefix_key(key)
@@ -94,18 +108,24 @@ pub(super) fn prefix_intent_method(
         } else {
             ordered.get(position - 1)?
         };
-        return Some(Method::WorkspaceFocus(WorkspaceTarget {
-            workspace_id: (*target).to_owned(),
-        }));
+        return Some((
+            target_remote,
+            Method::WorkspaceFocus(WorkspaceTarget {
+                workspace_id: (*target).to_owned(),
+            }),
+        ));
     }
     if keybinds.new_tab.matches_prefix_key(key) {
-        return Some(Method::TabCreate(TabCreateParams {
-            workspace_id: focused_workspace,
-            cwd: None,
-            focus: true,
-            label: None,
-            env: Default::default(),
-        }));
+        return Some((
+            target_remote,
+            Method::TabCreate(TabCreateParams {
+                workspace_id: focused_workspace,
+                cwd: None,
+                focus: true,
+                label: None,
+                env: Default::default(),
+            }),
+        ));
     }
     if keybinds.previous_tab.matches_prefix_key(key) || keybinds.next_tab.matches_prefix_key(key) {
         let forward = keybinds.next_tab.matches_prefix_key(key);
@@ -125,16 +145,22 @@ pub(super) fn prefix_intent_method(
         } else {
             tabs.get(position - 1)?
         };
-        return Some(Method::TabFocus(TabTarget {
-            tab_id: (*target).to_owned(),
-        }));
+        return Some((
+            target_remote,
+            Method::TabFocus(TabTarget {
+                tab_id: (*target).to_owned(),
+            }),
+        ));
     }
     if keybinds.close_tab.matches_prefix_key(key) {
         let workspace_id = focused_workspace?;
         let workspace = catalog.workspace(&workspace_id)?;
-        return Some(Method::TabClose(TabTarget {
-            tab_id: workspace.active_tab_id.clone(),
-        }));
+        return Some((
+            target_remote,
+            Method::TabClose(TabTarget {
+                tab_id: workspace.active_tab_id.clone(),
+            }),
+        ));
     }
     if keybinds.split_horizontal.matches_prefix_key(key)
         || keybinds.split_vertical.matches_prefix_key(key)
@@ -146,26 +172,35 @@ pub(super) fn prefix_intent_method(
         } else {
             SplitDirection::Down
         };
-        return Some(Method::PaneSplit(PaneSplitParams {
-            workspace_id: None,
-            target_pane_id: focused_pane,
-            direction,
-            ratio: None,
-            cwd: None,
-            focus: true,
-            env: Default::default(),
-        }));
+        return Some((
+            target_remote,
+            Method::PaneSplit(PaneSplitParams {
+                workspace_id: None,
+                target_pane_id: focused_pane,
+                direction,
+                ratio: None,
+                cwd: None,
+                focus: true,
+                env: Default::default(),
+            }),
+        ));
     }
     if keybinds.close_pane.matches_prefix_key(key) {
-        return Some(Method::PaneClose(PaneTarget {
-            pane_id: focused_pane?,
-        }));
+        return Some((
+            target_remote,
+            Method::PaneClose(PaneTarget {
+                pane_id: focused_pane?,
+            }),
+        ));
     }
     if keybinds.zoom.matches_prefix_key(key) {
-        return Some(Method::PaneZoom(PaneZoomParams {
-            pane_id: focused_pane,
-            mode: Default::default(),
-        }));
+        return Some((
+            target_remote,
+            Method::PaneZoom(PaneZoomParams {
+                pane_id: focused_pane,
+                mode: Default::default(),
+            }),
+        ));
     }
     for (bind, direction) in [
         (&keybinds.focus_pane_left, PaneDirection::Left),
@@ -174,10 +209,13 @@ pub(super) fn prefix_intent_method(
         (&keybinds.focus_pane_right, PaneDirection::Right),
     ] {
         if bind.matches_prefix_key(key) {
-            return Some(Method::PaneFocusDirection(PaneFocusDirectionParams {
-                pane_id: focused_pane,
-                direction,
-            }));
+            return Some((
+                target_remote,
+                Method::PaneFocusDirection(PaneFocusDirectionParams {
+                    pane_id: focused_pane,
+                    direction,
+                }),
+            ));
         }
     }
     None
@@ -209,54 +247,68 @@ pub(super) fn dispatch_mouse_intent(
         app.mode = mode_before;
         app.context_menu = None;
     }
-    let Some(method) = mouse_intent_method(action, mirrors, ids, app) else {
+    let Some((_remote, method)) = mouse_intent_method(action, mirrors, ids, app) else {
         return;
     };
     super::run::send_api_request(link, method);
 }
 
-/// The JSON API method a resolved chrome mouse action maps to, if any.
+/// The owning remote and JSON API method a resolved chrome mouse action
+/// maps to, if any. Focus actions target the clicked entity's owner;
+/// creation targets the remote owning the focused context.
 pub(super) fn mouse_intent_method(
     action: Option<crate::app::MouseAction>,
     mirrors: &RemoteMirrors,
     ids: &ComposeIds,
     app: &AppState,
-) -> Option<Method> {
-    let catalog = &mirrors.local().catalog;
+) -> Option<(usize, Method)> {
     match action? {
         crate::app::MouseAction::NewWorkspace => {
-            Some(Method::WorkspaceCreate(WorkspaceCreateParams {
-                cwd: None,
-                focus: true,
-                label: None,
-                env: Default::default(),
-            }))
+            let remote =
+                super::fleet_view::creation_target_remote(app, ids, super::LOCAL_REMOTE_INDEX);
+            Some((
+                remote,
+                Method::WorkspaceCreate(WorkspaceCreateParams {
+                    cwd: None,
+                    focus: true,
+                    label: None,
+                    env: Default::default(),
+                }),
+            ))
         }
         crate::app::MouseAction::FocusWorkspace { ws_idx } => {
-            let workspace = app.workspaces.get(ws_idx)?;
-            Some(Method::WorkspaceFocus(WorkspaceTarget {
-                workspace_id: workspace.id.clone(),
-            }))
+            let (remote, public) = ids.workspace_owner(ws_idx)?;
+            Some((
+                remote,
+                Method::WorkspaceFocus(WorkspaceTarget {
+                    workspace_id: public.to_owned(),
+                }),
+            ))
         }
         crate::app::MouseAction::FocusTab { tab_idx } => {
-            let workspace = app.active.and_then(|idx| app.workspaces.get(idx))?;
+            let ws_idx = app.active?;
+            let (remote, workspace_public) = ids.workspace_owner(ws_idx)?;
+            let catalog = &mirrors.get(remote)?.catalog;
             // The composed tab bar skips tabs with no panes (compose_into),
             // so the hit-tested index must be resolved against the same
-            // filtered view of the catalog.
+            // filtered view of the owning remote's catalog.
             let tab_id = catalog
                 .tabs
                 .iter()
-                .filter(|tab| tab.workspace_id == workspace.id)
+                .filter(|tab| tab.workspace_id == workspace_public)
                 .filter(|tab| catalog.panes.iter().any(|pane| pane.tab_id == tab.tab_id))
                 .nth(tab_idx)
                 .map(|tab| tab.tab_id.clone())?;
-            Some(Method::TabFocus(TabTarget { tab_id }))
+            Some((remote, Method::TabFocus(TabTarget { tab_id })))
         }
         crate::app::MouseAction::FocusPane { pane_id, .. } => {
-            let public = ids.public_pane_id(pane_id)?;
-            Some(Method::PaneFocus(PaneTarget {
-                pane_id: public.to_owned(),
-            }))
+            let (remote, public) = ids.public_pane_id(pane_id)?;
+            Some((
+                remote,
+                Method::PaneFocus(PaneTarget {
+                    pane_id: public.to_owned(),
+                }),
+            ))
         }
         // Everything else (drag reordering, split-ratio drags, modals,
         // context menus, settings) stays unsupported under the flag for now.
@@ -295,31 +347,35 @@ mod tests {
 
         // Default binds: c = new tab, % / " = splits, x = close pane,
         // arrows = pane focus (all through the configured keybinds).
-        let method = prefix_intent_method(key(KeyCode::Char('c')), &mirrors, &ids, &app)
+        let (remote, method) = prefix_intent_method(key(KeyCode::Char('c')), &mirrors, &ids, &app)
             .expect("new tab intent");
+        assert_eq!(remote, 0, "adversarial fixture is local-only");
         let Method::TabCreate(params) = method else {
             panic!("expected tab.create, got {method:?}");
         };
         assert_eq!(params.workspace_id.as_deref(), Some("ws_2"));
         assert!(params.focus);
 
-        let method = prefix_intent_method(key(KeyCode::Char('v')), &mirrors, &ids, &app)
+        let (remote, method) = prefix_intent_method(key(KeyCode::Char('v')), &mirrors, &ids, &app)
             .expect("split intent");
+        assert_eq!(remote, 0, "adversarial fixture is local-only");
         let Method::PaneSplit(params) = method else {
             panic!("expected pane.split, got {method:?}");
         };
         assert_eq!(params.direction, SplitDirection::Right);
         assert_eq!(params.target_pane_id.as_deref(), Some("p_2_1"));
 
-        let method = prefix_intent_method(key(KeyCode::Char('x')), &mirrors, &ids, &app)
+        let (remote, method) = prefix_intent_method(key(KeyCode::Char('x')), &mirrors, &ids, &app)
             .expect("close pane intent");
+        assert_eq!(remote, 0, "adversarial fixture is local-only");
         let Method::PaneClose(target) = method else {
             panic!("expected pane.close, got {method:?}");
         };
         assert_eq!(target.pane_id, "p_2_1");
 
-        let method = prefix_intent_method(key(KeyCode::Char('l')), &mirrors, &ids, &app)
+        let (remote, method) = prefix_intent_method(key(KeyCode::Char('l')), &mirrors, &ids, &app)
             .expect("focus direction intent");
+        assert_eq!(remote, 0, "adversarial fixture is local-only");
         let Method::PaneFocusDirection(params) = method else {
             panic!("expected pane.focus_direction, got {method:?}");
         };
@@ -331,8 +387,9 @@ mod tests {
         let (mirrors, ids, mut app) = composed();
         // next_workspace is unbound by default; bind it like a user would.
         app.keybinds.next_workspace = crate::config::ActionKeybinds::prefix("n");
-        let method = prefix_intent_method(key(KeyCode::Char('n')), &mirrors, &ids, &app)
+        let (remote, method) = prefix_intent_method(key(KeyCode::Char('n')), &mirrors, &ids, &app)
             .expect("next workspace intent");
+        assert_eq!(remote, 0, "adversarial fixture is local-only");
         let Method::WorkspaceFocus(target) = method else {
             panic!("expected workspace.focus, got {method:?}");
         };
@@ -366,13 +423,14 @@ mod tests {
 
         // The composed tab bar shows only t_2_1, at index 0; clicking it must
         // not resolve to the invisible empty tab.
-        let method = mouse_intent_method(
+        let (remote, method) = mouse_intent_method(
             Some(MouseAction::FocusTab { tab_idx: 0 }),
             &mirrors,
             &ids,
             &app,
         )
         .expect("tab focus intent");
+        assert_eq!(remote, 0, "adversarial fixture is local-only");
         let Method::TabFocus(target) = method else {
             panic!("expected tab.focus, got {method:?}");
         };
@@ -407,13 +465,14 @@ mod tests {
     fn mouse_focus_actions_map_to_control_plane_methods() {
         let (mirrors, ids, app) = composed();
 
-        let method = mouse_intent_method(
+        let (remote, method) = mouse_intent_method(
             Some(MouseAction::FocusWorkspace { ws_idx: 1 }),
             &mirrors,
             &ids,
             &app,
         )
         .expect("workspace focus intent");
+        assert_eq!(remote, 0, "adversarial fixture is local-only");
         let Method::WorkspaceFocus(target) = method else {
             panic!("expected workspace.focus, got {method:?}");
         };
@@ -422,13 +481,14 @@ mod tests {
         let pane_id = app.workspaces[0]
             .focused_pane_id()
             .expect("composed focused pane");
-        let method = mouse_intent_method(
+        let (remote, method) = mouse_intent_method(
             Some(MouseAction::FocusPane { ws_idx: 0, pane_id }),
             &mirrors,
             &ids,
             &app,
         )
         .expect("pane focus intent");
+        assert_eq!(remote, 0, "adversarial fixture is local-only");
         let Method::PaneFocus(target) = method else {
             panic!("expected pane.focus, got {method:?}");
         };

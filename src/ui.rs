@@ -13,6 +13,7 @@ mod navigator;
 mod onboarding;
 mod panes;
 mod release_notes;
+mod remote_chips;
 mod scrollbar;
 mod settings;
 mod sidebar;
@@ -47,6 +48,8 @@ pub(crate) use self::release_notes::{
     RELEASE_NOTES_MODAL_SIZE,
 };
 use self::release_notes::{render_product_announcement_overlay, render_release_notes_overlay};
+pub(crate) use self::remote_chips::remote_chip_at;
+use self::remote_chips::{render_remote_chip_strip, split_sidebar_for_chip_strip};
 pub(crate) use self::scrollbar::{
     pane_scrollbar_rect, release_notes_scrollbar_rect, scrollbar_offset_from_drag_row,
     scrollbar_offset_from_row, scrollbar_thumb_grab_offset, should_show_scrollbar,
@@ -220,6 +223,12 @@ fn compute_view_internal(
     let [sidebar_area, main_area] =
         Layout::horizontal([Constraint::Length(sidebar_w), Constraint::Min(1)]).areas(area);
 
+    // Fleet chip strip: reserve rows atop the sidebar. `remote_chips` is
+    // only populated by the pure client's fleet composition, so every other
+    // path keeps today's geometry untouched.
+    let (chip_strip, sidebar_area) =
+        split_sidebar_for_chip_strip(&app.remote_chips, sidebar_area, app.sidebar_collapsed);
+
     let (tab_bar_rect, terminal_area) = app
         .active
         .and_then(|i| app.workspaces.get(i))
@@ -285,6 +294,9 @@ fn compute_view_internal(
     app.view = crate::app::ViewState {
         layout: ViewLayout::Desktop,
         sidebar_rect: sidebar_area,
+        remote_chip_strip_rect: chip_strip.strip_rect,
+        remote_chip_hit_areas: chip_strip.chip_hit_areas,
+        remote_add_hit_area: chip_strip.add_hit_area,
         workspace_card_areas,
         tab_bar_rect,
         tab_hit_areas: tab_bar_view.tab_hit_areas,
@@ -343,6 +355,9 @@ fn compute_mobile_view(
     app.view = crate::app::ViewState {
         layout: ViewLayout::Mobile,
         sidebar_rect: Rect::default(),
+        remote_chip_strip_rect: Rect::default(),
+        remote_chip_hit_areas: Vec::new(),
+        remote_add_hit_area: Rect::default(),
         workspace_card_areas: Vec::new(),
         tab_bar_rect: Rect::default(),
         tab_hit_areas: Vec::new(),
@@ -374,6 +389,7 @@ pub fn render_with_content(app: &AppState, content: &dyn PaneContentSource, fram
     if app.view.layout == ViewLayout::Mobile {
         render_mobile_header(app, content, frame, app.view.mobile_header_rect);
     } else if sidebar_area.width > 0 {
+        render_remote_chip_strip(app, frame);
         if app.sidebar_collapsed {
             render_sidebar_collapsed(app, frame, sidebar_area);
         } else {
@@ -584,6 +600,12 @@ mod tests {
     fn characterization_app_state() -> AppState {
         let mut workspace = Workspace::test_new("characterization");
         workspace.identity_cwd = std::path::PathBuf::from("characterization");
+        // Pin the git-derived fields: `Workspace::test_new` probes the
+        // checkout the tests run in, so the branch name of the developer's
+        // worktree would otherwise leak into the characterized pixels.
+        workspace.cached_git_branch = Some("characterize/branch".to_string());
+        workspace.cached_git_ahead_behind = None;
+        workspace.cached_git_space = None;
         workspace.test_add_tab(Some("logs"));
         workspace.switch_tab(0);
         let left = workspace.tabs[0].root_pane;
@@ -624,7 +646,7 @@ mod tests {
         assert!(all.contains("characterization"), "rows: {all}");
         assert_eq!(
             digest,
-            "9e86729386f43cdcb705a7d0ee93c6b16005aec75f120c6e2389f8c6074cf72a"
+            "0009752514d8fdb85d5cc92f39f777554b9d520d5df598b458214df2d4f710b3"
         );
     }
 
@@ -709,7 +731,7 @@ mod tests {
         assert!(all.contains("characterization"), "rows: {all}");
         assert_eq!(
             digest,
-            "59c8a697460dd91d47a358008c8c0218a5a8f5dbd53b83895a977c9821ca7cb9"
+            "70d9061b772c46493e7e6df1221a4b8dc0ba1f49c47950e512c6eee4ba871ad2"
         );
     }
 

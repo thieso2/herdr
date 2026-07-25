@@ -507,10 +507,12 @@ fn scroll_focused_replica_page(
     ids: &mut ComposeIds,
     app: &mut AppState,
 ) -> bool {
-    let Some(public) = focused_public_pane(mirrors, ids, app) else {
+    let Some((remote, public)) = focused_public_pane(mirrors, ids, app) else {
         return false;
     };
-    let mirror = mirrors.local_mut();
+    let Some(mirror) = mirrors.get_mut(remote) else {
+        return false;
+    };
     let Some(stream_id) = mirror.stream_for_pane(&public) else {
         return false;
     };
@@ -532,18 +534,26 @@ fn scroll_focused_replica_page(
         rows
     };
     replica.scroll_delta(delta);
-    request_backfill_if_needed(link, stream_id, mirrors);
+    request_backfill_if_needed(link, stream_id, remote, mirrors);
     true
 }
 
 /// Issues a lazy scrollback backfill for a stream whose viewport approaches
 /// the top of loaded history. The response prepends through the replica's
 /// rebuild path.
-fn request_backfill_if_needed(link: &mut Link, stream_id: u32, mirrors: &mut RemoteMirrors) {
+fn request_backfill_if_needed(
+    link: &mut Link,
+    stream_id: u32,
+    remote: usize,
+    mirrors: &mut RemoteMirrors,
+) {
     let Link::Up(session) = link else {
         return;
     };
-    let Some(replica) = mirrors.local_mut().replicas.get_mut(&stream_id) else {
+    let Some(replica) = mirrors
+        .get_mut(remote)
+        .and_then(|mirror| mirror.replicas.get_mut(&stream_id))
+    else {
         return;
     };
     let id = session.request_id("history");
@@ -959,7 +969,7 @@ fn handle_raw_input(
         crate::raw_input::RawInputEvent::Key(key) => handle_key(key, link, mirrors, ids, app),
         crate::raw_input::RawInputEvent::Paste(text) => {
             if app.mode == Mode::Terminal {
-                if let Some((pane_id, bytes)) = encode_paste(mirrors, ids, app, &text) {
+                if let Some((_remote, pane_id, bytes)) = encode_paste(mirrors, ids, app, &text) {
                     send_pane_bytes(link, &pane_id, &bytes);
                 }
             }
@@ -971,16 +981,18 @@ fn handle_raw_input(
     }
 }
 
+/// The focused pane's owning remote and public pane id, when the pane is
+/// still present in that remote's catalog.
 fn focused_public_pane(
     mirrors: &RemoteMirrors,
     ids: &ComposeIds,
     app: &AppState,
-) -> Option<String> {
+) -> Option<(usize, String)> {
     let ws = app.active.and_then(|idx| app.workspaces.get(idx))?;
     let pane_id = ws.focused_pane_id()?;
-    let public = ids.public_pane_id(pane_id)?;
-    mirrors.local().catalog.pane(public)?;
-    Some(public.to_owned())
+    let (remote, public) = ids.public_pane_id(pane_id)?;
+    mirrors.get(remote)?.catalog.pane(public)?;
+    Some((remote, public.to_owned()))
 }
 
 fn handle_key(
@@ -1045,10 +1057,12 @@ fn forward_key(
     ids: &mut ComposeIds,
     app: &mut AppState,
 ) {
-    let Some(pane_id) = focused_public_pane(mirrors, ids, app) else {
+    let Some((remote, pane_id)) = focused_public_pane(mirrors, ids, app) else {
         return;
     };
-    let mirror = mirrors.local();
+    let Some(mirror) = mirrors.get(remote) else {
+        return;
+    };
     let replica = mirror
         .stream_for_pane(&pane_id)
         .and_then(|stream_id| mirror.replicas.get(&stream_id));
@@ -1097,9 +1111,9 @@ fn encode_paste(
     ids: &ComposeIds,
     app: &AppState,
     text: &str,
-) -> Option<(String, Vec<u8>)> {
-    let pane_id = focused_public_pane(mirrors, ids, app)?;
-    let mirror = mirrors.local();
+) -> Option<(usize, String, Vec<u8>)> {
+    let (remote, pane_id) = focused_public_pane(mirrors, ids, app)?;
+    let mirror = mirrors.get(remote)?;
     let bracketed = mirror
         .stream_for_pane(&pane_id)
         .and_then(|stream_id| mirror.replicas.get(&stream_id))
@@ -1114,7 +1128,7 @@ fn encode_paste(
     } else {
         bytes.extend_from_slice(text.as_bytes());
     }
-    Some((pane_id, bytes))
+    Some((remote, pane_id, bytes))
 }
 
 fn send_pane_bytes(link: &mut Link, pane_id: &str, bytes: &[u8]) {
@@ -1153,10 +1167,15 @@ fn handle_mouse(
             let Some((pane_id, inner_rect)) = pane_hit else {
                 return;
             };
-            let Some(public) = ids.public_pane_id(pane_id).map(str::to_owned) else {
+            let Some((remote, public)) = ids
+                .public_pane_id(pane_id)
+                .map(|(remote, public)| (remote, public.to_owned()))
+            else {
                 return;
             };
-            let mirror = mirrors.local_mut();
+            let Some(mirror) = mirrors.get_mut(remote) else {
+                return;
+            };
             let Some(stream_id) = mirror.stream_for_pane(&public) else {
                 return;
             };
@@ -1187,7 +1206,7 @@ fn handle_mouse(
                 lines
             };
             replica.scroll_delta(delta);
-            request_backfill_if_needed(link, stream_id, mirrors);
+            request_backfill_if_needed(link, stream_id, remote, mirrors);
         }
         MouseEventKind::Down(_) | MouseEventKind::Up(_) | MouseEventKind::Drag(_)
             if forward_reported_mouse_button(mouse, link, mirrors, ids, app) => {}
@@ -1223,10 +1242,15 @@ fn forward_reported_mouse_button(
     let Some((pane_id, inner_rect)) = pane_hit else {
         return false;
     };
-    let Some(public) = ids.public_pane_id(pane_id).map(str::to_owned) else {
+    let Some((remote, public)) = ids
+        .public_pane_id(pane_id)
+        .map(|(remote, public)| (remote, public.to_owned()))
+    else {
         return false;
     };
-    let mirror = mirrors.local();
+    let Some(mirror) = mirrors.get(remote) else {
+        return false;
+    };
     let Some(replica) = mirror
         .stream_for_pane(&public)
         .and_then(|stream_id| mirror.replicas.get(&stream_id))

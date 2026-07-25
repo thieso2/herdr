@@ -570,6 +570,8 @@ impl App {
             worktree_remove: None,
             worktree_directory,
             collapsed_space_keys,
+            remote_chips: Vec::new(),
+            workspace_remote_tags: Vec::new(),
             request_complete_onboarding: false,
             name_input: String::new(),
             name_input_replace_on_type: false,
@@ -595,6 +597,9 @@ impl App {
             view: state::ViewState {
                 layout: state::ViewLayout::Desktop,
                 sidebar_rect: Rect::default(),
+                remote_chip_strip_rect: Rect::default(),
+                remote_chip_hit_areas: Vec::new(),
+                remote_add_hit_area: Rect::default(),
                 workspace_card_areas: Vec::new(),
                 tab_bar_rect: Rect::default(),
                 tab_hit_areas: Vec::new(),

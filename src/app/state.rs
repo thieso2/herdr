@@ -659,6 +659,41 @@ pub struct WorkspaceCardArea {
     pub indented: bool,
 }
 
+/// Connection state shown in a remote chip's dot. A plain projection of the
+/// pure client's per-remote connection machine; the chip dot is the only
+/// place connection state surfaces in the strip.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoteChipConnection {
+    Connected,
+    Connecting,
+    Offline,
+    /// Protocol windows do not overlap; the chip greys out.
+    Incompatible,
+}
+
+/// One chip in the fleet strip atop the sidebar. Pure presentation data
+/// composed by the pure client; empty `AppState::remote_chips` means no
+/// strip (single-remote setups render exactly today's sidebar).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteChipState {
+    pub name: String,
+    /// Identity hue index into `Palette::remote_hue`.
+    pub hue_index: usize,
+    /// Whether this remote is composed into the sidebar. Filtered-out
+    /// remotes stay connected and syncing; this is view membership only.
+    pub in_view: bool,
+    pub connection: RemoteChipConnection,
+}
+
+/// Per-space remote attribution shown when two or more remotes are in view:
+/// a hue gutter plus a dim remote-name token. Parallel to
+/// `AppState::workspaces` when non-empty; empty in single-remote views.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteTag {
+    pub name: String,
+    pub hue_index: usize,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorktreeCreateState {
     pub source_workspace_id: String,
@@ -813,6 +848,13 @@ pub enum ViewLayout {
 pub struct ViewState {
     pub layout: ViewLayout,
     pub sidebar_rect: Rect,
+    /// Rows reserved atop the sidebar for the fleet chip strip; empty when
+    /// no strip is shown.
+    pub remote_chip_strip_rect: Rect,
+    /// Per-chip hit rects, parallel to `AppState::remote_chips`.
+    pub remote_chip_hit_areas: Vec<Rect>,
+    /// The `add` affordance in the strip header.
+    pub remote_add_hit_area: Rect,
     pub workspace_card_areas: Vec<WorkspaceCardArea>,
     pub tab_bar_rect: Rect,
     pub tab_hit_areas: Vec<Rect>,
@@ -1485,6 +1527,11 @@ pub struct AppState {
     pub worktree_remove: Option<WorktreeRemoveState>,
     pub worktree_directory: std::path::PathBuf,
     pub collapsed_space_keys: std::collections::HashSet<String>,
+    /// Fleet chip strip model (pure client only). Empty means no strip.
+    pub remote_chips: Vec<RemoteChipState>,
+    /// Per-space remote attribution, parallel to `workspaces` when two or
+    /// more remotes are in view. Empty means no attribution (today's look).
+    pub workspace_remote_tags: Vec<RemoteTag>,
     pub request_complete_onboarding: bool,
     pub name_input: String,
     pub name_input_replace_on_type: bool,
@@ -1962,6 +2009,8 @@ impl AppState {
             worktree_remove: None,
             worktree_directory: std::path::PathBuf::from("/tmp/herdr-worktrees"),
             collapsed_space_keys: std::collections::HashSet::new(),
+            remote_chips: Vec::new(),
+            workspace_remote_tags: Vec::new(),
             request_complete_onboarding: false,
             name_input: String::new(),
             name_input_replace_on_type: false,
@@ -1978,6 +2027,9 @@ impl AppState {
             view: ViewState {
                 layout: ViewLayout::Desktop,
                 sidebar_rect: Rect::default(),
+                remote_chip_strip_rect: Rect::default(),
+                remote_chip_hit_areas: Vec::new(),
+                remote_add_hit_area: Rect::default(),
                 workspace_card_areas: Vec::new(),
                 tab_bar_rect: Rect::default(),
                 tab_hit_areas: Vec::new(),

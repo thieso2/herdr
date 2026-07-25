@@ -14,6 +14,7 @@ pub(crate) mod catalog;
 pub(crate) mod chrome;
 pub(crate) mod compose;
 pub(crate) mod connection;
+pub(crate) mod fleet_view;
 #[cfg(unix)]
 pub(crate) mod intent;
 #[cfg(unix)]
@@ -253,8 +254,9 @@ impl RemoteMirror {
     }
 }
 
-/// Keyed collection of remote mirrors. Only local #0 is wired today; the
-/// key structure is what a multi-remote client generalizes over.
+/// Keyed collection of remote mirrors: the local server at #0 plus one
+/// mirror per configured fleet remote. Every configured remote keeps its
+/// mirror (and its connection) regardless of the client's view selection.
 pub(crate) struct RemoteMirrors {
     mirrors: BTreeMap<usize, RemoteMirror>,
 }
@@ -278,9 +280,31 @@ impl RemoteMirrors {
             .expect("local mirror always exists")
     }
 
-    // Multi-remote iteration is wired by the fleet client (#23); until then
-    // only tests walk the collection.
-    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn get(&self, remote_index: usize) -> Option<&RemoteMirror> {
+        self.mirrors.get(&remote_index)
+    }
+
+    pub(crate) fn get_mut(&mut self, remote_index: usize) -> Option<&mut RemoteMirror> {
+        self.mirrors.get_mut(&remote_index)
+    }
+
+    /// Registers a remote's mirror, replacing any previous mirror at the
+    /// same index (a config identity change is a different remote runtime).
+    pub(crate) fn insert(&mut self, mirror: RemoteMirror) {
+        self.mirrors.insert(mirror.remote_index, mirror);
+    }
+
+    /// Drops a remote's mirror. The local mirror at #0 is never removed.
+    pub(crate) fn remove(&mut self, remote_index: usize) {
+        if remote_index != LOCAL_REMOTE_INDEX {
+            self.mirrors.remove(&remote_index);
+        }
+    }
+
+    pub(crate) fn indices(&self) -> Vec<usize> {
+        self.mirrors.keys().copied().collect()
+    }
+
     pub(crate) fn iter(&self) -> impl Iterator<Item = &RemoteMirror> {
         self.mirrors.values()
     }

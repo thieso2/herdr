@@ -2,6 +2,11 @@
 //!
 //! Defines the message types, framing, version negotiation, and safety
 //! constraints for the binary protocol over Unix domain sockets.
+//!
+//! This legacy client protocol is frozen at `PROTOCOL_VERSION` 18 while the
+//! framed unified protocol (`src/protocol/framed.rs`) grows on the API
+//! socket. Do not add, remove, or reorder message variants or fields here;
+//! byte-exact fixture tests below fail on any wire drift.
 
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
@@ -12,7 +17,9 @@ use serde::{Deserialize, Serialize};
 // Protocol constants
 // ---------------------------------------------------------------------------
 
-/// Current protocol version. Bumped when wire format changes incompatibly.
+/// Current protocol version. Frozen at 18: this legacy client protocol no
+/// longer changes; new wire behavior lands in the framed unified protocol
+/// (`src/protocol/framed.rs`).
 pub const PROTOCOL_VERSION: u32 = 18;
 
 /// Maximum allowed frame payload size (2 MB). Frames larger than this are
@@ -2036,6 +2043,324 @@ mod tests {
             let decoded: ClientMessage = read_message(&mut b, MAX_FRAME_SIZE).unwrap();
             assert_eq!(*expected, decoded);
         }
+    }
+
+    // ---- Legacy protocol freeze fixtures ----
+    //
+    // The legacy bincode client protocol is frozen at PROTOCOL_VERSION 18.
+    // These canonical messages pin the exact wire bytes of every variant; any
+    // drift (added/removed/reordered variants or fields, changed encodings)
+    // must fail here. New runtime capabilities belong in the framed protocol
+    // (`src/protocol/framed.rs`), not in this frozen protocol.
+
+    fn frozen_client_fixtures() -> Vec<(&'static str, ClientMessage)> {
+        vec![
+            (
+                "hello",
+                ClientMessage::Hello {
+                    version: 18,
+                    cols: 80,
+                    rows: 24,
+                    cell_width_px: 8,
+                    cell_height_px: 16,
+                    requested_encoding: RenderEncoding::TerminalAnsi,
+                    keybindings: ClientKeybindings::Local {
+                        keys_toml: "k".to_owned(),
+                    },
+                    launch_mode: ClientLaunchMode::TerminalAttach,
+                },
+            ),
+            (
+                "input",
+                ClientMessage::Input {
+                    data: vec![0x1b, b'[', b'A'],
+                },
+            ),
+            (
+                "clipboard_image",
+                ClientMessage::ClipboardImage {
+                    extension: "png".to_owned(),
+                    data: vec![1, 2, 3],
+                },
+            ),
+            (
+                "resize",
+                ClientMessage::Resize {
+                    cols: 120,
+                    rows: 40,
+                    cell_width_px: 7,
+                    cell_height_px: 15,
+                },
+            ),
+            ("detach", ClientMessage::Detach),
+            (
+                "attach_terminal",
+                ClientMessage::AttachTerminal {
+                    terminal_id: "term_1".to_owned(),
+                    takeover: true,
+                },
+            ),
+            (
+                "attach_scroll",
+                ClientMessage::AttachScroll {
+                    source: AttachScrollSource::PageKey {
+                        input: vec![0x1b, b'v'],
+                    },
+                    direction: AttachScrollDirection::Down,
+                    lines: 3,
+                    column: Some(5),
+                    row: None,
+                    modifiers: 2,
+                },
+            ),
+            (
+                "input_events",
+                ClientMessage::InputEvents {
+                    events: vec![
+                        ClientInputEvent::Key {
+                            code: ClientKeyCode::Char('a'),
+                            modifiers: 1,
+                            kind: ClientKeyKind::Press,
+                        },
+                        ClientInputEvent::Text { codepoint: 'ü' },
+                        ClientInputEvent::Mouse {
+                            kind: ClientMouseKind::Down(ClientMouseButton::Left),
+                            column: 3,
+                            row: 4,
+                            modifiers: 0,
+                        },
+                        ClientInputEvent::Paste {
+                            text: "hi".to_owned(),
+                        },
+                        ClientInputEvent::FocusGained,
+                        ClientInputEvent::FocusLost,
+                    ],
+                },
+            ),
+            (
+                "observe_terminal",
+                ClientMessage::ObserveTerminal {
+                    target: "w1:p2".to_owned(),
+                },
+            ),
+            (
+                "control_terminal",
+                ClientMessage::ControlTerminal {
+                    target: "w1:p2".to_owned(),
+                    takeover: false,
+                },
+            ),
+        ]
+    }
+
+    fn frozen_server_fixtures() -> Vec<(&'static str, ServerMessage)> {
+        vec![
+            (
+                "welcome",
+                ServerMessage::Welcome {
+                    version: 18,
+                    encoding: RenderEncoding::SemanticFrame,
+                    error: Some("nope".to_owned()),
+                },
+            ),
+            (
+                "frame",
+                ServerMessage::Frame(FrameData {
+                    cells: vec![CellData {
+                        symbol: "A".to_owned(),
+                        fg: 0x02,
+                        bg: 0x0210_2030,
+                        modifier: 1,
+                        skip: false,
+                        hyperlink: Some(0),
+                    }],
+                    width: 1,
+                    height: 1,
+                    cursor: Some(CursorState {
+                        x: 0,
+                        y: 0,
+                        visible: true,
+                        shape: 2,
+                    }),
+                    hyperlinks: vec!["https://example.com".to_owned()],
+                    graphics: vec![9],
+                }),
+            ),
+            (
+                "terminal",
+                ServerMessage::Terminal(TerminalFrame {
+                    seq: 7,
+                    width: 80,
+                    height: 24,
+                    full: true,
+                    bytes: vec![0x1b, b'c'],
+                }),
+            ),
+            (
+                "graphics",
+                ServerMessage::Graphics {
+                    bytes: vec![0xAA, 0xBB],
+                },
+            ),
+            (
+                "server_shutdown",
+                ServerMessage::ServerShutdown {
+                    reason: Some("bye".to_owned()),
+                },
+            ),
+            (
+                "notify",
+                ServerMessage::Notify {
+                    kind: NotifyKind::SystemToast,
+                    message: "m".to_owned(),
+                    body: Some("b".to_owned()),
+                },
+            ),
+            (
+                "clipboard",
+                ServerMessage::Clipboard {
+                    data: "aGk=".to_owned(),
+                },
+            ),
+            (
+                "window_title",
+                ServerMessage::WindowTitle {
+                    title: Some("t".to_owned()),
+                },
+            ),
+            ("reload_sound_config", ServerMessage::ReloadSoundConfig),
+            (
+                "mouse_capture",
+                ServerMessage::MouseCapture { enabled: true },
+            ),
+            (
+                "kitty_keyboard_report_all",
+                ServerMessage::KittyKeyboardReportAll { enabled: false },
+            ),
+            (
+                "prefix_input_source",
+                ServerMessage::PrefixInputSource { active: true },
+            ),
+        ]
+    }
+
+    fn assert_frozen_wire_bytes<M>(fixtures: Vec<(&'static str, M)>, expected: &[(&str, &[u8])])
+    where
+        M: Serialize + for<'de> Deserialize<'de> + PartialEq + std::fmt::Debug,
+    {
+        assert_eq!(
+            fixtures.len(),
+            expected.len(),
+            "fixture list and expected byte list must stay in sync"
+        );
+        for ((name, msg), (expected_name, expected_bytes)) in fixtures.iter().zip(expected) {
+            assert_eq!(name, expected_name);
+            let encoded = bincode::serde::encode_to_vec(msg, bincode::config::standard()).unwrap();
+            assert_eq!(
+                encoded.as_slice(),
+                *expected_bytes,
+                "wire drift in frozen legacy variant `{name}`; the legacy client protocol \
+                 is frozen at version 18 — add new behavior to the framed protocol instead"
+            );
+            let (decoded, _): (M, _) =
+                bincode::serde::decode_from_slice(expected_bytes, bincode::config::standard())
+                    .unwrap_or_else(|err| {
+                        panic!("frozen bytes for `{name}` no longer decode: {err}")
+                    });
+            assert_eq!(
+                &decoded, msg,
+                "frozen bytes for `{name}` decode differently"
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_protocol_version_is_frozen_at_18() {
+        // The legacy bincode client protocol is frozen. Do not bump this
+        // version; new wire behavior belongs in src/protocol/framed.rs.
+        assert_eq!(PROTOCOL_VERSION, 18);
+    }
+
+    #[test]
+    fn legacy_client_message_wire_bytes_are_frozen_at_protocol_18() {
+        assert_frozen_wire_bytes(
+            frozen_client_fixtures(),
+            &[
+                (
+                    "hello",
+                    &[
+                        0x00, 0x12, 0x50, 0x18, 0x08, 0x10, 0x01, 0x01, 0x01, 0x6B, 0x01,
+                    ],
+                ),
+                ("input", &[0x01, 0x03, 0x1B, 0x5B, 0x41]),
+                (
+                    "clipboard_image",
+                    &[0x02, 0x03, 0x70, 0x6E, 0x67, 0x03, 0x01, 0x02, 0x03],
+                ),
+                ("resize", &[0x03, 0x78, 0x28, 0x07, 0x0F]),
+                ("detach", &[0x04]),
+                (
+                    "attach_terminal",
+                    &[0x05, 0x06, 0x74, 0x65, 0x72, 0x6D, 0x5F, 0x31, 0x01],
+                ),
+                (
+                    "attach_scroll",
+                    &[
+                        0x06, 0x01, 0x02, 0x1B, 0x76, 0x01, 0x03, 0x01, 0x05, 0x00, 0x02,
+                    ],
+                ),
+                (
+                    "input_events",
+                    &[
+                        0x07, 0x06, 0x00, 0x0F, 0x61, 0x01, 0x00, 0x01, 0xC3, 0xBC, 0x02, 0x00,
+                        0x00, 0x03, 0x04, 0x00, 0x03, 0x02, 0x68, 0x69, 0x04, 0x05,
+                    ],
+                ),
+                (
+                    "observe_terminal",
+                    &[0x08, 0x05, 0x77, 0x31, 0x3A, 0x70, 0x32],
+                ),
+                (
+                    "control_terminal",
+                    &[0x09, 0x05, 0x77, 0x31, 0x3A, 0x70, 0x32, 0x00],
+                ),
+            ],
+        );
+    }
+
+    #[test]
+    fn legacy_server_message_wire_bytes_are_frozen_at_protocol_18() {
+        assert_frozen_wire_bytes(
+            frozen_server_fixtures(),
+            &[
+                (
+                    "welcome",
+                    &[0x00, 0x12, 0x00, 0x01, 0x04, 0x6E, 0x6F, 0x70, 0x65],
+                ),
+                (
+                    "frame",
+                    &[
+                        0x01, 0x01, 0x01, 0x41, 0x02, 0xFC, 0x30, 0x20, 0x10, 0x02, 0x01, 0x00,
+                        0x01, 0x00, 0x01, 0x01, 0x01, 0x00, 0x00, 0x01, 0x02, 0x01, 0x13, 0x68,
+                        0x74, 0x74, 0x70, 0x73, 0x3A, 0x2F, 0x2F, 0x65, 0x78, 0x61, 0x6D, 0x70,
+                        0x6C, 0x65, 0x2E, 0x63, 0x6F, 0x6D, 0x01, 0x09,
+                    ],
+                ),
+                (
+                    "terminal",
+                    &[0x02, 0x07, 0x50, 0x18, 0x01, 0x02, 0x1B, 0x63],
+                ),
+                ("graphics", &[0x03, 0x02, 0xAA, 0xBB]),
+                ("server_shutdown", &[0x04, 0x01, 0x03, 0x62, 0x79, 0x65]),
+                ("notify", &[0x05, 0x02, 0x01, 0x6D, 0x01, 0x01, 0x62]),
+                ("clipboard", &[0x06, 0x04, 0x61, 0x47, 0x6B, 0x3D]),
+                ("window_title", &[0x07, 0x01, 0x01, 0x74]),
+                ("reload_sound_config", &[0x08]),
+                ("mouse_capture", &[0x09, 0x01]),
+                ("kitty_keyboard_report_all", &[0x0A, 0x00]),
+                ("prefix_input_source", &[0x0B, 0x01]),
+            ],
+        );
     }
 
     // ---- Helper: chunked reader for simulating partial reads ----

@@ -16,6 +16,12 @@ pub(crate) enum LocalStreamRead {
     Closed,
 }
 
+pub(crate) enum LocalStreamReadLen {
+    Data(usize),
+    Pending,
+    Closed,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct SocketFileIdentity {
     #[cfg(unix)]
@@ -148,6 +154,37 @@ pub(crate) fn poll_local_stream_read(
                 Ok(0) => Ok(LocalStreamRead::Closed),
                 Ok(_) => Ok(LocalStreamRead::Data),
                 Err(err) if is_connection_closed_error(&err) => Ok(LocalStreamRead::Closed),
+                Err(err) => Err(err),
+            },
+        }
+    }
+}
+
+/// Like `poll_local_stream_read`, but reports how many bytes were read so
+/// callers can consume multi-byte chunks.
+pub(crate) fn poll_local_stream_read_len(
+    stream: &mut LocalStream,
+    buf: &mut [u8],
+) -> io::Result<LocalStreamReadLen> {
+    #[cfg(unix)]
+    {
+        match stream.read(buf) {
+            Ok(0) => Ok(LocalStreamReadLen::Closed),
+            Ok(read) => Ok(LocalStreamReadLen::Data(read)),
+            Err(err) if err.kind() == io::ErrorKind::WouldBlock => Ok(LocalStreamReadLen::Pending),
+            Err(err) => Err(err),
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        match windows_named_pipe_available(stream)? {
+            None => Ok(LocalStreamReadLen::Closed),
+            Some(0) => Ok(LocalStreamReadLen::Pending),
+            Some(_) => match stream.read(buf) {
+                Ok(0) => Ok(LocalStreamReadLen::Closed),
+                Ok(read) => Ok(LocalStreamReadLen::Data(read)),
+                Err(err) if is_connection_closed_error(&err) => Ok(LocalStreamReadLen::Closed),
                 Err(err) => Err(err),
             },
         }

@@ -1117,7 +1117,11 @@ fn handle_key(
     use crossterm::event::KeyCode;
 
     if key.kind == crossterm::event::KeyEventKind::Release {
-        if app.mode != Mode::Copy {
+        // Legacy parity: only Terminal mode forwards key events to the
+        // pane. Releases of keys typed into modals (rename, confirm-close,
+        // context menu) or copy mode must not leak CSI-u release reports
+        // into kitty-protocol panes behind the modal.
+        if app.mode == Mode::Terminal {
             forward_key(key, link, mirrors, ids, app);
         }
         return;
@@ -1147,6 +1151,27 @@ fn handle_key(
                 && scroll_focused_replica_page(key.code, link, mirrors, ids, app)
             {
                 return;
+            }
+            // Retained-selection copy (legacy try_copy_retained_selection):
+            // with copy_on_select off, the copy chord copies a finalized
+            // mouse selection out of the replica instead of reaching the
+            // pane. An empty extraction falls through and forwards the key,
+            // matching the legacy client.
+            if !app.copy_on_select
+                && crate::app::is_retained_selection_copy_key(key)
+                && app
+                    .selection
+                    .as_ref()
+                    .is_some_and(crate::selection::Selection::is_finalized)
+            {
+                {
+                    let source = MirrorPaneSource::new(mirrors.local());
+                    app.copy_selection(&source);
+                }
+                if let Some(content) = app.request_clipboard_write.take() {
+                    crate::selection::write_osc52_bytes(&content);
+                    return;
+                }
             }
             forward_key(key, link, mirrors, ids, app);
         }
@@ -1188,9 +1213,13 @@ fn handle_key(
             super::intent::dispatch_modal_key(key, link, mirrors, ids, app);
         }
         _ => {
-            // Residual modal modes are unsupported under the flag; Esc or q
-            // folds back to the base modes instead of trapping the user (or
-            // quitting the whole client from inside a dead modal).
+            // Residual modal modes (Settings, Navigator, GlobalMenu,
+            // worktree dialogs) are unsupported under the flag: their
+            // handlers live on App, coupled to config-file persistence and
+            // live workspace runtimes (see the NOT CLOSED note in
+            // intent::dispatch_mouse_intent). Esc or q folds back to the
+            // base modes instead of trapping the user (or quitting the
+            // whole client from inside a dead modal).
             if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
                 app.context_menu = None;
                 app.mode = Mode::Navigate;
@@ -1282,10 +1311,12 @@ fn encode_paste(
     Some((pane_id, bytes))
 }
 
-/// Bridges image pastes into `pane.paste_image`: an empty bracketed paste
-/// means the host clipboard holds an image instead of text, and a pasted
-/// path pointing at an image file is a terminal file drop. Returns false to
-/// fall through to a normal text paste.
+/// Bridges an image paste into `pane.paste_image`: an empty bracketed
+/// paste means the host clipboard holds an image instead of text. Pasted
+/// file paths (terminal file drops) stay plain text — the pure client is
+/// local, so the server reads the same filesystem and the legacy local
+/// client pastes the path bytes unchanged; path-to-image bridging is a
+/// remote-client concern. Returns false to fall through to a text paste.
 fn try_paste_image(
     text: &str,
     link: &mut Link,
@@ -1307,12 +1338,10 @@ fn try_paste_image(
     if !negotiated_paste_image {
         return false;
     }
-    let image = if text.is_empty() {
-        crate::platform::read_clipboard_image()
-    } else {
-        crate::client::read_image_file_from_terminal_drop(text.as_bytes(), true)
-    };
-    let Some(image) = image else {
+    if !text.is_empty() {
+        return false;
+    }
+    let Some(image) = crate::platform::read_clipboard_image() else {
         return false;
     };
     if image.bytes.len() > crate::protocol::MAX_CLIPBOARD_IMAGE_PAYLOAD {
@@ -1366,7 +1395,7 @@ fn handle_mouse(
     mirrors: &mut RemoteMirrors,
     ids: &mut ComposeIds,
     app: &mut AppState,
-    _chrome: &mut GlobalChrome,
+    chrome: &mut GlobalChrome,
 ) {
     match mouse.kind {
         MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
@@ -1421,9 +1450,88 @@ fn handle_mouse(
         MouseEventKind::Down(_) | MouseEventKind::Up(_) | MouseEventKind::Drag(_)
             if forward_reported_mouse_button(mouse, link, mirrors, ids, app) => {}
         _ => {
+            if handle_pane_double_click(mouse, mirrors, ids, app, chrome) {
+                return;
+            }
             super::intent::dispatch_mouse_intent(mouse, link, mirrors, ids, app);
         }
     }
+}
+
+/// Double-click word selection against the replica, mirroring the legacy
+/// `App::handle_pane_double_click` gesture: two adjacent left-clicks in the
+/// same pane cell within the double-click window select the token under
+/// the cursor, and copy_on_select sends it out as OSC52. Mouse-reporting
+/// panes never reach this (their buttons forward upstream). Returns true
+/// when the double-click was consumed.
+fn handle_pane_double_click(
+    mouse: MouseEvent,
+    mirrors: &RemoteMirrors,
+    _ids: &ComposeIds,
+    app: &mut AppState,
+    chrome: &mut GlobalChrome,
+) -> bool {
+    use crossterm::event::MouseButton;
+
+    // A pane press stops being a double-click candidate once it becomes a
+    // drag or completes as a real text selection (legacy parity).
+    match mouse.kind {
+        MouseEventKind::Drag(MouseButton::Left) => {
+            chrome.last_pane_click = None;
+            return false;
+        }
+        MouseEventKind::Up(MouseButton::Left)
+            if app
+                .selection
+                .as_ref()
+                .is_some_and(crate::selection::Selection::is_visible) =>
+        {
+            chrome.last_pane_click = None;
+            return false;
+        }
+        MouseEventKind::Down(MouseButton::Left) => {}
+        _ => return false,
+    }
+
+    if !mouse.modifiers.is_empty() || app.mode != Mode::Terminal {
+        chrome.last_pane_click = None;
+        return false;
+    }
+    let Some(info) = app
+        .view
+        .pane_infos
+        .iter()
+        .find(|info| {
+            info.inner_rect
+                .contains(ratatui::layout::Position::new(mouse.column, mouse.row))
+        })
+        .cloned()
+    else {
+        chrome.last_pane_click = None;
+        return false;
+    };
+    let viewport_row = mouse.row.saturating_sub(info.inner_rect.y);
+    let col = mouse.column.saturating_sub(info.inner_rect.x);
+    let click = crate::app::PaneClickState::new(info.id, viewport_row, col);
+    if !chrome
+        .last_pane_click
+        .take()
+        .is_some_and(|last| last.is_double_click_for(click))
+    {
+        chrome.last_pane_click = Some(click);
+        return false;
+    }
+
+    let selected = {
+        let source = MirrorPaneSource::new(mirrors.local());
+        app.select_word_at_pane_cell(&source, info.id, viewport_row, col)
+    };
+    // copy_on_select word copies go straight out as OSC52, like every
+    // other pure-client copy.
+    if let Some(content) = app.request_clipboard_write.take() {
+        crate::selection::write_osc52_bytes(&content);
+    }
+    selected
 }
 
 /// Encodes a button/drag event for a mouse-reporting pane and forwards it as
@@ -1630,8 +1738,9 @@ mod tests {
         std::env::remove_var("HERDR_PURE_CLIENT");
     }
 
-    #[tokio::test]
-    async fn copy_mode_selects_and_copies_replica_content_through_the_seam() {
+    /// A mirror whose catalog holds one focused pane (`p_1_1`) served by a
+    /// replica seeded with `screen`.
+    fn mirror_with_replica(screen: &str) -> super::super::RemoteMirror {
         let mut mirror = super::super::RemoteMirror::test_new();
         let snapshot: crate::api::schema::session::SessionSnapshot =
             serde_json::from_value(serde_json::json!({
@@ -1660,16 +1769,49 @@ mod tests {
             }))
             .expect("snapshot deserializes");
         mirror.catalog.resync(&snapshot, 1);
-        let replica = crate::terminal::replica::PaneReplica::open(
-            "alpha bravo charlie\r\n",
-            10,
-            None,
-            80,
-            24,
-            64 * 1024,
-        )
-        .expect("replica opens");
+        let replica =
+            crate::terminal::replica::PaneReplica::open(screen, 10, None, 80, 24, 64 * 1024)
+                .expect("replica opens");
         mirror.stream_opened("p_1_1", 3, replica);
+        mirror
+    }
+
+    /// A connected [`Session`] whose peer end the test reads frames from.
+    fn session_pair() -> (Session, crate::ipc::LocalStream) {
+        use interprocess::local_socket::traits::Listener as _;
+        static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "herdr-pure-run-test-{}-{}.sock",
+            std::process::id(),
+            COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        ));
+        let _ = std::fs::remove_file(&path);
+        let listener = crate::ipc::bind_local_listener(&path).expect("bind test socket");
+        let client = crate::ipc::connect_local_stream(&path).expect("connect test socket");
+        let server = listener.accept().expect("accept test socket");
+        let _ = std::fs::remove_file(&path);
+        let session = Session {
+            stream: client,
+            next_request_id: 1,
+            pending: HashMap::new(),
+            sent_sizes: HashMap::new(),
+            read_only: HashSet::new(),
+        };
+        (session, server)
+    }
+
+    /// Reads one control frame off the test peer, or None on timeout.
+    fn try_read_control(server: &mut crate::ipc::LocalStream) -> Option<serde_json::Value> {
+        let _ = server.set_recv_timeout(Some(Duration::from_millis(200)));
+        match read_frame(server) {
+            Ok(frame) => serde_json::from_slice(&frame.payload).ok(),
+            Err(_) => None,
+        }
+    }
+
+    #[tokio::test]
+    async fn copy_mode_selects_and_copies_replica_content_through_the_seam() {
+        let mirror = mirror_with_replica("alpha bravo charlie\r\n");
 
         let chrome = GlobalChrome::new();
         let mut ids = ComposeIds::new();
@@ -1726,6 +1868,222 @@ mod tests {
             "alpha bravo charlie"
         );
         assert_eq!(app.mode, Mode::Terminal, "copy exits copy mode");
+    }
+
+    #[tokio::test]
+    async fn modal_keys_and_releases_never_reach_the_pane() {
+        let mut mirrors = RemoteMirrors::with_local();
+        *mirrors.local_mut() = mirror_with_replica("hello\r\n");
+        let chrome = GlobalChrome::new();
+        let mut ids = ComposeIds::new();
+        let mut app = AppState::test_new();
+        compose_into(mirrors.local(), &chrome, &mut ids, &mut app);
+        app.keybinds = crate::config::Config::default().keybinds();
+
+        let (session, mut server) = session_pair();
+        let mut link = Link::Up(session);
+
+        // Positive control: a Terminal-mode press reaches the pane.
+        app.mode = Mode::Terminal;
+        handle_key(
+            key(KeyCode::Char('a')),
+            &mut link,
+            &mut mirrors,
+            &mut ids,
+            &mut app,
+        );
+        let frame = try_read_control(&mut server).expect("terminal press forwards to the pane");
+        assert_eq!(frame["method"], "pane.send_bytes");
+
+        // A press typed into a rename modal edits the modal, not the pane.
+        app.mode = Mode::RenameWorkspace;
+        app.name_input.clear();
+        app.name_input_replace_on_type = false;
+        handle_key(
+            key(KeyCode::Char('b')),
+            &mut link,
+            &mut mirrors,
+            &mut ids,
+            &mut app,
+        );
+        assert_eq!(app.name_input, "b");
+        assert!(
+            try_read_control(&mut server).is_none(),
+            "modal press must not reach the pane"
+        );
+
+        // The matching Release must not leak into the pane either (legacy
+        // parity: key events are only forwarded from Terminal mode).
+        handle_key(
+            crate::input::TerminalKey::new(KeyCode::Char('b'), KeyModifiers::empty())
+                .with_kind(crossterm::event::KeyEventKind::Release),
+            &mut link,
+            &mut mirrors,
+            &mut ids,
+            &mut app,
+        );
+        assert!(
+            try_read_control(&mut server).is_none(),
+            "modal key release must not reach the pane"
+        );
+    }
+
+    #[tokio::test]
+    async fn retained_selection_copy_key_copies_replica_text_instead_of_forwarding() {
+        let mut mirrors = RemoteMirrors::with_local();
+        *mirrors.local_mut() = mirror_with_replica("alpha bravo charlie\r\n");
+        let chrome = GlobalChrome::new();
+        let mut ids = ComposeIds::new();
+        let mut app = AppState::test_new();
+        compose_into(mirrors.local(), &chrome, &mut ids, &mut app);
+        app.keybinds = crate::config::Config::default().keybinds();
+        app.mode = Mode::Terminal;
+        app.copy_on_select = false;
+
+        let pane_id = app.workspaces[0]
+            .focused_pane_id()
+            .expect("composed focused pane");
+        let metrics = {
+            let source = MirrorPaneSource::new(mirrors.local());
+            app.pane_scroll_metrics(&source, pane_id)
+        };
+        let mut selection = crate::selection::Selection::range(pane_id, 0, 0, 4, metrics);
+        assert!(selection.finish());
+        app.selection = Some(selection);
+
+        let (session, mut server) = session_pair();
+        let mut link = Link::Up(session);
+
+        // Ctrl-C copies the retained selection out of the replica and is
+        // not forwarded to the pane.
+        handle_key(
+            crate::input::TerminalKey::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            &mut link,
+            &mut mirrors,
+            &mut ids,
+            &mut app,
+        );
+        assert!(app.selection.is_none(), "copy consumes the selection");
+        assert!(
+            try_read_control(&mut server).is_none(),
+            "the copy chord must not reach the pane"
+        );
+
+        // With copy_on_select the chord forwards to the pane instead.
+        app.copy_on_select = true;
+        handle_key(
+            crate::input::TerminalKey::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            &mut link,
+            &mut mirrors,
+            &mut ids,
+            &mut app,
+        );
+        let frame = try_read_control(&mut server).expect("ctrl-c forwards with copy_on_select");
+        assert_eq!(frame["method"], "pane.send_bytes");
+    }
+
+    #[tokio::test]
+    async fn mouse_drag_selection_copies_replica_text_through_the_seam() {
+        use crossterm::event::{MouseButton, MouseEventKind};
+
+        let mirror = mirror_with_replica("alpha bravo charlie\r\n");
+        let chrome = GlobalChrome::new();
+        let mut ids = ComposeIds::new();
+        let mut app = AppState::test_new();
+        compose_into(&mirror, &chrome, &mut ids, &mut app);
+        app.keybinds = crate::config::Config::default().keybinds();
+        app.mode = Mode::Terminal;
+        app.copy_on_select = true;
+
+        let source = MirrorPaneSource::new(&mirror);
+        let _requests = crate::ui::compute_view_with_content(
+            &mut app,
+            &source,
+            ratatui::layout::Rect::new(0, 0, 106, 26),
+        );
+        let inner = app.view.pane_infos.first().expect("pane info").inner_rect;
+        let empty = crate::terminal::TerminalRuntimeRegistry::new();
+        let mouse = |kind: MouseEventKind, column: u16, row: u16| MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::empty(),
+        };
+
+        // Drag-select "alpha" (columns 0..=4 of the replica's first row)
+        // and release: copy_on_select extracts the text from the replica
+        // through the pane-content seam.
+        app.handle_mouse_with_content(
+            &empty,
+            &source,
+            mouse(MouseEventKind::Down(MouseButton::Left), inner.x, inner.y),
+        );
+        app.handle_mouse_with_content(
+            &empty,
+            &source,
+            mouse(
+                MouseEventKind::Drag(MouseButton::Left),
+                inner.x + 4,
+                inner.y,
+            ),
+        );
+        app.handle_mouse_with_content(
+            &empty,
+            &source,
+            mouse(MouseEventKind::Up(MouseButton::Left), inner.x + 4, inner.y),
+        );
+
+        let copied = app
+            .request_clipboard_write
+            .take()
+            .expect("mouse selection copied replica text");
+        assert_eq!(String::from_utf8_lossy(&copied), "alpha");
+    }
+
+    #[tokio::test]
+    async fn double_click_selects_the_replica_word_under_the_cursor() {
+        use crossterm::event::{MouseButton, MouseEventKind};
+
+        let mut mirrors = RemoteMirrors::with_local();
+        *mirrors.local_mut() = mirror_with_replica("alpha bravo charlie\r\n");
+        let mut chrome = GlobalChrome::new();
+        let mut ids = ComposeIds::new();
+        let mut app = AppState::test_new();
+        compose_into(mirrors.local(), &chrome, &mut ids, &mut app);
+        app.keybinds = crate::config::Config::default().keybinds();
+        app.mode = Mode::Terminal;
+        app.copy_on_select = false;
+
+        {
+            let source = MirrorPaneSource::new(mirrors.local());
+            let _requests = crate::ui::compute_view_with_content(
+                &mut app,
+                &source,
+                ratatui::layout::Rect::new(0, 0, 106, 26),
+            );
+        }
+        let inner = app.view.pane_infos.first().expect("pane info").inner_rect;
+        // Two clicks on the same cell inside "bravo".
+        let click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: inner.x + 7,
+            row: inner.y,
+            modifiers: KeyModifiers::empty(),
+        };
+        assert!(
+            !handle_pane_double_click(click, &mirrors, &ids, &mut app, &mut chrome),
+            "first click only arms the candidate"
+        );
+        assert!(
+            handle_pane_double_click(click, &mirrors, &ids, &mut app, &mut chrome),
+            "second click selects the word"
+        );
+        let selection = app.selection.clone().expect("word selection");
+        assert!(selection.is_finalized());
+        let source = MirrorPaneSource::new(mirrors.local());
+        app.copy_selection(&source);
+        let copied = app.request_clipboard_write.take().expect("copied word");
+        assert_eq!(String::from_utf8_lossy(&copied), "bravo");
     }
 
     #[test]

@@ -48,6 +48,8 @@ mod sidebar;
 mod terminal;
 
 #[cfg(unix)]
+pub(crate) use self::clipboard::is_retained_selection_copy_key;
+#[cfg(unix)]
 pub(crate) use self::modal::{pure_client_modal_key, pure_client_modal_mouse, PureModalIds};
 pub(crate) use self::mouse::MouseAction;
 pub(crate) use self::{
@@ -614,6 +616,18 @@ impl App {
     }
 
     fn select_double_clicked_word(&mut self, click: PaneClickState) -> bool {
+        // Leave mouse input to terminal apps that requested it (this check
+        // lived in select_word_at_pane_cell before it moved onto the
+        // content seam, which has no input-state surface).
+        let reporting = self.state.active.is_some_and(|ws_idx| {
+            self.state
+                .runtime_for_pane_in_workspace(&self.terminal_runtimes, ws_idx, click.pane_id)
+                .and_then(|rt| rt.input_state())
+                .is_some_and(crate::pane::InputState::mouse_reporting_enabled)
+        });
+        if reporting {
+            return false;
+        }
         let selected = self.state.select_word_at_pane_cell(
             &self.terminal_runtimes,
             click.pane_id,

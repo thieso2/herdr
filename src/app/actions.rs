@@ -2063,9 +2063,13 @@ impl AppState {
         self.selection_autoscroll = None;
     }
 
+    /// Word-selects the token under a double-clicked pane cell, reading the
+    /// pane text through the content seam. Callers route mouse-reporting
+    /// panes away before this (the legacy client checks the runtime's input
+    /// state; the pure client forwards reporting-pane buttons upstream).
     pub(crate) fn select_word_at_pane_cell(
         &mut self,
-        terminal_runtimes: &crate::terminal::TerminalRuntimeRegistry,
+        terminal_runtimes: &dyn crate::terminal::PaneContentSource,
         pane_id: crate::layout::PaneId,
         viewport_row: u16,
         col: u16,
@@ -2085,17 +2089,10 @@ impl AppState {
             return false;
         }
 
-        // Leave mouse input to terminal apps that requested it.
-        let Some(rt) = self.runtime_for_pane_in_workspace(terminal_runtimes, ws_idx, pane_id)
+        let Some(rt) = self.content_for_pane_in_workspace(terminal_runtimes, ws_idx, pane_id)
         else {
             return false;
         };
-        if rt
-            .input_state()
-            .is_some_and(crate::pane::InputState::mouse_reporting_enabled)
-        {
-            return false;
-        }
 
         // Read the visible row and identify the clicked token bounds.
         let metrics = self.pane_scroll_metrics(terminal_runtimes, pane_id);

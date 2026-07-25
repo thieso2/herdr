@@ -40,6 +40,98 @@ struct SpawnedHerdr {
     child: Box<dyn Child + Send + Sync>,
 }
 
+/// The real pure client (`herdr client` with `HERDR_PURE_CLIENT=1`) in a
+/// PTY, with its rendered output accumulated on a reader thread.
+struct SpawnedPureClient {
+    _master: Box<dyn MasterPty + Send>,
+    child: Box<dyn Child + Send + Sync>,
+    output: std::sync::Arc<Mutex<String>>,
+}
+
+impl SpawnedPureClient {
+    /// Waits until the accumulated rendered output contains `needle`.
+    fn wait_for_output(&self, needle: &str, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if self
+                .output
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .contains(needle)
+            {
+                return true;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        false
+    }
+
+    fn output_snapshot(&self) -> String {
+        self.output
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+}
+
+impl Drop for SpawnedPureClient {
+    fn drop(&mut self) {
+        let pid = self.child.process_id();
+        let _ = self.child.kill();
+        support::unregister_spawned_herdr_pid(pid);
+    }
+}
+
+fn spawn_pure_client(
+    config_home: &Path,
+    runtime_dir: &Path,
+    api_socket: &Path,
+) -> SpawnedPureClient {
+    let pair = native_pty_system()
+        .openpty(PtySize {
+            rows: 24,
+            cols: 100,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .unwrap();
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_herdr"));
+    cmd.arg("client");
+    cmd.env("HERDR_PURE_CLIENT", "1");
+    cmd.env("HERDR_DISABLE_SOUND", "1");
+    cmd.env("XDG_CONFIG_HOME", config_home);
+    cmd.env("XDG_RUNTIME_DIR", runtime_dir);
+    cmd.env("HERDR_SOCKET_PATH", api_socket);
+    cmd.env_remove("HERDR_CLIENT_SOCKET_PATH");
+    cmd.env("SHELL", "/bin/sh");
+    cmd.env_remove("HERDR_ENV");
+    cmd.env_remove("HERDR_STARTUP_CWD");
+
+    let child = pair.slave.spawn_command(cmd).unwrap();
+    support::register_spawned_herdr_pid(child.process_id());
+    drop(pair.slave);
+
+    let output = std::sync::Arc::new(Mutex::new(String::new()));
+    let sink = std::sync::Arc::clone(&output);
+    let mut reader = pair.master.try_clone_reader().unwrap();
+    thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        while let Ok(n) = reader.read(&mut buf) {
+            if n == 0 {
+                break;
+            }
+            let mut out = sink.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            out.push_str(&String::from_utf8_lossy(&buf[..n]));
+        }
+    });
+
+    SpawnedPureClient {
+        _master: pair.master,
+        child,
+        output,
+    }
+}
+
 impl Drop for SpawnedHerdr {
     fn drop(&mut self) {
         let pid = self.child.process_id();
@@ -473,6 +565,93 @@ fn pure_client_catalog_session_reconnects_and_resyncs_across_live_handoff() {
 
     let pids = support::herdr_server_pids_for_runtime_dir(&runtime_dir).unwrap_or_default();
     drop(reconnected);
+    for pid in pids {
+        unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+    }
+    cleanup_test_base(&base);
+}
+
+/// The real pure client, flag on, end to end: `herdr client` with
+/// `HERDR_PURE_CLIENT=1` renders replica content from the live server, and
+/// its own reconnect loop survives a live handoff — after the replacement
+/// server takes over, the client resyncs and renders new pane output
+/// written on the restored session (restore continuity through the real
+/// `run_pure_client` loop, not a hand-rolled wire client).
+#[test]
+fn real_pure_client_renders_and_resyncs_across_live_handoff() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let api_socket = runtime_dir.join("herdr.sock");
+
+    let server = spawn_server(&config_home, &runtime_dir, &api_socket);
+    wait_for_api(&api_socket, Duration::from_secs(10));
+    let (pane_id, _terminal_id) = create_pane(&api_socket, &base);
+
+    // Distinctive pane content the rendered client output must show.
+    let sent = request(
+        &api_socket,
+        serde_json::json!({
+            "id": "test:text1",
+            "method": "pane.send_text",
+            "params": {"pane_id": pane_id, "text": "echo MARK_PURE_ALPHA\n"},
+        }),
+    );
+    assert!(sent.get("error").is_none(), "pane.send_text: {sent}");
+
+    let client = spawn_pure_client(&config_home, &runtime_dir, &api_socket);
+    assert!(
+        client.wait_for_output("MARK_PURE_ALPHA", Duration::from_secs(15)),
+        "pure client must render replica content; output: {:?}",
+        client.output_snapshot()
+    );
+
+    // Live handoff: the old server exits, a replacement takes over the
+    // session, and the pure client's reconnect loop must resync on its own.
+    assert!(
+        request(
+            &api_socket,
+            serde_json::json!({"id":"test:handoff","method":"server.live_handoff","params":{}}),
+        )
+        .get("result")
+        .is_some(),
+        "live handoff should be accepted"
+    );
+    thread::sleep(Duration::from_millis(500));
+    wait_for_api(&api_socket, Duration::from_secs(15));
+
+    // New output on the handed-off pane only reaches the client if it
+    // reconnected, resynced the catalog, and reopened the pane stream.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut resynced = false;
+    while Instant::now() < deadline {
+        let sent = try_request(
+            &api_socket,
+            serde_json::json!({
+                "id": "test:text2",
+                "method": "pane.send_text",
+                "params": {"pane_id": pane_id, "text": "echo MARK_PURE_BRAVO\n"},
+            }),
+        );
+        if sent
+            .as_ref()
+            .is_some_and(|sent| sent.get("error").is_none())
+            && client.wait_for_output("MARK_PURE_BRAVO", Duration::from_secs(2))
+        {
+            resynced = true;
+            break;
+        }
+    }
+    assert!(
+        resynced,
+        "pure client must resync and render post-handoff pane output; output: {:?}",
+        client.output_snapshot()
+    );
+
+    let pids = support::herdr_server_pids_for_runtime_dir(&runtime_dir).unwrap_or_default();
+    drop(client);
+    drop(server);
     for pid in pids {
         unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
     }

@@ -25,6 +25,9 @@ pub(crate) struct GlobalChrome {
     /// client keeps this selector and writes only the focused remote's
     /// title.
     pub(crate) window_title: Option<String>,
+    /// Double-click candidate for pane word selection, client-side mouse
+    /// state exactly like the legacy `App::last_pane_click`.
+    pub(crate) last_pane_click: Option<crate::app::PaneClickState>,
 }
 
 impl GlobalChrome {

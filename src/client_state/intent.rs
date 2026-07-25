@@ -194,16 +194,41 @@ pub(super) fn dispatch_mouse_intent(
     app: &mut AppState,
 ) {
     // Hit testing runs on the composed state with no live runtimes: chrome
-    // actions resolve exactly, pane-content interactions (selection drags)
-    // simply find no runtime and do nothing.
+    // actions resolve exactly, and pane-content interactions (selection
+    // drags, copy-on-select, scrollbar clicks and drags) run against the
+    // replicas through the pane-content seam. Byte forwarding to
+    // mouse-reporting panes already happened in the caller, so the empty
+    // registry only mutes the residual forwarding paths.
     let mode_before = app.mode;
-    let mut empty_runtimes = crate::terminal::TerminalRuntimeRegistry::new();
-    let action = app.handle_mouse(&mut empty_runtimes, mouse);
+    let empty_runtimes = crate::terminal::TerminalRuntimeRegistry::new();
+    let action = {
+        let source = super::compose::MirrorPaneSource::new(mirrors.local());
+        app.handle_mouse_with_content(&empty_runtimes, &source, mouse)
+    };
+    // A mouse-driven copy (copy_on_select drag release, double-click word
+    // copies) lands in request_clipboard_write; the pure client is the
+    // host terminal, so it goes straight out as OSC52.
+    if let Some(content) = app.request_clipboard_write.take() {
+        crate::selection::write_osc52_bytes(&content);
+    }
     // handle_mouse can open modal surfaces. Context menus, confirm-close,
     // and rename dialogs are interpreted client-side below; anything else
-    // (settings, worktree dialogs) stays unsupported under the flag, so
-    // revert to the pre-click mode instead of trapping the user in a dead
+    // reverts to the pre-click mode instead of trapping the user in a dead
     // modal.
+    //
+    // NOT CLOSED IN #21 — settings dialog and navigator under the flag.
+    // Both are App-coupled, not AppState-coupled: every settings mutation
+    // (SettingsAction::Save*) is an App method that does a config-file
+    // load-modify-write plus an in-process runtime re-apply (theme reload,
+    // sound engine, integration installs), and the navigator's open/refresh
+    // path (App::open_navigator and Mode::Navigator key dispatch in
+    // app/mod.rs) rebuilds its rows from live workspace runtimes. Closing
+    // them needs either extracting those handlers into AppState-level
+    // state machines like pure_client_modal_key, or a config surface on
+    // the control plane; neither fits this change. What remains:
+    // interpret MouseAction::Settings plus Mode::Settings, Mode::Navigator,
+    // and Mode::GlobalMenu key handling client-side. The same applies to
+    // the worktree dialog modes, which additionally run git operations.
     if !matches!(
         app.mode,
         crate::app::Mode::Terminal
@@ -374,9 +399,10 @@ pub(super) fn mouse_intent_method(
                 ratio,
             }))
         }
-        // Settings, toast targets, and modal actions are handled elsewhere
-        // (modal actions in interpret_modal_mouse; settings stays
-        // unsupported under the flag).
+        // Modal actions are handled in interpret_modal_mouse. Settings stays
+        // unsupported under the flag (see the NOT CLOSED note in
+        // dispatch_mouse_intent for why and what remains); toast targets
+        // have no composed equivalent yet.
         _ => None,
     }
 }

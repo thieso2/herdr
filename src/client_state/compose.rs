@@ -69,6 +69,22 @@ pub(crate) fn compose_into(
     ids.retain_known(&mirror.catalog);
     let catalog = &mirror.catalog;
 
+    // Client-side modals (confirm-close, rename, context menu) target the
+    // workspace at `app.selected`, which can differ from the focused
+    // workspace (right-click on a non-focused row). A recompose while such
+    // a modal is open must not clobber that target, so remember it by id.
+    let modal_targets_selection = matches!(
+        app.mode,
+        crate::app::Mode::ContextMenu
+            | crate::app::Mode::ConfirmClose
+            | crate::app::Mode::RenameWorkspace
+            | crate::app::Mode::RenameTab
+            | crate::app::Mode::RenamePane
+    );
+    let selected_workspace_id = modal_targets_selection
+        .then(|| app.workspaces.get(app.selected).map(|ws| ws.id.clone()))
+        .flatten();
+
     let mut workspaces = Vec::new();
     let mut terminals = HashMap::new();
     for workspace_info in &catalog.workspaces {
@@ -144,9 +160,26 @@ pub(crate) fn compose_into(
     app.workspaces = workspaces;
     app.terminals = terminals;
     app.active = active;
-    app.selected = active
+    let followed_focus = active
         .unwrap_or(0)
         .min(app.workspaces.len().saturating_sub(1));
+    app.selected = if modal_targets_selection {
+        match selected_workspace_id.and_then(|id| app.workspaces.iter().position(|ws| ws.id == id))
+        {
+            Some(idx) => idx,
+            None => {
+                // The modal's target workspace left the catalog: acting on
+                // a fallback workspace would close or rename the wrong one,
+                // so the modal is dropped instead (sync_mode promotes
+                // Navigate back to Terminal when focus exists).
+                app.mode = crate::app::Mode::Navigate;
+                app.context_menu = None;
+                followed_focus
+            }
+        }
+    } else {
+        followed_focus
+    };
 
     app.sidebar_collapsed = chrome.sidebar_collapsed;
     app.workspace_scroll = chrome.workspace_scroll;
@@ -570,6 +603,59 @@ mod tests {
             Some("p_2_10"),
             "composed focus must follow pane_focused events, not the stale layout snapshot"
         );
+        app.assert_invariants_for_test();
+    }
+
+    #[tokio::test]
+    async fn recompose_preserves_modal_selection_target() {
+        // Two workspaces; ws_2 is focused, ws_10 is the non-focused row the
+        // user right-clicked (test_with_adversarial_catalog order).
+        let mirror = mirror_with_layout();
+        let chrome = GlobalChrome::new();
+        let mut ids = ComposeIds::new();
+        let mut app = AppState::test_new();
+        compose_into(&mirror, &chrome, &mut ids, &mut app);
+        assert_eq!(app.active, Some(0));
+        assert_eq!(app.workspaces[1].id, "ws_10");
+
+        // The user picked the non-focused workspace in a confirm-close
+        // dialog; a catalog-driven recompose must keep targeting it.
+        app.mode = crate::app::Mode::ConfirmClose;
+        app.selected = 1;
+        compose_into(&mirror, &chrome, &mut ids, &mut app);
+        assert_eq!(app.selected, 1, "modal target survives recompose");
+        assert_eq!(app.mode, crate::app::Mode::ConfirmClose);
+
+        // Same preservation for rename dialogs.
+        app.mode = crate::app::Mode::RenameWorkspace;
+        compose_into(&mirror, &chrome, &mut ids, &mut app);
+        assert_eq!(app.selected, 1);
+
+        // Outside modal modes the selection follows the focused workspace.
+        app.mode = crate::app::Mode::Terminal;
+        compose_into(&mirror, &chrome, &mut ids, &mut app);
+        assert_eq!(app.selected, 0);
+
+        // If the modal's target vanishes from the catalog, the modal is
+        // dropped rather than retargeted at the focused workspace.
+        app.mode = crate::app::Mode::ConfirmClose;
+        app.selected = 1;
+        let mut shrunk = mirror;
+        shrunk
+            .catalog
+            .workspaces
+            .retain(|ws| ws.workspace_id != "ws_10");
+        shrunk
+            .catalog
+            .tabs
+            .retain(|tab| tab.workspace_id != "ws_10");
+        shrunk
+            .catalog
+            .panes
+            .retain(|pane| pane.workspace_id != "ws_10");
+        compose_into(&shrunk, &chrome, &mut ids, &mut app);
+        assert_eq!(app.mode, crate::app::Mode::Navigate, "modal dropped");
+        assert_eq!(app.selected, 0);
         app.assert_invariants_for_test();
     }
 

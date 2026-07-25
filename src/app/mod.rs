@@ -20,7 +20,8 @@ mod input;
 pub(crate) use input::MouseAction;
 #[cfg(unix)]
 pub(crate) use input::{
-    insert_rename_input_text, pure_client_modal_key, pure_client_modal_mouse, PureModalIds,
+    insert_rename_input_text, is_retained_selection_copy_key, pure_client_modal_key,
+    pure_client_modal_mouse, PureModalIds,
 };
 mod popup;
 mod runtime;
@@ -86,7 +87,7 @@ pub(crate) struct OverlayPaneState {
     temp_files: Vec<std::path::PathBuf>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PaneClickState {
     pane_id: crate::layout::PaneId,
     viewport_row: u16,
@@ -95,7 +96,20 @@ pub(crate) struct PaneClickState {
 }
 
 impl PaneClickState {
-    fn is_double_click_for(self, next: Self) -> bool {
+    /// A left-click candidate at a pane cell, stamped now. Shared with the
+    /// pure client's double-click word selection (unix-only run path, so
+    /// this constructor compiles out of Windows builds).
+    #[cfg(unix)]
+    pub(crate) fn new(pane_id: crate::layout::PaneId, viewport_row: u16, col: u16) -> Self {
+        Self {
+            pane_id,
+            viewport_row,
+            col,
+            at: Instant::now(),
+        }
+    }
+
+    pub(crate) fn is_double_click_for(self, next: Self) -> bool {
         self.pane_id == next.pane_id
             && next.at.duration_since(self.at) <= PANE_DOUBLE_CLICK_WINDOW
             && self.viewport_row.abs_diff(next.viewport_row) <= 1

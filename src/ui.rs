@@ -584,6 +584,11 @@ mod tests {
     fn characterization_app_state() -> AppState {
         let mut workspace = Workspace::test_new("characterization");
         workspace.identity_cwd = std::path::PathBuf::from("characterization");
+        // Workspace::test_new captures the git branch of the checkout it
+        // runs in (std::env::current_dir), which the sidebar renders into
+        // the hashed buffer. Pin it so the digests are identical on every
+        // branch, worktree, and detached checkout.
+        workspace.cached_git_branch = Some("char-branch".to_owned());
         workspace.test_add_tab(Some("logs"));
         workspace.switch_tab(0);
         let left = workspace.tabs[0].root_pane;
@@ -622,13 +627,14 @@ mod tests {
         assert!(all.contains("LEFT PANE"), "rows: {all}");
         assert!(all.contains("RIGHT"), "rows: {all}");
         assert!(all.contains("characterization"), "rows: {all}");
-        // Re-baselined on fleet/integration after the #17/#18 merges: the
-        // constant shipped with the seam refactor predated those merges and
-        // never matched this branch. Verified byte-identical before and
-        // after the copy-mode seam port.
+        assert!(all.contains("char-branch"), "rows: {all}");
+        // Baselined with cached_git_branch pinned (the previous constants
+        // hashed the live checkout's branch name and only matched the
+        // authoring worktree). With the environment held constant this
+        // render is byte-identical to the fleet/integration base.
         assert_eq!(
             digest,
-            "1468dfd57f219c66806fe746ea6f587400698b34c85ef6f0265378b520ea3050"
+            "bb5e1667ff64404f378028b508414f278a06c0ee3c4ac26b775251ea0f858023"
         );
     }
 
@@ -711,10 +717,10 @@ mod tests {
         assert_eq!(app.view.layout, ViewLayout::Mobile);
         let all = rows.join("\n");
         assert!(all.contains("characterization"), "rows: {all}");
-        // Re-baselined together with the desktop digest; see the note there.
+        // Baselined together with the desktop digest; see the note there.
         assert_eq!(
             digest,
-            "9db7ea6b5f461c631f54399ba72b3b3bf04c3631778e025307670b277fd94d1e"
+            "340bfea61b50d9c1eb018e12919bddb59b186838801fa8c103a1664cadb56256"
         );
     }
 

@@ -1711,6 +1711,109 @@ impl AppState {
         terminal_runtimes.get(terminal_id)
     }
 
+    /// Read-only pane content lookup for the UI layer: same resolution as
+    /// [`Self::runtime_for_pane_in_workspace`], but through the
+    /// [`crate::terminal::PaneContentSource`] seam so callers do not name the
+    /// runtime registry.
+    pub(crate) fn content_for_pane_in_workspace<'a>(
+        &'a self,
+        content: &'a dyn crate::terminal::PaneContentSource,
+        ws_idx: usize,
+        pane_id: crate::layout::PaneId,
+    ) -> Option<&'a dyn crate::terminal::PaneContent> {
+        #[cfg(test)]
+        if let Some(runtime) = self.workspaces.get(ws_idx)?.test_runtimes.get(&pane_id) {
+            return Some(runtime);
+        }
+        #[cfg(test)]
+        if let Some(runtime) = self
+            .workspaces
+            .get(ws_idx)?
+            .tabs
+            .iter()
+            .find_map(|tab| tab.runtimes.get(&pane_id))
+        {
+            return Some(runtime);
+        }
+        let terminal_id = self.workspaces.get(ws_idx)?.terminal_id(pane_id)?;
+        content.pane_content(terminal_id)
+    }
+
+    /// Applies pane resizes planned by `compute_view` to live runtimes.
+    ///
+    /// In tests, panes backed by test runtimes are resized through the same
+    /// lookup `compute_view` used, so geometry-driven resize semantics stay
+    /// identical to when `compute_view` resized panes itself.
+    pub(crate) fn apply_pane_resize_requests(
+        &self,
+        terminal_runtimes: &crate::terminal::TerminalRuntimeRegistry,
+        requests: &[crate::terminal::PaneResizeRequest],
+        cell_size: crate::kitty_graphics::HostCellSize,
+    ) {
+        for request in requests {
+            #[cfg(test)]
+            if let Some(runtime) = self.test_runtime_for_terminal(&request.terminal_id) {
+                runtime.resize(
+                    request.rows,
+                    request.cols,
+                    cell_size.width_px,
+                    cell_size.height_px,
+                );
+                continue;
+            }
+            if let Some(runtime) = terminal_runtimes.get(&request.terminal_id) {
+                runtime.resize(
+                    request.rows,
+                    request.cols,
+                    cell_size.width_px,
+                    cell_size.height_px,
+                );
+            }
+        }
+    }
+
+    /// Applies planned pane resizes to test runtimes only, for pure-state
+    /// tests that call `compute_view` without a runtime registry.
+    #[cfg(test)]
+    pub(crate) fn apply_pane_resize_requests_to_test_runtimes(
+        &self,
+        requests: &[crate::terminal::PaneResizeRequest],
+    ) {
+        let cell_size = crate::kitty_graphics::HostCellSize::default();
+        for request in requests {
+            if let Some(runtime) = self.test_runtime_for_terminal(&request.terminal_id) {
+                runtime.resize(
+                    request.rows,
+                    request.cols,
+                    cell_size.width_px,
+                    cell_size.height_px,
+                );
+            }
+        }
+    }
+
+    /// Test-runtime lookup by terminal id, mirroring the pane-id based test
+    /// fallbacks in [`Self::runtime_for_pane_in_workspace`].
+    #[cfg(test)]
+    fn test_runtime_for_terminal(
+        &self,
+        terminal_id: &crate::terminal::TerminalId,
+    ) -> Option<&crate::terminal::TerminalRuntime> {
+        self.workspaces.iter().find_map(|ws| {
+            ws.tabs.iter().find_map(|tab| {
+                tab.layout.pane_ids().into_iter().find_map(|pane_id| {
+                    (tab.terminal_id(pane_id) == Some(terminal_id))
+                        .then(|| {
+                            ws.test_runtimes
+                                .get(&pane_id)
+                                .or_else(|| tab.runtimes.get(&pane_id))
+                        })
+                        .flatten()
+                })
+            })
+        })
+    }
+
     #[cfg(test)]
     pub(crate) fn runtime_for_pane<'a>(
         &'a self,

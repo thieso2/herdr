@@ -380,7 +380,7 @@ impl AppState {
 
     pub(crate) fn navigator_rows_from(
         &self,
-        terminal_runtimes: &crate::terminal::TerminalRuntimeRegistry,
+        terminal_runtimes: &dyn crate::terminal::PaneContentSource,
     ) -> Vec<NavigatorRow> {
         let query = self.navigator.query.trim().to_lowercase();
         let query_kind = navigator_query_kind(&query, self.navigator.state_filter);

@@ -1,15 +1,16 @@
 use ratatui::{layout::Rect, Frame};
 
-use super::panes::{compute_pane_infos, render_panes, resize_tab_panes};
+use super::panes::{compute_pane_infos, plan_tab_panes_resizes, render_panes};
 use crate::app::state::ViewState;
 use crate::app::{AppState, Mode};
 use crate::layout::{PaneInfo, SplitBorder};
 use crate::protocol::CursorState;
-use crate::terminal::TerminalRuntimeRegistry;
+use crate::terminal::{PaneContentSource, PaneResizeRequest};
 
 pub(crate) struct TabSurfaceLayout {
     pub(crate) pane_infos: Vec<PaneInfo>,
     pub(crate) split_borders: Vec<SplitBorder>,
+    pub(crate) resize_requests: Vec<PaneResizeRequest>,
 }
 
 #[derive(Clone, Copy)]
@@ -29,10 +30,9 @@ impl ViewState {
 
 pub(crate) fn compute_tab_surface(
     app: &AppState,
-    terminal_runtimes: &TerminalRuntimeRegistry,
+    content: &dyn PaneContentSource,
     area: Rect,
     resize_panes: bool,
-    cell_size: crate::kitty_graphics::HostCellSize,
 ) -> TabSurfaceLayout {
     let split_borders = app
         .active
@@ -45,33 +45,35 @@ pub(crate) fn compute_tab_surface(
             }
         })
         .unwrap_or_default();
-    let pane_infos = compute_pane_infos(app, terminal_runtimes, area, resize_panes, cell_size);
+    let mut resize_requests = Vec::new();
+    let pane_infos = compute_pane_infos(app, content, area, resize_panes, &mut resize_requests);
 
     TabSurfaceLayout {
         pane_infos,
         split_borders,
+        resize_requests,
     }
 }
 
-pub(crate) fn resize_tab_surface(
+pub(crate) fn plan_tab_surface_resizes(
     app: &AppState,
-    terminal_runtimes: &TerminalRuntimeRegistry,
+    content: &dyn PaneContentSource,
     tab: &crate::workspace::Tab,
     area: Rect,
-    cell_size: crate::kitty_graphics::HostCellSize,
+    requests: &mut Vec<PaneResizeRequest>,
 ) {
-    resize_tab_panes(app, terminal_runtimes, tab, area, cell_size);
+    plan_tab_panes_resizes(app, content, tab, area, requests);
 }
 
 pub(crate) fn render_tab_surface(
     app: &AppState,
-    terminal_runtimes: &TerminalRuntimeRegistry,
+    content: &dyn PaneContentSource,
     surface: TabSurfaceView<'_>,
     frame: &mut Frame,
 ) {
     render_panes(
         app,
-        terminal_runtimes,
+        content,
         frame,
         surface.pane_infos,
         surface.split_borders,
@@ -80,7 +82,7 @@ pub(crate) fn render_tab_surface(
 
 pub(crate) fn tab_surface_hyperlinks(
     app: &AppState,
-    terminal_runtimes: &TerminalRuntimeRegistry,
+    content: &dyn PaneContentSource,
     surface: TabSurfaceView<'_>,
 ) -> Vec<((u16, u16), String, String)> {
     let Some(ws_idx) = app.active else {
@@ -92,8 +94,7 @@ pub(crate) fn tab_surface_hyperlinks(
 
     let mut links = Vec::new();
     for info in surface.pane_infos {
-        if let Some(runtime) = app.runtime_for_pane_in_workspace(terminal_runtimes, ws_idx, info.id)
-        {
+        if let Some(runtime) = app.content_for_pane_in_workspace(content, ws_idx, info.id) {
             links.extend(runtime.visible_hyperlinks(info.inner_rect));
         }
     }
@@ -102,7 +103,7 @@ pub(crate) fn tab_surface_hyperlinks(
 
 pub(crate) fn tab_surface_cursor(
     app: &AppState,
-    terminal_runtimes: &TerminalRuntimeRegistry,
+    content: &dyn PaneContentSource,
     surface: TabSurfaceView<'_>,
 ) -> Option<CursorState> {
     if app.mode != Mode::Terminal {
@@ -114,7 +115,7 @@ pub(crate) fn tab_surface_cursor(
     if !app.pane_exposes_host_cursor(ws_idx, info.id) {
         return None;
     }
-    let runtime = app.runtime_for_pane_in_workspace(terminal_runtimes, ws_idx, info.id)?;
+    let runtime = app.content_for_pane_in_workspace(content, ws_idx, info.id)?;
     if runtime.synchronized_output_active() {
         return None;
     }
@@ -197,10 +198,9 @@ mod tests {
         assert_eq!(area, Rect::new(26, 1, 80, 19));
         let surface = compute_tab_surface(
             &app,
-            &TerminalRuntimeRegistry::new(),
+            &crate::terminal::TerminalRuntimeRegistry::new(),
             area,
             false,
-            crate::kitty_graphics::HostCellSize::default(),
         );
         assert_eq!(surface.pane_infos.len(), 2);
         assert!(!surface.split_borders.is_empty());
@@ -217,7 +217,12 @@ mod tests {
             Terminal::new(TestBackend::new(full_area.width, full_area.height)).unwrap();
         terminal
             .draw(|frame| {
-                render_tab_surface(&app, &TerminalRuntimeRegistry::new(), surface_view, frame)
+                render_tab_surface(
+                    &app,
+                    &crate::terminal::TerminalRuntimeRegistry::new(),
+                    surface_view,
+                    frame,
+                )
             })
             .unwrap();
 
@@ -232,17 +237,28 @@ mod tests {
         assert!(rendered.contains("RIGHT"), "surface: {rendered:?}");
         assert!(!rendered.contains("shell-workspace"));
 
-        let links = tab_surface_hyperlinks(&app, &TerminalRuntimeRegistry::new(), surface_view);
+        let links = tab_surface_hyperlinks(
+            &app,
+            &crate::terminal::TerminalRuntimeRegistry::new(),
+            surface_view,
+        );
         assert!(links
             .iter()
             .any(|(_, symbol, link)| { symbol == "L" && link == uri }));
-        assert!(tab_surface_cursor(&app, &TerminalRuntimeRegistry::new(), surface_view,).is_some());
+        assert!(tab_surface_cursor(
+            &app,
+            &crate::terminal::TerminalRuntimeRegistry::new(),
+            surface_view,
+        )
+        .is_some());
     }
 
     fn full_app_frame(app: &mut AppState, area: Rect) -> crate::protocol::FrameData {
         let (buffer, cursor) = crate::server::render_stream::render_virtual(app, area, true);
-        let hyperlinks =
-            crate::server::render_stream::visible_hyperlinks(app, &TerminalRuntimeRegistry::new());
+        let hyperlinks = crate::server::render_stream::visible_hyperlinks(
+            app,
+            &crate::terminal::TerminalRuntimeRegistry::new(),
+        );
         crate::protocol::FrameData::from_ratatui_buffer_with_hyperlinks(
             &buffer,
             cursor,

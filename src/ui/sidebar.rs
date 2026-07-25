@@ -15,7 +15,7 @@ use super::text::{display_width, display_width_u16, truncate_end};
 use crate::app::state::{AgentPanelSort, Palette};
 use crate::app::{AppState, Mode};
 use crate::detect::AgentState;
-use crate::terminal::TerminalRuntimeRegistry;
+use crate::terminal::{EmptyPaneContentSource, PaneContentSource};
 
 const WORKSPACE_SECTION_HEADER_ROWS: u16 = 2;
 const AGENT_PANEL_HEADER_ROWS: u16 = 3;
@@ -119,32 +119,25 @@ pub(crate) fn all_agent_panel_entries(app: &AppState) -> Vec<AgentPanelEntry> {
 
 pub(crate) fn agent_panel_entries_from(
     app: &AppState,
-    terminal_runtimes: &TerminalRuntimeRegistry,
+    content: &dyn PaneContentSource,
 ) -> Vec<AgentPanelEntry> {
-    agent_panel_entries_with_runtimes(app, Some(terminal_runtimes))
+    agent_panel_entries_with_runtimes(app, Some(content))
 }
 
 fn agent_panel_entries_with_runtimes(
     app: &AppState,
-    terminal_runtimes: Option<&TerminalRuntimeRegistry>,
+    content: Option<&dyn PaneContentSource>,
 ) -> Vec<AgentPanelEntry> {
-    let mut entries = collect_agent_panel_entries_with_runtimes(app, terminal_runtimes);
+    let mut entries = collect_agent_panel_entries_with_runtimes(app, content);
     crate::app::agent_view::apply_agent_view(app, &mut entries);
     entries
 }
 
 fn collect_agent_panel_entries_with_runtimes(
     app: &AppState,
-    terminal_runtimes: Option<&TerminalRuntimeRegistry>,
+    content: Option<&dyn PaneContentSource>,
 ) -> Vec<AgentPanelEntry> {
-    let empty_runtimes;
-    let terminal_runtimes = match terminal_runtimes {
-        Some(terminal_runtimes) => terminal_runtimes,
-        None => {
-            empty_runtimes = TerminalRuntimeRegistry::new();
-            &empty_runtimes
-        }
-    };
+    let terminal_runtimes = content.unwrap_or(&EmptyPaneContentSource);
 
     app.workspaces
         .iter()
@@ -884,7 +877,7 @@ pub(crate) fn workspace_drop_indicator_row(
 
 pub(super) fn render_sidebar(
     app: &AppState,
-    terminal_runtimes: &TerminalRuntimeRegistry,
+    terminal_runtimes: &dyn PaneContentSource,
     frame: &mut Frame,
     area: Rect,
 ) {
@@ -1109,7 +1102,7 @@ fn apply_token_style(mut style: Style, patch: crate::config::SidebarTokenStyle) 
 
 fn render_workspace_list(
     app: &AppState,
-    terminal_runtimes: &TerminalRuntimeRegistry,
+    terminal_runtimes: &dyn PaneContentSource,
     frame: &mut Frame,
     area: Rect,
     is_navigating: bool,
@@ -1309,7 +1302,7 @@ fn render_workspace_list(
 
 fn render_agent_detail(
     app: &AppState,
-    terminal_runtimes: &TerminalRuntimeRegistry,
+    terminal_runtimes: &dyn PaneContentSource,
     frame: &mut Frame,
     area: Rect,
 ) {
@@ -1515,7 +1508,14 @@ mod tests {
         let area = Rect::new(0, 0, 26, 20);
         let mut terminal = Terminal::new(TestBackend::new(26, 20)).unwrap();
         terminal
-            .draw(|frame| render_sidebar(&app, &TerminalRuntimeRegistry::new(), frame, area))
+            .draw(|frame| {
+                render_sidebar(
+                    &app,
+                    &crate::terminal::TerminalRuntimeRegistry::new(),
+                    frame,
+                    area,
+                )
+            })
             .unwrap();
         let buffer = terminal.backend().buffer();
         let (_, agent_area) = expanded_sidebar_sections(area, app.sidebar_section_split);
@@ -1567,7 +1567,14 @@ rows = [[{ token = "workspace", bold = false }, { token = "agent", dim = false }
         let area = Rect::new(0, 0, 26, 20);
         let mut terminal = Terminal::new(TestBackend::new(26, 20)).unwrap();
         terminal
-            .draw(|frame| render_sidebar(&app, &TerminalRuntimeRegistry::new(), frame, area))
+            .draw(|frame| {
+                render_sidebar(
+                    &app,
+                    &crate::terminal::TerminalRuntimeRegistry::new(),
+                    frame,
+                    area,
+                )
+            })
             .unwrap();
         let (_, agent_area) = expanded_sidebar_sections(area, app.sidebar_section_split);
         let body = agent_panel_body_rect(agent_area, false);
@@ -1593,7 +1600,14 @@ rows = [[{ token = "workspace", bold = false }, { token = "agent", dim = false }
         let second_row = app.view.workspace_card_areas[1].rect.y;
         let mut terminal = Terminal::new(TestBackend::new(26, 20)).unwrap();
         terminal
-            .draw(|frame| render_sidebar(&app, &TerminalRuntimeRegistry::new(), frame, area))
+            .draw(|frame| {
+                render_sidebar(
+                    &app,
+                    &crate::terminal::TerminalRuntimeRegistry::new(),
+                    frame,
+                    area,
+                )
+            })
             .unwrap();
         let buffer = terminal.backend().buffer();
 
@@ -1636,7 +1650,14 @@ rows = [[{ token = "$hype", fg = "#abcdef", bold = true, dim = false }, "workspa
         let row = app.view.workspace_card_areas[0].rect.y;
         let mut terminal = Terminal::new(TestBackend::new(26, 20)).unwrap();
         terminal
-            .draw(|frame| render_sidebar(&app, &TerminalRuntimeRegistry::new(), frame, area))
+            .draw(|frame| {
+                render_sidebar(
+                    &app,
+                    &crate::terminal::TerminalRuntimeRegistry::new(),
+                    frame,
+                    area,
+                )
+            })
             .unwrap();
         let buffer = terminal.backend().buffer();
         let h = buffer[(find_symbol_x(buffer, row, 25, "H"), row)].style();
@@ -1712,7 +1733,14 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
         let body = agent_panel_body_rect(area, false);
         let mut terminal = Terminal::new(TestBackend::new(20, 5)).unwrap();
         terminal
-            .draw(|frame| render_agent_detail(&app, &TerminalRuntimeRegistry::new(), frame, area))
+            .draw(|frame| {
+                render_agent_detail(
+                    &app,
+                    &crate::terminal::TerminalRuntimeRegistry::new(),
+                    frame,
+                    area,
+                )
+            })
             .unwrap();
         let buffer = terminal.backend().buffer();
 
@@ -1738,7 +1766,14 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
         let area = Rect::new(0, 0, 18, 20);
         let mut terminal = Terminal::new(TestBackend::new(18, 20)).unwrap();
         terminal
-            .draw(|frame| render_sidebar(&app, &TerminalRuntimeRegistry::new(), frame, area))
+            .draw(|frame| {
+                render_sidebar(
+                    &app,
+                    &crate::terminal::TerminalRuntimeRegistry::new(),
+                    frame,
+                    area,
+                )
+            })
             .unwrap();
         let buffer = terminal.backend().buffer();
         let (_, agent_area) = expanded_sidebar_sections(area, app.sidebar_section_split);
@@ -1769,7 +1804,14 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
         let area = Rect::new(0, 0, 10, 12);
         let mut renderer = Terminal::new(TestBackend::new(10, 12)).unwrap();
         renderer
-            .draw(|frame| render_sidebar(&app, &TerminalRuntimeRegistry::new(), frame, area))
+            .draw(|frame| {
+                render_sidebar(
+                    &app,
+                    &crate::terminal::TerminalRuntimeRegistry::new(),
+                    frame,
+                    area,
+                )
+            })
             .unwrap();
         let (_, agent_area) = expanded_sidebar_sections(area, app.sidebar_section_split);
         let body = agent_panel_body_rect(agent_area, false);
@@ -2166,7 +2208,7 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
 
-        let mut runtime_registry = TerminalRuntimeRegistry::new();
+        let mut runtime_registry = crate::terminal::TerminalRuntimeRegistry::new();
         runtime_registry.insert(terminal_id, runtime);
         let entries = agent_panel_entries_from(&app, &runtime_registry);
         let primary_label = entries[0].primary_label.clone();
@@ -2378,7 +2420,7 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
             .draw(|frame| {
                 render_workspace_list(
                     &app,
-                    &TerminalRuntimeRegistry::new(),
+                    &crate::terminal::TerminalRuntimeRegistry::new(),
                     frame,
                     list_area,
                     false,

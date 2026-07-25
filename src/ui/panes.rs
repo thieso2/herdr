@@ -15,9 +15,9 @@ use crate::app::state::Palette;
 use crate::app::{AppState, Mode};
 use crate::layout::PaneInfo;
 use crate::popup_size::resolve_popup_geometry;
-use crate::terminal::{TerminalRuntime, TerminalRuntimeRegistry};
+use crate::terminal::{PaneContent, PaneContentSource, PaneResizeRequest};
 
-pub(crate) fn pane_is_scrolled_back(rt: &TerminalRuntime) -> bool {
+pub(crate) fn pane_is_scrolled_back(rt: &dyn PaneContent) -> bool {
     rt.scroll_metrics()
         .is_some_and(|metrics| metrics.offset_from_bottom > 0)
 }
@@ -128,22 +128,22 @@ pub(crate) fn apply_pane_chrome(
         .collect()
 }
 
-fn runtime_for_tab_pane<'a>(
-    terminal_runtimes: &'a TerminalRuntimeRegistry,
+fn content_for_tab_pane<'a>(
+    content: &'a dyn PaneContentSource,
     tab: &'a crate::workspace::Tab,
     pane_id: crate::layout::PaneId,
-) -> Option<(&'a crate::terminal::TerminalId, &'a TerminalRuntime)> {
+) -> Option<(&'a crate::terminal::TerminalId, &'a dyn PaneContent)> {
     let terminal_id = tab.terminal_id(pane_id)?;
     #[cfg(test)]
     if let Some(runtime) = tab.runtimes.get(&pane_id) {
-        return Some((terminal_id, runtime));
+        return Some((terminal_id, runtime as _));
     }
-    terminal_runtimes
-        .get(terminal_id)
-        .map(|runtime| (terminal_id, runtime))
+    content
+        .pane_content(terminal_id)
+        .map(|pane_content| (terminal_id, pane_content))
 }
 
-fn stable_scrollbar_gutter(rt: &TerminalRuntime, pane_inner: Rect) -> (Rect, Option<Rect>) {
+fn stable_scrollbar_gutter(rt: &dyn PaneContent, pane_inner: Rect) -> (Rect, Option<Rect>) {
     let inner_rect = stable_terminal_inner_rect(pane_inner);
     if inner_rect == pane_inner {
         return (inner_rect, None);
@@ -162,19 +162,20 @@ fn stable_scrollbar_gutter(rt: &TerminalRuntime, pane_inner: Rect) -> (Rect, Opt
     (inner_rect, scrollbar_rect)
 }
 
-/// Resize every visible runtime in a tab to the geometry it would receive if the tab were selected.
-pub(super) fn resize_tab_panes(
+/// Plan a resize for every visible pane in a tab to the geometry it would
+/// receive if the tab were selected.
+pub(super) fn plan_tab_panes_resizes(
     app: &AppState,
-    terminal_runtimes: &TerminalRuntimeRegistry,
+    content: &dyn PaneContentSource,
     tab: &crate::workspace::Tab,
     area: Rect,
-    cell_size: crate::kitty_graphics::HostCellSize,
+    requests: &mut Vec<PaneResizeRequest>,
 ) {
     let multi_pane = tab.layout.pane_count() > 1;
 
     if tab.zoomed {
         let focused_id = tab.layout.focused();
-        if let Some((terminal_id, rt)) = runtime_for_tab_pane(terminal_runtimes, tab, focused_id) {
+        if let Some((terminal_id, _)) = content_for_tab_pane(content, tab, focused_id) {
             let borders = if multi_pane && app.pane_borders {
                 Borders::ALL
             } else {
@@ -183,12 +184,11 @@ pub(super) fn resize_tab_panes(
             let pane_inner = pane_inner_rect(area, borders);
             let inner_rect = stable_terminal_inner_rect(pane_inner);
             if !app.direct_attach_resize_locks.contains(terminal_id) {
-                rt.resize(
-                    inner_rect.height,
-                    inner_rect.width,
-                    cell_size.width_px,
-                    cell_size.height_px,
-                );
+                requests.push(PaneResizeRequest {
+                    terminal_id: terminal_id.clone(),
+                    rows: inner_rect.height,
+                    cols: inner_rect.width,
+                });
             }
         }
         return;
@@ -197,27 +197,26 @@ pub(super) fn resize_tab_panes(
     for info in apply_pane_chrome(tab.layout.panes(area), app.pane_borders, app.pane_gaps) {
         let pane_inner = pane_inner_rect(info.rect, info.borders);
 
-        if let Some((terminal_id, rt)) = runtime_for_tab_pane(terminal_runtimes, tab, info.id) {
+        if let Some((terminal_id, _)) = content_for_tab_pane(content, tab, info.id) {
             let inner_rect = stable_terminal_inner_rect(pane_inner);
             if !app.direct_attach_resize_locks.contains(terminal_id) {
-                rt.resize(
-                    inner_rect.height,
-                    inner_rect.width,
-                    cell_size.width_px,
-                    cell_size.height_px,
-                );
+                requests.push(PaneResizeRequest {
+                    terminal_id: terminal_id.clone(),
+                    rows: inner_rect.height,
+                    cols: inner_rect.width,
+                });
             }
         }
     }
 }
 
-/// Compute pane layout info and optionally resize pane runtimes to match.
+/// Compute pane layout info and optionally plan pane resizes to match.
 pub(super) fn compute_pane_infos(
     app: &AppState,
-    terminal_runtimes: &TerminalRuntimeRegistry,
+    content: &dyn PaneContentSource,
     area: Rect,
     resize_panes: bool,
-    cell_size: crate::kitty_graphics::HostCellSize,
+    requests: &mut Vec<PaneResizeRequest>,
 ) -> Vec<PaneInfo> {
     let Some(ws_idx) = app.active else {
         return Vec::new();
@@ -238,19 +237,19 @@ pub(super) fn compute_pane_infos(
         let pane_inner = pane_inner_rect(area, borders);
         let mut inner_rect = pane_inner;
         let mut scrollbar_rect = None;
-        if let Some(rt) = app.runtime_for_pane_in_workspace(terminal_runtimes, ws_idx, focused_id) {
+        if let Some(rt) = app.content_for_pane_in_workspace(content, ws_idx, focused_id) {
             (inner_rect, scrollbar_rect) = stable_scrollbar_gutter(rt, pane_inner);
-            if resize_panes
-                && ws.terminal_id(focused_id).is_some_and(|terminal_id| {
-                    !app.direct_attach_resize_locks.contains(terminal_id)
-                })
-            {
-                rt.resize(
-                    inner_rect.height,
-                    inner_rect.width,
-                    cell_size.width_px,
-                    cell_size.height_px,
-                );
+            if resize_panes {
+                if let Some(terminal_id) = ws
+                    .terminal_id(focused_id)
+                    .filter(|terminal_id| !app.direct_attach_resize_locks.contains(*terminal_id))
+                {
+                    requests.push(PaneResizeRequest {
+                        terminal_id: terminal_id.clone(),
+                        rows: inner_rect.height,
+                        cols: inner_rect.width,
+                    });
+                }
             }
         }
         return vec![PaneInfo {
@@ -270,19 +269,19 @@ pub(super) fn compute_pane_infos(
 
         let mut inner_rect = pane_inner;
         let mut scrollbar_rect = None;
-        if let Some(rt) = app.runtime_for_pane_in_workspace(terminal_runtimes, ws_idx, info.id) {
+        if let Some(rt) = app.content_for_pane_in_workspace(content, ws_idx, info.id) {
             (inner_rect, scrollbar_rect) = stable_scrollbar_gutter(rt, pane_inner);
-            if resize_panes
-                && ws.terminal_id(info.id).is_some_and(|terminal_id| {
-                    !app.direct_attach_resize_locks.contains(terminal_id)
-                })
-            {
-                rt.resize(
-                    inner_rect.height,
-                    inner_rect.width,
-                    cell_size.width_px,
-                    cell_size.height_px,
-                );
+            if resize_panes {
+                if let Some(terminal_id) = ws
+                    .terminal_id(info.id)
+                    .filter(|terminal_id| !app.direct_attach_resize_locks.contains(*terminal_id))
+                {
+                    requests.push(PaneResizeRequest {
+                        terminal_id: terminal_id.clone(),
+                        rows: inner_rect.height,
+                        cols: inner_rect.width,
+                    });
+                }
             }
         }
 
@@ -295,7 +294,7 @@ pub(super) fn compute_pane_infos(
 
 pub(super) fn render_panes(
     app: &AppState,
-    terminal_runtimes: &TerminalRuntimeRegistry,
+    content: &dyn PaneContentSource,
     frame: &mut Frame,
     pane_infos: &[PaneInfo],
     split_borders: &[crate::layout::SplitBorder],
@@ -311,7 +310,7 @@ pub(super) fn render_panes(
     let terminal_active = app.mode == Mode::Terminal;
 
     for info in pane_infos {
-        if let Some(rt) = app.runtime_for_pane_in_workspace(terminal_runtimes, ws_idx, info.id) {
+        if let Some(rt) = app.content_for_pane_in_workspace(content, ws_idx, info.id) {
             let show_cursor = info.is_focused
                 && terminal_active
                 && !pane_is_scrolled_back(rt)
@@ -373,11 +372,11 @@ pub(crate) fn popup_pane_rects(app: &AppState, area: Rect) -> Option<(Rect, Rect
         .map(|geometry| (geometry.outer, geometry.inner))
 }
 
-pub(super) fn resize_popup_pane(
+pub(super) fn plan_popup_pane_resize(
     app: &AppState,
-    terminal_runtimes: &TerminalRuntimeRegistry,
+    content: &dyn PaneContentSource,
     area: Rect,
-    cell_size: crate::kitty_graphics::HostCellSize,
+    requests: &mut Vec<PaneResizeRequest>,
 ) {
     let Some(popup) = app.popup_pane.as_ref() else {
         return;
@@ -388,19 +387,18 @@ pub(super) fn resize_popup_pane(
     if app.direct_attach_resize_locks.contains(&popup.terminal_id) {
         return;
     }
-    if let Some(rt) = terminal_runtimes.get(&popup.terminal_id) {
-        rt.resize(
-            inner.height,
-            inner.width,
-            cell_size.width_px,
-            cell_size.height_px,
-        );
+    if content.pane_content(&popup.terminal_id).is_some() {
+        requests.push(PaneResizeRequest {
+            terminal_id: popup.terminal_id.clone(),
+            rows: inner.height,
+            cols: inner.width,
+        });
     }
 }
 
 pub(super) fn render_popup_pane(
     app: &AppState,
-    terminal_runtimes: &TerminalRuntimeRegistry,
+    content: &dyn PaneContentSource,
     frame: &mut Frame,
     area: Rect,
 ) {
@@ -410,7 +408,7 @@ pub(super) fn render_popup_pane(
     let Some((outer, inner)) = popup_pane_rects(app, area) else {
         return;
     };
-    let Some(rt) = terminal_runtimes.get(&popup.terminal_id) else {
+    let Some(rt) = content.pane_content(&popup.terminal_id) else {
         return;
     };
     let title = app
@@ -707,7 +705,7 @@ fn render_copy_mode_cursor(app: &AppState, frame: &mut Frame, info: &PaneInfo) {
 fn validated_copy_mode_search_matches(
     app: &AppState,
     info: &PaneInfo,
-    rt: &crate::terminal::TerminalRuntime,
+    rt: &dyn PaneContent,
 ) -> (u32, u32, Vec<(usize, crate::pane::TerminalTextMatch)>) {
     let Some(copy_mode) = app.copy_mode.as_ref() else {
         return (0, 0, Vec::new());
@@ -961,6 +959,7 @@ mod tests {
     use crate::layout::PaneId;
     use crate::selection::Selection;
     use crate::terminal::TerminalRuntime;
+    use crate::terminal::TerminalRuntimeRegistry;
     use crate::terminal::TerminalState;
     use crate::workspace::Workspace;
 
@@ -1256,13 +1255,7 @@ mod tests {
 
         let area = Rect::new(10, 3, 40, 8);
         let terminal_runtimes = TerminalRuntimeRegistry::new();
-        let infos = compute_pane_infos(
-            &app,
-            &terminal_runtimes,
-            area,
-            false,
-            crate::kitty_graphics::HostCellSize::default(),
-        );
+        let infos = compute_pane_infos(&app, &terminal_runtimes, area, false, &mut Vec::new());
         let info = &infos[0];
 
         assert_eq!(info.rect, area);
@@ -1285,13 +1278,7 @@ mod tests {
 
         let area = Rect::new(10, 3, 40, 8);
         let terminal_runtimes = TerminalRuntimeRegistry::new();
-        let infos = compute_pane_infos(
-            &app,
-            &terminal_runtimes,
-            area,
-            false,
-            crate::kitty_graphics::HostCellSize::default(),
-        );
+        let infos = compute_pane_infos(&app, &terminal_runtimes, area, false, &mut Vec::new());
         let info = &infos[0];
 
         assert_eq!(info.rect, area);
@@ -1314,13 +1301,7 @@ mod tests {
 
         let area = Rect::new(10, 3, 40, 8);
         let terminal_runtimes = TerminalRuntimeRegistry::new();
-        let infos = compute_pane_infos(
-            &app,
-            &terminal_runtimes,
-            area,
-            false,
-            crate::kitty_graphics::HostCellSize::default(),
-        );
+        let infos = compute_pane_infos(&app, &terminal_runtimes, area, false, &mut Vec::new());
         let info = &infos[0];
 
         assert_eq!(info.id, focused_pane);
@@ -1343,13 +1324,7 @@ mod tests {
 
         let area = Rect::new(10, 3, 4, 8);
         let terminal_runtimes = TerminalRuntimeRegistry::new();
-        let infos = compute_pane_infos(
-            &app,
-            &terminal_runtimes,
-            area,
-            false,
-            crate::kitty_graphics::HostCellSize::default(),
-        );
+        let infos = compute_pane_infos(&app, &terminal_runtimes, area, false, &mut Vec::new());
         let info = &infos[0];
 
         assert_eq!(info.rect, area);
@@ -1376,13 +1351,7 @@ mod tests {
 
         let area = Rect::new(10, 3, 40, 8);
         let terminal_runtimes = TerminalRuntimeRegistry::new();
-        let infos = compute_pane_infos(
-            &app,
-            &terminal_runtimes,
-            area,
-            false,
-            crate::kitty_graphics::HostCellSize::default(),
-        );
+        let infos = compute_pane_infos(&app, &terminal_runtimes, area, false, &mut Vec::new());
         let info = &infos[0];
 
         assert_eq!(info.rect, area);

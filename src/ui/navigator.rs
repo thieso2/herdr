@@ -16,11 +16,11 @@ use crate::app::state::{
     navigator_display_lines, AppState, NavigatorDisplayLine, NavigatorRow, NavigatorStateFilter,
     NavigatorTarget,
 };
-use crate::terminal::TerminalRuntimeRegistry;
+use crate::terminal::PaneContentSource;
 
 pub(super) fn render_navigator_overlay(
     app: &AppState,
-    terminal_runtimes: &TerminalRuntimeRegistry,
+    terminal_runtimes: &dyn PaneContentSource,
     frame: &mut Frame,
 ) {
     let popup = app.navigator_popup_rect();
@@ -355,7 +355,7 @@ fn metadata_width(width: u16) -> u16 {
 
 fn render_detail(
     app: &AppState,
-    terminal_runtimes: &TerminalRuntimeRegistry,
+    terminal_runtimes: &dyn PaneContentSource,
     frame: &mut Frame,
     area: Rect,
 ) {
@@ -374,7 +374,7 @@ fn render_detail(
     );
 }
 
-fn selected_detail(app: &AppState, terminal_runtimes: &TerminalRuntimeRegistry) -> String {
+fn selected_detail(app: &AppState, terminal_runtimes: &dyn PaneContentSource) -> String {
     let rows = app.navigator_rows_from(terminal_runtimes);
     let Some(row) = rows.get(app.navigator.selected) else {
         return String::new();
@@ -394,7 +394,7 @@ fn selected_detail(app: &AppState, terminal_runtimes: &TerminalRuntimeRegistry) 
 
 fn workspace_detail(
     app: &AppState,
-    terminal_runtimes: &TerminalRuntimeRegistry,
+    terminal_runtimes: &dyn PaneContentSource,
     ws_idx: usize,
 ) -> String {
     let Some(ws) = app.workspaces.get(ws_idx) else {
@@ -411,7 +411,7 @@ fn workspace_detail(
 
 fn tab_detail(
     app: &AppState,
-    terminal_runtimes: &TerminalRuntimeRegistry,
+    terminal_runtimes: &dyn PaneContentSource,
     ws_idx: usize,
     tab_idx: usize,
 ) -> String {
@@ -444,7 +444,7 @@ fn tab_detail(
 
 fn pane_detail(
     app: &AppState,
-    terminal_runtimes: &TerminalRuntimeRegistry,
+    terminal_runtimes: &dyn PaneContentSource,
     ws_idx: usize,
     tab_idx: usize,
     pane_id: crate::layout::PaneId,
@@ -502,7 +502,7 @@ fn pane_detail(
 
 fn rowless_workspace_activity(
     app: &AppState,
-    terminal_runtimes: &TerminalRuntimeRegistry,
+    terminal_runtimes: &dyn PaneContentSource,
     ws_idx: usize,
 ) -> String {
     app.navigator_rows_from(terminal_runtimes)

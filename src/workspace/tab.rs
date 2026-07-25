@@ -548,12 +548,12 @@ impl Tab {
         &self,
         pane_id: PaneId,
         terminals: &HashMap<TerminalId, TerminalState>,
-        terminal_runtimes: &TerminalRuntimeRegistry,
+        terminal_runtimes: &dyn crate::terminal::PaneContentSource,
     ) -> Option<PathBuf> {
         let terminal_id = self.terminal_id(pane_id)?;
         terminal_runtimes
-            .get(terminal_id)
-            .and_then(|rt| rt.cwd())
+            .pane_content(terminal_id)
+            .and_then(|content| content.cwd())
             .or_else(|| {
                 terminals
                     .get(terminal_id)

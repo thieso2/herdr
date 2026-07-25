@@ -937,20 +937,21 @@ impl HeadlessServer {
         };
         let (cols, rows) = self.effective_size;
         let area = Rect::new(0, 0, cols, rows);
-        if self.app.state.kitty_graphics_enabled && client.cell_size.is_known() {
-            crate::ui::compute_view_with_cell_size(
-                &mut self.app.state,
-                &self.app.terminal_runtimes,
-                area,
-                client.cell_size,
-            );
+        let cell_size = if self.app.state.kitty_graphics_enabled && client.cell_size.is_known() {
+            client.cell_size
         } else {
-            crate::ui::compute_view_with_runtime_registry(
-                &mut self.app.state,
-                &self.app.terminal_runtimes,
-                area,
-            );
-        }
+            crate::kitty_graphics::HostCellSize::default()
+        };
+        let resize_requests = crate::ui::compute_view_with_content(
+            &mut self.app.state,
+            &self.app.terminal_runtimes,
+            area,
+        );
+        self.app.state.apply_pane_resize_requests(
+            &self.app.terminal_runtimes,
+            &resize_requests,
+            cell_size,
+        );
 
         // Shared runtime size changes affect pane wrapping and foreground-driven
         // rendering semantics. Force one fresh frame to every remaining client

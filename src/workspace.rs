@@ -12,7 +12,7 @@ use crate::layout::PaneId;
 #[cfg(test)]
 use crate::layout::TileLayout;
 use crate::pane::{PaneLaunchEnv, PaneState};
-use crate::terminal::{TerminalId, TerminalRuntime, TerminalRuntimeRegistry, TerminalState};
+use crate::terminal::{TerminalId, TerminalRuntime, TerminalState};
 
 mod aggregate;
 mod git;
@@ -1085,7 +1085,7 @@ impl Workspace {
     pub fn resolved_identity_cwd_from(
         &self,
         terminals: &HashMap<TerminalId, TerminalState>,
-        terminal_runtimes: &TerminalRuntimeRegistry,
+        terminal_runtimes: &dyn crate::terminal::PaneContentSource,
     ) -> Option<PathBuf> {
         self.tabs
             .first()
@@ -1123,7 +1123,7 @@ impl Workspace {
     pub fn display_name_from(
         &self,
         terminals: &HashMap<TerminalId, TerminalState>,
-        terminal_runtimes: &TerminalRuntimeRegistry,
+        terminal_runtimes: &dyn crate::terminal::PaneContentSource,
     ) -> String {
         if let Some(name) = &self.custom_name {
             return name.clone();
@@ -1731,7 +1731,7 @@ mod tests {
             terminal_id.clone(),
             TerminalState::new(terminal_id, PathBuf::from("/herdr-test/pion")),
         );
-        let terminal_runtimes = TerminalRuntimeRegistry::new();
+        let terminal_runtimes = crate::terminal::TerminalRuntimeRegistry::new();
 
         assert_eq!(ws.display_name_from(&terminals, &terminal_runtimes), "pion");
         assert_eq!(

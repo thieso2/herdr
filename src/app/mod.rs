@@ -1095,24 +1095,29 @@ impl App {
                         cell_size = observed_cell_size.unwrap_or_else(|| {
                             crate::kitty_graphics::HostCellSize::fallback_for_area(area)
                         });
-                        crate::ui::compute_view_with_cell_size(
+                        let resize_requests = crate::ui::compute_view_with_content(
                             &mut self.state,
                             &self.terminal_runtimes,
                             area,
+                        );
+                        self.state.apply_pane_resize_requests(
+                            &self.terminal_runtimes,
+                            &resize_requests,
                             cell_size,
                         );
                     } else {
-                        crate::ui::compute_view_with_runtime_registry(
+                        let resize_requests = crate::ui::compute_view_with_content(
                             &mut self.state,
                             &self.terminal_runtimes,
                             area,
                         );
+                        self.state.apply_pane_resize_requests(
+                            &self.terminal_runtimes,
+                            &resize_requests,
+                            crate::kitty_graphics::HostCellSize::default(),
+                        );
                     }
-                    crate::ui::render_with_runtime_registry(
-                        &self.state,
-                        &self.terminal_runtimes,
-                        frame,
-                    );
+                    crate::ui::render_with_content(&self.state, &self.terminal_runtimes, frame);
                 })?;
                 if kitty_graphics_enabled {
                     crate::kitty_graphics::paint_local_pane_graphics(

@@ -46,7 +46,9 @@ use self::agent_detection::{
 #[cfg_attr(windows, allow(unused_imports))]
 pub(crate) use self::terminal::plain_terminal_input_state;
 pub(crate) use self::terminal::{
-    plain_terminal_cursor_state, plain_terminal_visible_hyperlinks, render_plain_terminal,
+    plain_terminal_cursor_state, plain_terminal_extract_selection,
+    plain_terminal_search_text_matches, plain_terminal_text_matches_are_current,
+    plain_terminal_visible_hyperlinks, plain_terminal_word_motion_target, render_plain_terminal,
     TerminalDirtyPatch, TerminalDirtyPatchOutcome, TerminalReadSnapshot, TerminalTextMatch,
     TerminalTextPoint, TerminalWordMotion,
 };

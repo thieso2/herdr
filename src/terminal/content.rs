@@ -42,8 +42,47 @@ pub(crate) trait PaneContent {
         text_matches: &[crate::pane::TerminalTextMatch],
     ) -> Vec<bool>;
 
+    /// Whether one candidate match still matches the screen text.
+    fn text_match_is_current(&self, text_match: crate::pane::TerminalTextMatch) -> bool {
+        self.text_matches_are_current(&[text_match])
+            .first()
+            .copied()
+            .unwrap_or(false)
+    }
+
     /// The pane's current working directory, when known live.
     fn cwd(&self) -> Option<std::path::PathBuf>;
+
+    /// Scrolls the viewport up by `lines` rows into history.
+    ///
+    /// Scroll mutations take `&self`: the live runtime already synchronizes
+    /// interior state behind its core lock, and the replica implementation
+    /// on [`std::cell::RefCell`] borrows mutably per call.
+    fn scroll_up(&self, lines: usize);
+
+    /// Scrolls the viewport down by `lines` rows toward the live tail.
+    fn scroll_down(&self, lines: usize);
+
+    /// Sets the viewport offset in rows from the bottom of history.
+    fn set_scroll_offset_from_bottom(&self, offset_from_bottom: usize);
+
+    /// Searches the pane's screen text (scrollback plus viewport).
+    fn search_text_matches(
+        &self,
+        query: &str,
+        case_sensitive: bool,
+    ) -> Vec<crate::pane::TerminalTextMatch>;
+
+    /// Word-motion target from a text position, for copy-mode vi motions.
+    fn word_motion_target(
+        &self,
+        row: u32,
+        col: u16,
+        motion: crate::pane::TerminalWordMotion,
+    ) -> Option<crate::pane::TerminalTextPoint>;
+
+    /// Extracts the selected text from the pane's screen rows.
+    fn extract_selection(&self, selection: &crate::selection::Selection) -> Option<String>;
 }
 
 impl PaneContent for TerminalRuntime {
@@ -81,11 +120,52 @@ impl PaneContent for TerminalRuntime {
     fn cwd(&self) -> Option<std::path::PathBuf> {
         TerminalRuntime::cwd(self)
     }
+
+    fn scroll_up(&self, lines: usize) {
+        TerminalRuntime::scroll_up(self, lines);
+    }
+
+    fn scroll_down(&self, lines: usize) {
+        TerminalRuntime::scroll_down(self, lines);
+    }
+
+    fn set_scroll_offset_from_bottom(&self, offset_from_bottom: usize) {
+        TerminalRuntime::set_scroll_offset_from_bottom(self, offset_from_bottom);
+    }
+
+    fn search_text_matches(
+        &self,
+        query: &str,
+        case_sensitive: bool,
+    ) -> Vec<crate::pane::TerminalTextMatch> {
+        TerminalRuntime::search_text_matches(self, query, case_sensitive)
+    }
+
+    fn text_match_is_current(&self, text_match: crate::pane::TerminalTextMatch) -> bool {
+        TerminalRuntime::text_match_is_current(self, text_match)
+    }
+
+    fn word_motion_target(
+        &self,
+        row: u32,
+        col: u16,
+        motion: crate::pane::TerminalWordMotion,
+    ) -> Option<crate::pane::TerminalTextPoint> {
+        TerminalRuntime::word_motion_target(self, row, col, motion)
+    }
+
+    fn extract_selection(&self, selection: &crate::selection::Selection) -> Option<String> {
+        TerminalRuntime::extract_selection(self, selection)
+    }
 }
 
-impl PaneContent for super::replica::PaneReplica {
+/// The replica implementation lives on `RefCell<PaneReplica>`: copy-mode
+/// scrolling mutates the replica's viewport through the shared reference the
+/// UI seam hands out, and the pure client is single-threaded per mirror so a
+/// `RefCell` is the exact fit (no lock, borrow bugs panic in tests).
+impl PaneContent for std::cell::RefCell<super::replica::PaneReplica> {
     fn render(&self, frame: &mut Frame, area: Rect, _show_cursor: bool) {
-        crate::pane::render_plain_terminal(self.terminal(), frame, area);
+        crate::pane::render_plain_terminal(self.borrow().terminal(), frame, area);
     }
 
     fn cursor_state(
@@ -96,7 +176,7 @@ impl PaneContent for super::replica::PaneReplica {
         if !show_cursor {
             return None;
         }
-        let cursor = crate::pane::plain_terminal_cursor_state(self.terminal())?;
+        let cursor = crate::pane::plain_terminal_cursor_state(self.borrow().terminal())?;
         if cursor.x >= area.width || cursor.y >= area.height {
             return None;
         }
@@ -104,32 +184,71 @@ impl PaneContent for super::replica::PaneReplica {
     }
 
     fn scroll_metrics(&self) -> Option<crate::pane::ScrollMetrics> {
-        super::replica::PaneReplica::scroll_metrics(self).ok()
+        super::replica::PaneReplica::scroll_metrics(&self.borrow()).ok()
     }
 
     fn synchronized_output_active(&self) -> bool {
-        self.terminal()
+        self.borrow()
+            .terminal()
             .mode_get(crate::ghostty::MODE_SYNCHRONIZED_OUTPUT)
             .unwrap_or(false)
     }
 
     fn visible_hyperlinks(&self, area: Rect) -> Vec<((u16, u16), String, String)> {
-        crate::pane::plain_terminal_visible_hyperlinks(self.terminal(), area)
+        crate::pane::plain_terminal_visible_hyperlinks(self.borrow().terminal(), area)
     }
 
     fn text_matches_are_current(
         &self,
         text_matches: &[crate::pane::TerminalTextMatch],
     ) -> Vec<bool> {
-        // Copy-mode search runs against live runtimes only; a replica has no
-        // search index yet, so no candidate can be confirmed current.
-        vec![false; text_matches.len()]
+        crate::pane::plain_terminal_text_matches_are_current(self.borrow().terminal(), text_matches)
     }
 
     fn cwd(&self) -> Option<std::path::PathBuf> {
         // The catalog carries the pane cwd as a server fact; the replica has
         // no live process to ask.
         None
+    }
+
+    fn scroll_up(&self, lines: usize) {
+        self.borrow_mut()
+            .scroll_delta(-(lines.min(isize::MAX as usize) as isize));
+    }
+
+    fn scroll_down(&self, lines: usize) {
+        self.borrow_mut()
+            .scroll_delta(lines.min(isize::MAX as usize) as isize);
+    }
+
+    fn set_scroll_offset_from_bottom(&self, offset_from_bottom: usize) {
+        self.borrow_mut()
+            .set_scroll_offset_from_bottom(offset_from_bottom);
+    }
+
+    fn search_text_matches(
+        &self,
+        query: &str,
+        case_sensitive: bool,
+    ) -> Vec<crate::pane::TerminalTextMatch> {
+        crate::pane::plain_terminal_search_text_matches(
+            self.borrow().terminal(),
+            query,
+            case_sensitive,
+        )
+    }
+
+    fn word_motion_target(
+        &self,
+        row: u32,
+        col: u16,
+        motion: crate::pane::TerminalWordMotion,
+    ) -> Option<crate::pane::TerminalTextPoint> {
+        crate::pane::plain_terminal_word_motion_target(self.borrow().terminal(), row, col, motion)
+    }
+
+    fn extract_selection(&self, selection: &crate::selection::Selection) -> Option<String> {
+        crate::pane::plain_terminal_extract_selection(self.borrow().terminal(), selection)
     }
 }
 

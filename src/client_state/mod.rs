@@ -19,6 +19,7 @@ pub(crate) mod intent;
 #[cfg(unix)]
 pub(crate) mod run;
 
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 
 use crate::terminal::replica::PaneReplica;
@@ -42,8 +43,11 @@ pub(crate) struct RemoteMirror {
     pub(crate) connection: ClientConnectionState,
     /// Event-driven session catalog, resynced in full on reconnect.
     pub(crate) catalog: SessionCatalog,
-    /// Replicated pane screens keyed by server stream id.
-    pub(crate) replicas: BTreeMap<u32, PaneReplica>,
+    /// Replicated pane screens keyed by server stream id. Each replica sits
+    /// in a `RefCell` so the pane-content seam can scroll it through the
+    /// shared references the UI layer works with; the pure client is
+    /// single-threaded per mirror.
+    pub(crate) replicas: BTreeMap<u32, RefCell<PaneReplica>>,
     /// Open stream id per public pane id.
     pub(crate) pane_streams: BTreeMap<String, u32>,
 }
@@ -109,7 +113,12 @@ impl RemoteMirror {
         if let Some(previous) = self.pane_streams.insert(pane_id, stream_id) {
             self.replicas.remove(&previous);
         }
-        self.replicas.insert(stream_id, replica);
+        self.replicas.insert(stream_id, RefCell::new(replica));
+    }
+
+    /// Mutable access to the replica behind a stream id.
+    pub(crate) fn replica_mut(&mut self, stream_id: u32) -> Option<&mut PaneReplica> {
+        self.replicas.get_mut(&stream_id).map(RefCell::get_mut)
     }
 
     /// Removes a closed or revoked stream and its replica.

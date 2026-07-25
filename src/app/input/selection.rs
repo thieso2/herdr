@@ -2,13 +2,13 @@ use crossterm::event::{MouseEvent, MouseEventKind};
 
 use crate::{
     app::state::{AppState, SelectionAutoscroll, SelectionAutoscrollDirection},
-    terminal::TerminalRuntimeRegistry,
+    terminal::PaneContentSource,
 };
 
 impl AppState {
     pub(crate) fn update_selection_cursor(
         &mut self,
-        terminal_runtimes: &TerminalRuntimeRegistry,
+        terminal_runtimes: &dyn PaneContentSource,
         pane_id: crate::layout::PaneId,
         screen_col: u16,
         screen_row: u16,
@@ -28,7 +28,7 @@ impl AppState {
 
     pub(super) fn update_selection_drag(
         &mut self,
-        terminal_runtimes: &TerminalRuntimeRegistry,
+        terminal_runtimes: &dyn PaneContentSource,
         screen_col: u16,
         screen_row: u16,
     ) {
@@ -141,7 +141,7 @@ impl AppState {
 
     pub(super) fn scroll_selection_with_wheel(
         &mut self,
-        terminal_runtimes: &TerminalRuntimeRegistry,
+        terminal_runtimes: &dyn PaneContentSource,
         mouse: MouseEvent,
     ) -> bool {
         let lines_per_notch = self.mouse_scroll_lines;

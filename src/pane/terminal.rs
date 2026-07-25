@@ -231,10 +231,10 @@ impl PaneTerminal {
         query: &str,
         case_sensitive: bool,
     ) -> Vec<TerminalTextMatch> {
-        let Some((buffer, active_screen)) = self.retained_text_buffer() else {
+        let Ok(core) = self.ghostty.core.lock() else {
             return Vec::new();
         };
-        buffer.search(query, case_sensitive, active_screen)
+        plain_terminal_search_text_matches(&core.terminal, query, case_sensitive)
     }
 
     pub(crate) fn text_match_is_current(&self, text_match: TerminalTextMatch) -> bool {
@@ -245,50 +245,10 @@ impl PaneTerminal {
     }
 
     pub(crate) fn text_matches_are_current(&self, text_matches: &[TerminalTextMatch]) -> Vec<bool> {
-        if text_matches.is_empty() {
-            return Vec::new();
-        }
         let Ok(core) = self.ghostty.core.lock() else {
             return vec![false; text_matches.len()];
         };
-        let Some(cols) = core.terminal.cols().ok() else {
-            return vec![false; text_matches.len()];
-        };
-        let Some(active_screen) = core.terminal.active_screen().ok() else {
-            return vec![false; text_matches.len()];
-        };
-        let row_range = text_matches
-            .iter()
-            .filter(|text_match| {
-                text_match.scan_cols == cols && text_match.scan_screen == active_screen
-            })
-            .fold(None::<(u32, u32)>, |range, text_match| {
-                Some(match range {
-                    Some((start_row, end_row)) => (
-                        start_row.min(text_match.start.row),
-                        end_row.max(text_match.end.row),
-                    ),
-                    None => (text_match.start.row, text_match.end.row),
-                })
-            });
-        let Some((start_row, end_row)) = row_range else {
-            return vec![false; text_matches.len()];
-        };
-        let Ok(rows) = core
-            .terminal
-            .screen_text_rows_range(start_row as usize, end_row.saturating_add(1) as usize)
-        else {
-            return vec![false; text_matches.len()];
-        };
-        let buffer = RetainedTextBuffer::new_search(cols, rows, start_row);
-        text_matches
-            .iter()
-            .map(|text_match| {
-                text_match.scan_cols == cols
-                    && text_match.scan_screen == active_screen
-                    && buffer.contains_match(*text_match)
-            })
-            .collect()
+        plain_terminal_text_matches_are_current(&core.terminal, text_matches)
     }
 
     pub(crate) fn word_motion_target(
@@ -298,67 +258,7 @@ impl PaneTerminal {
         motion: TerminalWordMotion,
     ) -> Option<TerminalTextPoint> {
         let core = self.ghostty.core.lock().ok()?;
-        let cols = core.terminal.cols().ok()?;
-        let total_rows = core.terminal.total_rows().ok()?;
-        let row = usize::try_from(row).ok()?;
-        if row >= total_rows {
-            return None;
-        }
-
-        let mut window_rows = 64usize;
-        loop {
-            let (start_row, end_row) = match motion {
-                TerminalWordMotion::PreviousStart => {
-                    (row.saturating_sub(window_rows.saturating_sub(1)), row + 1)
-                }
-                TerminalWordMotion::NextStart | TerminalWordMotion::NextEnd => {
-                    (row, row.saturating_add(window_rows).min(total_rows))
-                }
-            };
-            let rows = core
-                .terminal
-                .screen_text_rows_range(start_row, end_row)
-                .ok()?;
-            let starts_in_continuation = rows
-                .first()
-                .is_some_and(|row| row.wrap_continuation && start_row > 0);
-            let ends_in_continuation = rows
-                .last()
-                .is_some_and(|row| row.soft_wrapped && end_row < total_rows);
-            let buffer = RetainedTextBuffer::new_words(cols, rows, u32::try_from(start_row).ok()?);
-            let target = buffer.word_motion(u32::try_from(row).ok()?, col, motion);
-            let needs_more_history = motion == TerminalWordMotion::PreviousStart
-                && target
-                    .is_some_and(|target| starts_in_continuation && target.row == start_row as u32);
-            let needs_more_future = motion == TerminalWordMotion::NextEnd
-                && ends_in_continuation
-                && target.is_some_and(|target| buffer.point_is_final_atom(target));
-            if target.is_some() && !needs_more_history && !needs_more_future {
-                return target;
-            }
-
-            let reached_edge = match motion {
-                TerminalWordMotion::PreviousStart => start_row == 0,
-                TerminalWordMotion::NextStart | TerminalWordMotion::NextEnd => {
-                    end_row == total_rows
-                }
-            };
-            if reached_edge {
-                return target;
-            }
-            window_rows = window_rows.saturating_mul(2).min(total_rows);
-        }
-    }
-
-    fn retained_text_buffer(&self) -> Option<(RetainedTextBuffer, crate::ghostty::ActiveScreen)> {
-        let (cols, rows, active_screen) = {
-            let core = self.ghostty.core.lock().ok()?;
-            let cols = core.terminal.cols().ok()?;
-            let rows = core.terminal.screen_text_rows().ok()?;
-            let active_screen = core.terminal.active_screen().ok()?;
-            (cols, rows, active_screen)
-        };
-        Some((RetainedTextBuffer::new_search(cols, rows, 0), active_screen))
+        plain_terminal_word_motion_target(&core.terminal, row, col, motion)
     }
 
     pub fn input_state(&self) -> Option<InputState> {
@@ -2092,6 +1992,137 @@ pub(crate) fn plain_terminal_cursor_state(
         visible: render_state.cursor_visible().ok()?,
         shape: 0,
     })
+}
+
+/// Searches a plain terminal's full screen text (scrollback plus viewport)
+/// for `query`. Shared by the pane runtime (under its core lock) and the pure
+/// client's pane replicas, so copy-mode search behaves identically on both.
+pub(crate) fn plain_terminal_search_text_matches(
+    terminal: &crate::ghostty::Terminal,
+    query: &str,
+    case_sensitive: bool,
+) -> Vec<TerminalTextMatch> {
+    let Ok(cols) = terminal.cols() else {
+        return Vec::new();
+    };
+    let Ok(rows) = terminal.screen_text_rows() else {
+        return Vec::new();
+    };
+    let Ok(active_screen) = terminal.active_screen() else {
+        return Vec::new();
+    };
+    RetainedTextBuffer::new_search(cols, rows, 0).search(query, case_sensitive, active_screen)
+}
+
+/// For each candidate match, whether the plain terminal's text still matches.
+pub(crate) fn plain_terminal_text_matches_are_current(
+    terminal: &crate::ghostty::Terminal,
+    text_matches: &[TerminalTextMatch],
+) -> Vec<bool> {
+    if text_matches.is_empty() {
+        return Vec::new();
+    }
+    let Some(cols) = terminal.cols().ok() else {
+        return vec![false; text_matches.len()];
+    };
+    let Some(active_screen) = terminal.active_screen().ok() else {
+        return vec![false; text_matches.len()];
+    };
+    let row_range = text_matches
+        .iter()
+        .filter(|text_match| {
+            text_match.scan_cols == cols && text_match.scan_screen == active_screen
+        })
+        .fold(None::<(u32, u32)>, |range, text_match| {
+            Some(match range {
+                Some((start_row, end_row)) => (
+                    start_row.min(text_match.start.row),
+                    end_row.max(text_match.end.row),
+                ),
+                None => (text_match.start.row, text_match.end.row),
+            })
+        });
+    let Some((start_row, end_row)) = row_range else {
+        return vec![false; text_matches.len()];
+    };
+    let Ok(rows) =
+        terminal.screen_text_rows_range(start_row as usize, end_row.saturating_add(1) as usize)
+    else {
+        return vec![false; text_matches.len()];
+    };
+    let buffer = RetainedTextBuffer::new_search(cols, rows, start_row);
+    text_matches
+        .iter()
+        .map(|text_match| {
+            text_match.scan_cols == cols
+                && text_match.scan_screen == active_screen
+                && buffer.contains_match(*text_match)
+        })
+        .collect()
+}
+
+/// Word-motion target on a plain terminal's screen text.
+pub(crate) fn plain_terminal_word_motion_target(
+    terminal: &crate::ghostty::Terminal,
+    row: u32,
+    col: u16,
+    motion: TerminalWordMotion,
+) -> Option<TerminalTextPoint> {
+    let cols = terminal.cols().ok()?;
+    let total_rows = terminal.total_rows().ok()?;
+    let row = usize::try_from(row).ok()?;
+    if row >= total_rows {
+        return None;
+    }
+
+    let mut window_rows = 64usize;
+    loop {
+        let (start_row, end_row) = match motion {
+            TerminalWordMotion::PreviousStart => {
+                (row.saturating_sub(window_rows.saturating_sub(1)), row + 1)
+            }
+            TerminalWordMotion::NextStart | TerminalWordMotion::NextEnd => {
+                (row, row.saturating_add(window_rows).min(total_rows))
+            }
+        };
+        let rows = terminal.screen_text_rows_range(start_row, end_row).ok()?;
+        let starts_in_continuation = rows
+            .first()
+            .is_some_and(|row| row.wrap_continuation && start_row > 0);
+        let ends_in_continuation = rows
+            .last()
+            .is_some_and(|row| row.soft_wrapped && end_row < total_rows);
+        let buffer = RetainedTextBuffer::new_words(cols, rows, u32::try_from(start_row).ok()?);
+        let target = buffer.word_motion(u32::try_from(row).ok()?, col, motion);
+        let needs_more_history = motion == TerminalWordMotion::PreviousStart
+            && target.is_some_and(|target| starts_in_continuation && target.row == start_row as u32);
+        let needs_more_future = motion == TerminalWordMotion::NextEnd
+            && ends_in_continuation
+            && target.is_some_and(|target| buffer.point_is_final_atom(target));
+        if target.is_some() && !needs_more_history && !needs_more_future {
+            return target;
+        }
+
+        let reached_edge = match motion {
+            TerminalWordMotion::PreviousStart => start_row == 0,
+            TerminalWordMotion::NextStart | TerminalWordMotion::NextEnd => end_row == total_rows,
+        };
+        if reached_edge {
+            return target;
+        }
+        window_rows = window_rows.saturating_mul(2).min(total_rows);
+    }
+}
+
+/// Extracts selected text from a plain terminal's screen rows.
+pub(crate) fn plain_terminal_extract_selection(
+    terminal: &crate::ghostty::Terminal,
+    selection: &crate::selection::Selection,
+) -> Option<String> {
+    let ((start_row, start_col), (end_row, end_col)) = selection.ordered_cells();
+    terminal
+        .read_text_screen((start_col, start_row), (end_col, end_row), false)
+        .ok()
 }
 
 /// Visible OSC 8 hyperlinks of a plain replicated terminal.

@@ -1455,40 +1455,42 @@ impl AppState {
 
     pub(crate) fn scroll_pane_up(
         &self,
-        terminal_runtimes: &TerminalRuntimeRegistry,
+        terminal_runtimes: &dyn crate::terminal::PaneContentSource,
         pane_id: crate::layout::PaneId,
         lines: usize,
     ) {
         if let Some(ws_idx) = self.active {
-            if let Some(rt) = self.runtime_for_pane_in_workspace(terminal_runtimes, ws_idx, pane_id)
+            if let Some(content) =
+                self.content_for_pane_in_workspace(terminal_runtimes, ws_idx, pane_id)
             {
-                rt.scroll_up(lines);
+                content.scroll_up(lines);
             }
         }
     }
 
     pub(crate) fn scroll_pane_down(
         &self,
-        terminal_runtimes: &TerminalRuntimeRegistry,
+        terminal_runtimes: &dyn crate::terminal::PaneContentSource,
         pane_id: crate::layout::PaneId,
         lines: usize,
     ) {
         if let Some(ws_idx) = self.active {
-            if let Some(rt) = self.runtime_for_pane_in_workspace(terminal_runtimes, ws_idx, pane_id)
+            if let Some(content) =
+                self.content_for_pane_in_workspace(terminal_runtimes, ws_idx, pane_id)
             {
-                rt.scroll_down(lines);
+                content.scroll_down(lines);
             }
         }
     }
 
     pub(crate) fn pane_scroll_metrics(
         &self,
-        terminal_runtimes: &TerminalRuntimeRegistry,
+        terminal_runtimes: &dyn crate::terminal::PaneContentSource,
         pane_id: crate::layout::PaneId,
     ) -> Option<crate::pane::ScrollMetrics> {
         self.active
-            .and_then(|i| self.runtime_for_pane_in_workspace(terminal_runtimes, i, pane_id))
-            .and_then(crate::terminal::TerminalRuntime::scroll_metrics)
+            .and_then(|i| self.content_for_pane_in_workspace(terminal_runtimes, i, pane_id))
+            .and_then(|content| content.scroll_metrics())
     }
 
     fn handle_right_click_passthrough(
@@ -1738,16 +1740,16 @@ impl AppState {
 
     pub(super) fn set_pane_scroll_offset(
         &self,
-        terminal_runtimes: &TerminalRuntimeRegistry,
+        terminal_runtimes: &dyn crate::terminal::PaneContentSource,
         pane_id: crate::layout::PaneId,
         offset_from_bottom: usize,
     ) {
         for ws_idx in 0..self.workspaces.len() {
-            let Some(rt) = self.runtime_for_pane_in_workspace(terminal_runtimes, ws_idx, pane_id)
+            let Some(content) = self.content_for_pane_in_workspace(terminal_runtimes, ws_idx, pane_id)
             else {
                 continue;
             };
-            rt.set_scroll_offset_from_bottom(offset_from_bottom);
+            content.set_scroll_offset_from_bottom(offset_from_bottom);
             return;
         }
     }

@@ -331,11 +331,22 @@ fn run_loop(
 
         if dirty {
             compose_into(mirrors.local(), chrome, ids, app);
+            // Copy mode cannot outlive its pane: a catalog update that
+            // removed the pane must drop copy-mode state before rendering.
+            if let Some(pane_id) = app.copy_mode.as_ref().map(|copy_mode| copy_mode.pane_id) {
+                let alive = ids
+                    .public_pane_id(pane_id)
+                    .is_some_and(|public| mirrors.local().catalog.pane(public).is_some());
+                if !alive {
+                    app.clear_copy_mode_for_removed_panes([pane_id]);
+                }
+            }
             sync_mode(app);
             let mut resize_requests = Vec::new();
             terminal.draw(|frame| {
                 let source = MirrorPaneSource::new(mirrors.local());
                 resize_requests = crate::ui::compute_view_with_content(app, &source, frame.area());
+                app.sync_copy_mode_search_geometry();
                 crate::ui::render_with_content(app, &source, frame);
             })?;
             if let Link::Up(session) = &mut link {
@@ -514,7 +525,7 @@ fn scroll_focused_replica_page(
     let Some(stream_id) = mirror.stream_for_pane(&public) else {
         return false;
     };
-    let Some(replica) = mirror.replicas.get_mut(&stream_id) else {
+    let Some(replica) = mirror.replica_mut(stream_id) else {
         return false;
     };
     let plain = crate::pane::plain_terminal_input_state(replica.terminal())
@@ -543,7 +554,7 @@ fn request_backfill_if_needed(link: &mut Link, stream_id: u32, mirrors: &mut Rem
     let Link::Up(session) = link else {
         return;
     };
-    let Some(replica) = mirrors.local_mut().replicas.get_mut(&stream_id) else {
+    let Some(replica) = mirrors.local_mut().replica_mut(stream_id) else {
         return;
     };
     let id = session.request_id("history");
@@ -596,7 +607,7 @@ fn handle_server_frame(
     let mirror = mirrors.local_mut();
     match frame.frame_type {
         FrameType::Data => {
-            if let Some(replica) = mirror.replicas.get_mut(&frame.stream_id) {
+            if let Some(replica) = mirror.replica_mut(frame.stream_id) {
                 if let Err(err) = replica.apply_tail(&frame.payload) {
                     warn!(err = %err, stream = frame.stream_id, "replica tail apply failed");
                 }
@@ -774,7 +785,7 @@ fn handle_server_frame(
                     }
                 }
                 Some(Pending::History { stream_id }) => {
-                    if let Some(replica) = mirror.replicas.get_mut(&stream_id) {
+                    if let Some(replica) = mirror.replica_mut(stream_id) {
                         match replica.apply_history_response(&payload) {
                             Ok(rows_prepended) => {
                                 debug!(stream = stream_id, rows_prepended, "history page applied")
@@ -906,7 +917,7 @@ fn sync_pane_streams(
             session
                 .sent_sizes
                 .insert(stream_id, (request.cols, request.rows));
-            if let Some(replica) = mirror.replicas.get_mut(&stream_id) {
+            if let Some(replica) = mirror.replica_mut(stream_id) {
                 let _ = replica.resize(request.cols, request.rows, 1, 1);
             }
         } else {
@@ -993,7 +1004,9 @@ fn handle_key(
     use crossterm::event::KeyCode;
 
     if key.kind == crossterm::event::KeyEventKind::Release {
-        forward_key(key, link, mirrors, ids, app);
+        if app.mode != Mode::Copy {
+            forward_key(key, link, mirrors, ids, app);
+        }
         return;
     }
 
@@ -1005,6 +1018,10 @@ fn handle_key(
                     app.should_quit = true;
                 }
                 KeyCode::Esc => {}
+                _ if app.keybinds.copy_mode.matches_prefix_key(key) => {
+                    let source = MirrorPaneSource::new(mirrors.local());
+                    app.enter_copy_mode(&source);
+                }
                 _ => super::intent::dispatch_prefix_intent(key, link, mirrors, ids, app),
             }
         }
@@ -1023,6 +1040,31 @@ fn handle_key(
         Mode::Navigate => {
             if key.code == KeyCode::Char('q') {
                 app.should_quit = true;
+            }
+        }
+        Mode::Copy => {
+            if app.is_prefix_key(key) {
+                app.mode = Mode::Prefix;
+                return;
+            }
+            let copy_pane = app.copy_mode.as_ref().map(|copy_mode| copy_mode.pane_id);
+            {
+                // Copy mode runs entirely against the replica through the
+                // pane-content seam: search, motions, selection, scrolling.
+                let source = MirrorPaneSource::new(mirrors.local());
+                app.handle_copy_mode_key(&source, key);
+            }
+            // OSC52: the pure client is the host terminal, so a pending
+            // clipboard write goes straight to stdout.
+            if let Some(content) = app.request_clipboard_write.take() {
+                crate::selection::write_osc52_bytes(&content);
+            }
+            // Scrolling near the top of loaded history pages more in.
+            if let Some(stream_id) = copy_pane
+                .and_then(|pane_id| ids.public_pane_id(pane_id))
+                .and_then(|public| mirrors.local().stream_for_pane(public))
+            {
+                request_backfill_if_needed(link, stream_id, mirrors);
             }
         }
         _ => {
@@ -1051,8 +1093,10 @@ fn forward_key(
     let mirror = mirrors.local();
     let replica = mirror
         .stream_for_pane(&pane_id)
-        .and_then(|stream_id| mirror.replicas.get(&stream_id));
+        .and_then(|stream_id| mirror.replicas.get(&stream_id))
+        .map(|cell| cell.borrow());
     let protocol = replica
+        .as_ref()
         .map(|replica| {
             crate::input::KeyboardProtocol::from_kitty_flags(
                 replica.terminal().kitty_keyboard_flags().unwrap_or(0) as u16,
@@ -1074,6 +1118,7 @@ fn forward_key(
         )
     {
         let application_cursor = replica
+            .as_ref()
             .and_then(|replica| crate::pane::plain_terminal_input_state(replica.terminal()))
             .map(|state| state.application_cursor)
             .unwrap_or(false);
@@ -1103,7 +1148,7 @@ fn encode_paste(
     let bracketed = mirror
         .stream_for_pane(&pane_id)
         .and_then(|stream_id| mirror.replicas.get(&stream_id))
-        .and_then(|replica| crate::pane::plain_terminal_input_state(replica.terminal()))
+        .and_then(|cell| crate::pane::plain_terminal_input_state(cell.borrow().terminal()))
         .map(|state| state.bracketed_paste)
         .unwrap_or(false);
     let mut bytes = Vec::new();
@@ -1160,7 +1205,7 @@ fn handle_mouse(
             let Some(stream_id) = mirror.stream_for_pane(&public) else {
                 return;
             };
-            let Some(replica) = mirror.replicas.get_mut(&stream_id) else {
+            let Some(replica) = mirror.replica_mut(stream_id) else {
                 return;
             };
             let input_state = crate::pane::plain_terminal_input_state(replica.terminal());
@@ -1233,7 +1278,7 @@ fn forward_reported_mouse_button(
     else {
         return false;
     };
-    let Some(state) = crate::pane::plain_terminal_input_state(replica.terminal()) else {
+    let Some(state) = crate::pane::plain_terminal_input_state(replica.borrow().terminal()) else {
         return false;
     };
     if !state.mouse_reporting_enabled() {
@@ -1346,6 +1391,104 @@ mod tests {
             &mut app,
         );
         assert!(app.should_quit);
+    }
+
+    #[tokio::test]
+    async fn copy_mode_selects_and_copies_replica_content_through_the_seam() {
+        let mut mirror = super::super::RemoteMirror::test_new();
+        let snapshot: crate::api::schema::session::SessionSnapshot =
+            serde_json::from_value(serde_json::json!({
+                "version": "test",
+                "protocol": 3,
+                "focused_workspace_id": "ws_1",
+                "focused_tab_id": "t_1_1",
+                "focused_pane_id": "p_1_1",
+                "workspaces": [{
+                    "workspace_id": "ws_1", "number": 1, "label": "repo",
+                    "focused": true, "pane_count": 1, "tab_count": 1,
+                    "active_tab_id": "t_1_1", "agent_status": "idle"
+                }],
+                "tabs": [{
+                    "tab_id": "t_1_1", "workspace_id": "ws_1", "number": 1,
+                    "label": "shell", "focused": true, "pane_count": 1,
+                    "agent_status": "idle"
+                }],
+                "panes": [{
+                    "pane_id": "p_1_1", "terminal_id": "term_1",
+                    "workspace_id": "ws_1", "tab_id": "t_1_1", "focused": true,
+                    "agent_status": "idle", "revision": 1
+                }],
+                "layouts": [],
+                "agents": []
+            }))
+            .expect("snapshot deserializes");
+        mirror.catalog.resync(&snapshot, 1);
+        let replica = crate::terminal::replica::PaneReplica::open(
+            "alpha bravo charlie\r\n",
+            10,
+            None,
+            80,
+            24,
+            64 * 1024,
+        )
+        .expect("replica opens");
+        mirror.stream_opened("p_1_1", 3, replica);
+
+        let chrome = GlobalChrome::new();
+        let mut ids = ComposeIds::new();
+        let mut app = AppState::test_new();
+        compose_into(&mirror, &chrome, &mut ids, &mut app);
+        app.keybinds = crate::config::Config::default().keybinds();
+        app.mode = Mode::Terminal;
+        {
+            let source = MirrorPaneSource::new(&mirror);
+            let _requests = crate::ui::compute_view_with_content(
+                &mut app,
+                &source,
+                ratatui::layout::Rect::new(0, 0, 106, 26),
+            );
+            app.enter_copy_mode(&source);
+        }
+        assert_eq!(app.mode, Mode::Copy);
+
+        // Search finds replica text and jumps the cursor to it.
+        {
+            let source = MirrorPaneSource::new(&mirror);
+            app.handle_copy_mode_key(
+                &source,
+                crate::input::TerminalKey::new(KeyCode::Char('/'), KeyModifiers::empty()),
+            );
+            for ch in "bravo".chars() {
+                app.handle_copy_mode_key(
+                    &source,
+                    crate::input::TerminalKey::new(KeyCode::Char(ch), KeyModifiers::empty()),
+                );
+            }
+            app.handle_copy_mode_key(
+                &source,
+                crate::input::TerminalKey::new(KeyCode::Enter, KeyModifiers::empty()),
+            );
+        }
+        let copy_mode = app.copy_mode.as_ref().expect("copy mode active");
+        assert_eq!(copy_mode.search.matches.len(), 1);
+        assert_eq!(copy_mode.cursor_col, 6, "cursor jumped to the match");
+
+        // Line-select and copy: the extracted text is the replica's row.
+        let source = MirrorPaneSource::new(&mirror);
+        app.handle_copy_mode_key(
+            &source,
+            crate::input::TerminalKey::new(KeyCode::Char('v'), KeyModifiers::SHIFT),
+        );
+        app.handle_copy_mode_key(
+            &source,
+            crate::input::TerminalKey::new(KeyCode::Char('y'), KeyModifiers::empty()),
+        );
+        let copied = app.request_clipboard_write.take().expect("copied bytes");
+        assert_eq!(
+            String::from_utf8_lossy(&copied).trim_end(),
+            "alpha bravo charlie"
+        );
+        assert_eq!(app.mode, Mode::Terminal, "copy exits copy mode");
     }
 
     #[test]

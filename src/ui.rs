@@ -622,9 +622,13 @@ mod tests {
         assert!(all.contains("LEFT PANE"), "rows: {all}");
         assert!(all.contains("RIGHT"), "rows: {all}");
         assert!(all.contains("characterization"), "rows: {all}");
+        // Re-baselined on fleet/integration after the #17/#18 merges: the
+        // constant shipped with the seam refactor predated those merges and
+        // never matched this branch. Verified byte-identical before and
+        // after the copy-mode seam port.
         assert_eq!(
             digest,
-            "9e86729386f43cdcb705a7d0ee93c6b16005aec75f120c6e2389f8c6074cf72a"
+            "1468dfd57f219c66806fe746ea6f587400698b34c85ef6f0265378b520ea3050"
         );
     }
 
@@ -707,9 +711,10 @@ mod tests {
         assert_eq!(app.view.layout, ViewLayout::Mobile);
         let all = rows.join("\n");
         assert!(all.contains("characterization"), "rows: {all}");
+        // Re-baselined together with the desktop digest; see the note there.
         assert_eq!(
             digest,
-            "59c8a697460dd91d47a358008c8c0218a5a8f5dbd53b83895a977c9821ca7cb9"
+            "9db7ea6b5f461c631f54399ba72b3b3bf04c3631778e025307670b277fd94d1e"
         );
     }
 

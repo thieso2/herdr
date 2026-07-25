@@ -2186,7 +2186,7 @@ impl AppState {
         url_at_column(line, logical_cell.logical_col).map(str::to_owned)
     }
 
-    pub fn copy_selection(&mut self, terminal_runtimes: &crate::terminal::TerminalRuntimeRegistry) {
+    pub fn copy_selection(&mut self, terminal_runtimes: &dyn crate::terminal::PaneContentSource) {
         let mut sel = match self.selection.take() {
             Some(sel) => sel,
             None => return,
@@ -2201,8 +2201,8 @@ impl AppState {
         };
 
         let text = self
-            .runtime_for_pane_in_workspace(terminal_runtimes, ws_idx, sel.pane_id)
-            .and_then(|rt| rt.extract_selection(&sel));
+            .content_for_pane_in_workspace(terminal_runtimes, ws_idx, sel.pane_id)
+            .and_then(|content| content.extract_selection(&sel));
         if let Some(text) = text {
             if !text.is_empty() {
                 self.request_clipboard_write = Some(text.into_bytes());

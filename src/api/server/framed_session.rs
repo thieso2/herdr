@@ -41,10 +41,10 @@ use crate::protocol::framed::{
     StreamOpenParams, CAPABILITY_NOTIFICATION, CAPABILITY_PANE_STREAM, CAPABILITY_PASTE_IMAGE,
     CAPABILITY_WINDOW_TITLE, CONTROL_STREAM_ID, FRAMED_PROTOCOL_MIN_SUPPORTED,
     FRAMED_PROTOCOL_VERSION, FRAME_HEADER_BYTES, HISTORY_FETCH_MAX_BYTES,
-    HISTORY_PAGE_DEFAULT_BYTES, HISTORY_PAGE_MIN_BYTES, NOTIFICATION_POSTED_EVENT,
-    PANE_PASTE_IMAGE_METHOD, PANE_SEND_BYTES_METHOD, PING_METHOD, SESSION_HELLO_METHOD,
-    STREAM_CLOSED_EVENT, STREAM_CLOSE_METHOD, STREAM_HISTORY_METHOD, STREAM_OPEN_METHOD,
-    WINDOW_TITLE_CHANGED_EVENT,
+    HISTORY_PAGE_DEFAULT_BYTES, HISTORY_PAGE_MIN_BYTES, HISTORY_PAGE_SERVED_MAX_BYTES,
+    MAX_FRAME_PAYLOAD, NOTIFICATION_POSTED_EVENT, PANE_PASTE_IMAGE_METHOD, PANE_SEND_BYTES_METHOD,
+    PING_METHOD, SESSION_HELLO_METHOD, STREAM_CLOSED_EVENT, STREAM_CLOSE_METHOD,
+    STREAM_HISTORY_METHOD, STREAM_OPEN_METHOD, WINDOW_TITLE_CHANGED_EVENT,
 };
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -774,7 +774,11 @@ fn handle_stream_history(
             .unwrap_or(HISTORY_PAGE_DEFAULT_BYTES as u64),
     )
     .unwrap_or(HISTORY_FETCH_MAX_BYTES)
-    .clamp(HISTORY_PAGE_MIN_BYTES, HISTORY_FETCH_MAX_BYTES);
+    .clamp(HISTORY_PAGE_MIN_BYTES, HISTORY_FETCH_MAX_BYTES)
+    // JSON string escaping can expand a content byte up to sixfold, so the
+    // sliced page is bounded well below the frame payload limit; larger
+    // requests are served across multiple pages via `next_cursor`.
+    .min(HISTORY_PAGE_SERVED_MAX_BYTES);
     let start = history_page_start(&history.content, end, max_bytes);
     let next_cursor = (start > 0).then(|| {
         encode_history_cursor(&HistoryCursor {
@@ -785,19 +789,47 @@ fn handle_stream_history(
         })
     });
 
-    write_control_allow_disconnect(
-        stream,
-        &serde_json::json!({
-            "id": request.id,
-            "result": {
-                "type": "stream_history",
-                "stream_id": cursor.stream_id,
-                "content": &history.content[start..end],
-                "next_cursor": next_cursor,
-                "at_top": start == 0,
-            },
-        }),
-    )
+    let response = serde_json::json!({
+        "id": request.id,
+        "result": {
+            "type": "stream_history",
+            "stream_id": cursor.stream_id,
+            "content": &history.content[start..end],
+            "next_cursor": next_cursor,
+            "at_top": start == 0,
+        },
+    });
+    let payload = match serde_json::to_vec(&response) {
+        Ok(payload) => payload,
+        Err(err) => {
+            return write_control_allow_disconnect(
+                stream,
+                &error_response(
+                    &request.id,
+                    "internal_error",
+                    &format!("failed to encode stream_history response: {err}"),
+                    None,
+                ),
+            );
+        }
+    };
+    if payload.len() > MAX_FRAME_PAYLOAD {
+        // Unreachable given the escaping headroom in
+        // HISTORY_PAGE_SERVED_MAX_BYTES; guard anyway so one oversized page
+        // degrades into an error response instead of tearing down the whole
+        // session with an oversized frame.
+        return write_control_allow_disconnect(
+            stream,
+            &error_response(
+                &request.id,
+                "history_page_too_large",
+                "history page encodes larger than the frame limit; \
+                 retry with a smaller max_bytes",
+                None,
+            ),
+        );
+    }
+    write_frame_allow_disconnect(stream, FrameType::Control, CONTROL_STREAM_ID, &payload)
 }
 
 /// Builds the rejection response for a method whose gating capability was not
@@ -1733,6 +1765,74 @@ mod tests {
         assert!(full.at_top);
         assert!(full.next_cursor.is_none());
         assert_eq!(full.content, history);
+
+        finish(client, done_rx, thread, path);
+        drop(api_tx);
+        responder.join().unwrap();
+    }
+
+    #[test]
+    fn framed_stream_history_hard_caps_pages_on_newline_free_history() {
+        // One giant soft-wrapped logical line: no newline anywhere in the
+        // capture. Pages must still honor the byte budget (mid-line cuts on
+        // char boundaries) instead of growing without bound.
+        let history = "x".repeat(20 * 1024);
+
+        let tap = Arc::new(PaneOutputTap::default());
+        let (request_tx, _request_rx) = mpsc::channel();
+        let (api_tx, responder) = spawn_pane_stream_responder_with_history(
+            Arc::downgrade(&tap),
+            request_tx,
+            history.clone(),
+        );
+
+        let (mut client, server, path) = local_stream_pair("history-newline-free");
+        let (done_rx, thread) = spawn_connection_with(server, api_tx.clone(), EventHub::default());
+
+        hello(&mut client, "h16", &["pane-stream"]);
+        send_control(
+            &mut client,
+            serde_json::json!({"id": "s1", "method": "stream.open", "params": {"pane_id": "pane_1"}}),
+        );
+        let opened = read_control(&mut client);
+        let mut cursor = opened["result"]["stream"]["history_cursor"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        let mut pages: Vec<String> = Vec::new();
+        loop {
+            send_control(
+                &mut client,
+                crate::protocol::framed::stream_history_request("nf", &cursor, 1),
+            );
+            let page = crate::protocol::framed::parse_stream_history(&read_control(&mut client))
+                .expect("history page");
+            assert!(!page.content.is_empty(), "pages must make progress");
+            assert!(
+                page.content.len() <= HISTORY_PAGE_MIN_BYTES + 3,
+                "newline-free page must stay hard-capped, got {}",
+                page.content.len()
+            );
+            pages.push(page.content);
+            match page.next_cursor {
+                Some(next) => cursor = next,
+                None => {
+                    assert!(page.at_top);
+                    break;
+                }
+            }
+        }
+        assert!(pages.len() > 2, "budget must split the capture");
+        let rejoined: String = pages.iter().rev().map(String::as_str).collect();
+        assert_eq!(rejoined, history);
+
+        // The session survives the whole walk.
+        send_control(
+            &mut client,
+            serde_json::json!({"id": "p1", "method": "ping", "params": {}}),
+        );
+        assert_eq!(read_control(&mut client)["result"]["type"], "pong");
 
         finish(client, done_rx, thread, path);
         drop(api_tx);

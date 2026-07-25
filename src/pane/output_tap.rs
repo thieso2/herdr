@@ -118,6 +118,19 @@ impl PaneOutputTap {
     /// Subscribes to the output tail, capturing `snapshot` under the tap lock
     /// so the subscription sequence and the snapshot describe the same
     /// instant of terminal state.
+    ///
+    /// The capture (for pane streams: the full stream seed, including the
+    /// scrollback history walk) deliberately runs while the tap lock is
+    /// held, stalling the PTY publish path for its duration. This is not
+    /// avoidable at this layer: releasing the tap lock before the capture
+    /// lets `publish_with` ingest bytes that the capture then also contains,
+    /// so the client would double-apply them from the tail. Re-reading the
+    /// sequence after an unlocked capture cannot fix that pairing either,
+    /// because terminal ingestion takes the terminal core lock *inside* the
+    /// tap lock — capturing core-first inverts that order and deadlocks, and
+    /// any formatter walk blocks ingestion on the core lock anyway. The
+    /// stall is bounded by one full-history format and only paid per
+    /// `stream.open`, not on the steady-state output path.
     pub(crate) fn subscribe_with_snapshot<R>(
         &self,
         snapshot: impl FnOnce() -> R,

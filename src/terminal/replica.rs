@@ -21,7 +21,7 @@
 
 use std::collections::VecDeque;
 
-use crate::ghostty::{ActiveScreen, Error as GhosttyError, Terminal};
+use crate::ghostty::{ActiveScreen, Error as GhosttyError, Terminal, TerminalScrollbar};
 use crate::pane::ScrollMetrics;
 use crate::protocol::framed::{
     parse_stream_history, stream_history_request, HISTORY_FETCH_MAX_BYTES,
@@ -107,9 +107,28 @@ pub struct PaneReplica {
     /// Total history bytes accepted so far, counted against the budget.
     fetched_bytes: usize,
     fetch_in_flight: bool,
-    /// Pane output byte sequence the replica has applied up to: the
-    /// `stream.open` sequence plus every DATA tail byte since.
+    /// Pane output byte sequence the replica has consumed up to: the
+    /// `stream.open` sequence plus every DATA tail byte since. Bytes of a
+    /// trailing incomplete escape sequence are counted here but sit in
+    /// `held_tail` until their continuation arrives.
     applied_sequence: u64,
+    /// Consumed-but-unwritten tail bytes: the trailing incomplete escape
+    /// sequence or UTF-8 codepoint, held back so the terminal parser always
+    /// rests between complete sequences when a rebuild replaces it.
+    held_tail: Vec<u8>,
+    /// Sequence-scanner state after every consumed tail byte.
+    scan_state: VtScanState,
+    /// Sequence-scanner state after every byte actually written to the
+    /// terminal. `Ground` whenever `held_tail` captures the incomplete
+    /// suffix; mid-sequence only after an oversized held tail was flushed
+    /// through, which defers rebuilds until the sequence terminates.
+    written_state: VtScanState,
+    /// Terminal row total right after the last bake (open/rebuild/resize).
+    baked_total_rows: usize,
+    /// Text of absolute row 0 at the last bake, recorded only while row 0
+    /// sits in (immutable) scrollback; `None` while the top row is still on
+    /// the active screen and can be legitimately rewritten.
+    history_anchor: Option<String>,
 }
 
 impl PaneReplica {
@@ -128,7 +147,7 @@ impl PaneReplica {
         let rows = rows.max(1);
         let mut terminal = Terminal::new(cols, rows, scrollback_limit_bytes)?;
         terminal.write(snapshot.as_bytes());
-        Ok(Self {
+        let mut replica = Self {
             terminal,
             cols,
             rows,
@@ -142,7 +161,14 @@ impl PaneReplica {
             fetched_bytes: 0,
             fetch_in_flight: false,
             applied_sequence: sequence,
-        })
+            held_tail: Vec::new(),
+            scan_state: VtScanState::Ground,
+            written_state: VtScanState::Ground,
+            baked_total_rows: 0,
+            history_anchor: None,
+        };
+        replica.rebase_history_anchor()?;
+        Ok(replica)
     }
 
     /// Read access to the replicated terminal, for rendering and text
@@ -162,13 +188,55 @@ impl PaneReplica {
     /// a deferred rebuild that ran because queued pages became applicable
     /// (the tail left the alternate screen); callers must re-base
     /// absolute-row state (selection, copy-mode cursor) by that amount.
+    ///
+    /// A trailing incomplete escape sequence or UTF-8 codepoint is held back
+    /// from the terminal until its continuation arrives, so a rebuild (which
+    /// replaces the terminal and its VT parser) can never land mid-sequence
+    /// and turn continuation bytes into literal text.
     pub fn apply_tail(&mut self, bytes: &[u8]) -> Result<usize, GhosttyError> {
-        self.terminal.write(bytes);
         self.applied_sequence = self.applied_sequence.saturating_add(bytes.len() as u64);
-        if !self.pages.is_empty() && self.terminal.active_screen()? == ActiveScreen::Primary {
+        self.ingest_tail(bytes);
+        if !self.pages.is_empty()
+            && self.written_state == VtScanState::Ground
+            && self.terminal.active_screen()? == ActiveScreen::Primary
+        {
             return self.rebuild();
         }
         Ok(0)
+    }
+
+    /// Writes tail bytes to the terminal up to the last point where the byte
+    /// stream rests between complete sequences and codepoints, holding the
+    /// incomplete suffix in `held_tail` for the next chunk.
+    fn ingest_tail(&mut self, bytes: &[u8]) {
+        let mut state = self.scan_state;
+        let mut flush_upto = None;
+        for (index, &byte) in bytes.iter().enumerate() {
+            state = vt_scan_advance(state, byte);
+            if state == VtScanState::Ground {
+                flush_upto = Some(index + 1);
+            }
+        }
+        self.scan_state = state;
+        match flush_upto {
+            Some(upto) => {
+                self.held_tail.extend_from_slice(&bytes[..upto]);
+                let complete = std::mem::take(&mut self.held_tail);
+                self.terminal.write(&complete);
+                self.written_state = VtScanState::Ground;
+                self.held_tail.extend_from_slice(&bytes[upto..]);
+            }
+            None => self.held_tail.extend_from_slice(bytes),
+        }
+        if self.held_tail.len() > HELD_TAIL_MAX_BYTES {
+            // A pathological giant sequence (huge OSC/APC payload) is written
+            // through instead of buffered without bound. `written_state` then
+            // tracks the mid-sequence parser and defers rebuilds until the
+            // sequence terminates.
+            let flushed = std::mem::take(&mut self.held_tail);
+            self.terminal.write(&flushed);
+            self.written_state = self.scan_state;
+        }
     }
 
     /// Scroll metrics of the replica viewport, shaped exactly like the pane
@@ -277,7 +345,11 @@ impl PaneReplica {
             .active_screen()
             .map_err(HistoryApplyError::Terminal)?
             != ActiveScreen::Primary
+            || self.written_state != VtScanState::Ground
         {
+            // Queued: the rebuild runs when the tail returns to the primary
+            // screen (and, after an oversized held-tail flush, when the
+            // terminal parser is back between sequences).
             return Ok(0);
         }
         self.rebuild().map_err(HistoryApplyError::Terminal)
@@ -300,6 +372,9 @@ impl PaneReplica {
         self.cols = cols;
         self.rows = rows;
         self.cell_px = (cell_width_px.max(1), cell_height_px.max(1));
+        // Reflow legitimately changes the row total and the top row content;
+        // re-anchor eviction detection on the reflowed state.
+        self.rebase_history_anchor()?;
         Ok(())
     }
 
@@ -348,6 +423,32 @@ impl PaneReplica {
             .total
             .saturating_sub(scrollbar.offset + scrollbar.len);
         let old_total = scrollbar.total;
+
+        if self.top_rows_lost_since_bake(&scrollbar)? {
+            // Scrollback rows were lost since the last bake: ghostty evicted
+            // its oldest rows under cell-memory pressure (its scrollback
+            // accounting differs from the replica's raw-byte budget) or the
+            // pane erased scrollback (ED 3). The history cursor points just
+            // above rows that no longer exist, so stitching queued pages
+            // under the truncated content would hide a gap. Stop paging.
+            tracing::debug!(
+                "pane replica lost scrollback rows since last bake; stopping history backfill"
+            );
+            self.stop_backfill();
+            self.pages.clear();
+            self.pages_bytes = 0;
+            self.rebase_history_anchor()?;
+            return Ok(0);
+        }
+        // Every newline in the queued pages must contribute at least one new
+        // row to the rebuilt terminal; fewer means the fresh terminal
+        // front-evicted while baking.
+        let page_line_rows: usize = self
+            .pages
+            .iter()
+            .map(|page| page.matches('\n').count())
+            .sum();
+
         let seed = self.terminal.stream_seed()?;
 
         let mut fresh = Terminal::new(self.cols, self.rows, self.scrollback_limit_bytes)?;
@@ -382,6 +483,19 @@ impl PaneReplica {
         self.pages.clear();
         self.pages_bytes = 0;
         self.set_scroll_offset_from_bottom(offset_from_bottom);
+        if new_total < old_total.saturating_add(page_line_rows) {
+            // The fresh terminal evicted its oldest rows while the pages and
+            // the local dump were baked in: the terminal is full in ghostty's
+            // cell-memory accounting even though the raw-byte budget is not.
+            // The content is still contiguous — only the oldest rows fell
+            // off — but the cursor now points above evicted rows, so further
+            // paging would stitch a gap. Stop here.
+            tracing::debug!(
+                "pane replica evicted rows while baking history; stopping history backfill"
+            );
+            self.stop_backfill();
+        }
+        self.rebase_history_anchor()?;
         Ok(new_total.saturating_sub(old_total))
     }
 
@@ -392,6 +506,133 @@ impl PaneReplica {
         }
         self.scrollback_limit_bytes
             .saturating_sub(self.fetched_bytes)
+    }
+
+    /// True when scrollback rows above the last-baked content are gone
+    /// (ghostty eviction or an ED 3 erase), observed as a shrunken row total
+    /// or a changed top row. Row 0 is immutable while it sits in scrollback,
+    /// so a text change there means the original row was dropped.
+    fn top_rows_lost_since_bake(
+        &self,
+        scrollbar: &TerminalScrollbar,
+    ) -> Result<bool, GhosttyError> {
+        if scrollbar.total < self.baked_total_rows {
+            return Ok(true);
+        }
+        match &self.history_anchor {
+            Some(anchor) => Ok(self.top_row_text()? != *anchor),
+            None => Ok(false),
+        }
+    }
+
+    fn top_row_text(&self) -> Result<String, GhosttyError> {
+        self.terminal
+            .read_text_screen((0, 0), (self.cols.saturating_sub(1), 0), false)
+    }
+
+    /// Re-anchors eviction detection on the terminal's current content:
+    /// records the row total and, once row 0 has scrolled into (immutable)
+    /// scrollback, its text. Runs after open, every rebuild, and every
+    /// resize, because baking and reflow legitimately change both.
+    fn rebase_history_anchor(&mut self) -> Result<(), GhosttyError> {
+        let scrollbar = self.terminal.scrollbar()?;
+        self.baked_total_rows = scrollbar.total;
+        self.history_anchor = if scrollbar.total > scrollbar.len {
+            Some(self.top_row_text()?)
+        } else {
+            None
+        };
+        Ok(())
+    }
+
+    /// Stops all further history paging: older pages can no longer be
+    /// stitched on gap-free.
+    fn stop_backfill(&mut self) {
+        self.budget_exhausted = true;
+        self.next_cursor = None;
+    }
+}
+
+/// Held-back tail bytes are capped so a pathological giant string sequence
+/// (huge OSC/APC payload) cannot buffer without bound; past the cap the bytes
+/// are written through and rebuilds are deferred instead.
+const HELD_TAIL_MAX_BYTES: usize = 64 * 1024;
+
+/// Streaming scanner state tracking whether a VT byte stream currently rests
+/// between complete escape sequences and UTF-8 codepoints ("ground"). Used to
+/// hold back a trailing incomplete sequence from the replica terminal so a
+/// rebuild never swaps out the VT parser mid-sequence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VtScanState {
+    /// Between complete sequences and codepoints.
+    Ground,
+    /// Inside a multi-byte UTF-8 codepoint; `remaining` continuation bytes
+    /// are still expected.
+    Utf8 { remaining: u8 },
+    /// After a bare ESC.
+    Escape,
+    /// Inside `ESC <intermediate...>` waiting for the final byte.
+    EscapeIntermediate,
+    /// Inside a CSI sequence waiting for its final byte.
+    Csi,
+    /// Inside an OSC/DCS/SOS/PM/APC string sequence waiting for its
+    /// terminator (ST, or BEL for OSC).
+    StringSeq { osc: bool },
+    /// Saw ESC inside a string sequence; `\` completes the ST terminator.
+    StringSeqEscape { osc: bool },
+}
+
+/// Advances the scanner by one byte. Deliberately lenient: malformed input
+/// falls back toward `Ground` so the scanner can only hold bytes back for
+/// genuine sequence prefixes, never wedge.
+fn vt_scan_advance(state: VtScanState, byte: u8) -> VtScanState {
+    use VtScanState::*;
+    match state {
+        Ground => match byte {
+            0x1b => Escape,
+            0xc2..=0xdf => Utf8 { remaining: 1 },
+            0xe0..=0xef => Utf8 { remaining: 2 },
+            0xf0..=0xf4 => Utf8 { remaining: 3 },
+            _ => Ground,
+        },
+        Utf8 { remaining } => match byte {
+            0x80..=0xbf if remaining > 1 => Utf8 {
+                remaining: remaining - 1,
+            },
+            0x80..=0xbf => Ground,
+            // Invalid continuation: rescan the byte from ground so a stray
+            // lead byte cannot wedge the scanner.
+            _ => vt_scan_advance(Ground, byte),
+        },
+        Escape => match byte {
+            b'[' => Csi,
+            b']' => StringSeq { osc: true },
+            b'P' | b'X' | b'^' | b'_' => StringSeq { osc: false },
+            0x20..=0x2f => EscapeIntermediate,
+            0x1b => Escape,
+            _ => Ground,
+        },
+        EscapeIntermediate => match byte {
+            0x20..=0x2f => EscapeIntermediate,
+            0x1b => Escape,
+            _ => Ground,
+        },
+        Csi => match byte {
+            0x40..=0x7e => Ground,
+            0x1b => Escape,
+            _ => Csi,
+        },
+        StringSeq { osc } => match byte {
+            0x07 if osc => Ground,
+            0x1b => StringSeqEscape { osc },
+            _ => StringSeq { osc },
+        },
+        StringSeqEscape { osc } => match byte {
+            b'\\' => Ground,
+            0x07 if osc => Ground,
+            0x1b => StringSeqEscape { osc },
+            _ => StringSeq { osc },
+        },
     }
 }
 
@@ -957,6 +1198,242 @@ mod tests {
             assert_eq!(extracted, expected, "range {start:?}..{end:?}");
             assert!(!expected.is_empty());
         }
+    }
+
+    #[test]
+    fn split_escape_and_utf8_across_rebuilds_still_render_intact() {
+        use std::fmt::Write as _;
+
+        let mut input = String::new();
+        for line in 0..100 {
+            write!(input, "hist {line:03}\r\n").unwrap();
+        }
+        input.push_str("prompt> ");
+
+        let mut streamed = Terminal::new(40, 5, 10_000_000).unwrap();
+        streamed.write(input.as_bytes());
+        let (server, seed, cursor) = TestHistoryServer::from_terminal(&streamed);
+        let mut replica = PaneReplica::open(
+            &seed.snapshot,
+            0,
+            Some(cursor),
+            seed.cols,
+            seed.rows,
+            10_000_000,
+        )
+        .unwrap();
+
+        // The DATA tail splits an SGR sequence across chunks and a history
+        // page (with its terminal-replacing rebuild) lands in the gap.
+        replica.apply_tail(b"plain \x1b[3").unwrap();
+        let request = replica
+            .take_backfill_request("r1", BackfillTrigger::JumpToTop)
+            .unwrap()
+            .expect("fetch planned");
+        let rows_added = replica
+            .apply_history_response(&server.serve_with_budget(&request, 600))
+            .unwrap();
+        assert!(rows_added > 0, "the rebuild must run mid-split");
+
+        // The continuation completes the CSI; the next chunk then ends with
+        // three of the four bytes of a UTF-8 emoji and another rebuild lands
+        // in that gap too.
+        let globe = "🌍".as_bytes();
+        let mut chunk = b"1mred\x1b[0m ".to_vec();
+        chunk.extend_from_slice(&globe[..3]);
+        replica.apply_tail(&chunk).unwrap();
+        let request = replica
+            .take_backfill_request("r2", BackfillTrigger::JumpToTop)
+            .unwrap()
+            .expect("second fetch planned");
+        let rows_added = replica
+            .apply_history_response(&server.serve_with_budget(&request, 600))
+            .unwrap();
+        assert!(rows_added > 0, "the second rebuild must run mid-codepoint");
+        let mut tail_end = globe[3..].to_vec();
+        tail_end.extend_from_slice(b" end");
+        replica.apply_tail(&tail_end).unwrap();
+
+        let total_tail = "plain \x1b[31mred\x1b[0m 🌍 end";
+        assert_eq!(
+            replica.applied_sequence(),
+            total_tail.len() as u64,
+            "held-back bytes still count as consumed"
+        );
+
+        // A locally fed terminal that saw the same bytes unsplit is the
+        // ground truth: the split sequences must still act as one.
+        let mut local = Terminal::new(40, 5, 10_000_000).unwrap();
+        local.write(input.as_bytes());
+        local.write(total_tail.as_bytes());
+        let visible = |t: &Terminal| {
+            let total = t.total_rows().unwrap();
+            let top = (total - 5) as u32;
+            t.read_text_screen((0, top), (39, (total - 1) as u32), false)
+                .unwrap()
+        };
+        assert_eq!(visible(replica.terminal()), visible(&local));
+        assert!(
+            !visible(replica.terminal()).contains("1mred"),
+            "split CSI must never render literally"
+        );
+    }
+
+    #[test]
+    fn backfill_stops_without_gap_when_ghostty_evicts_while_baking() {
+        use std::fmt::Write as _;
+
+        let mut input = String::new();
+        for line in 0..20_000 {
+            write!(input, "evict line {line:05}\r\n").unwrap();
+        }
+        input.push_str("bottom> ");
+
+        let mut streamed = Terminal::new(40, 6, 100_000_000).unwrap();
+        streamed.write(input.as_bytes());
+        let (server, seed, cursor) = TestHistoryServer::from_terminal(&streamed);
+
+        // The raw-byte budget (1 MB) covers the whole capture (~360 KB), but
+        // ghostty's cell-memory accounting for a 1 MB terminal cannot hold
+        // 20k rows: baking must evict, and paging must stop instead of
+        // stitching older pages onto a dump missing evicted rows.
+        let mut replica = PaneReplica::open(
+            &seed.snapshot,
+            0,
+            Some(cursor),
+            seed.cols,
+            seed.rows,
+            1_000_000,
+        )
+        .unwrap();
+        backfill_all(&mut replica, &server, 32 * 1024);
+        assert!(replica.history_exhausted());
+
+        // Contiguity: everything the replica retained must be a gap-free
+        // suffix of an unlimited reference terminal fed the same bytes.
+        let mut reference = Terminal::new(40, 6, 100_000_000).unwrap();
+        reference.write(input.as_bytes());
+        let ref_text = screen_text(&reference);
+        let replica_text = screen_text(replica.terminal());
+        let ref_lines: Vec<&str> = ref_text.lines().collect();
+        let replica_lines: Vec<&str> = replica_text.lines().collect();
+        assert!(
+            replica_lines.len() < ref_lines.len(),
+            "eviction must have trimmed the replica's history"
+        );
+        assert_eq!(
+            replica_lines[..],
+            ref_lines[ref_lines.len() - replica_lines.len()..],
+            "replica content must be a contiguous suffix, never gapped"
+        );
+    }
+
+    #[test]
+    fn tail_output_eviction_stops_paging_instead_of_stitching_a_gap() {
+        use std::fmt::Write as _;
+
+        let mut input = String::new();
+        for line in 0..2_000 {
+            write!(input, "old {line:04}\r\n").unwrap();
+        }
+        input.push_str("shell$ ");
+
+        let mut streamed = Terminal::new(40, 6, 100_000_000).unwrap();
+        streamed.write(input.as_bytes());
+        let (server, seed, cursor) = TestHistoryServer::from_terminal(&streamed);
+        // Raw budget far above every fetch below, so only eviction detection
+        // can stop paging.
+        let mut replica = PaneReplica::open(
+            &seed.snapshot,
+            0,
+            Some(cursor),
+            seed.cols,
+            seed.rows,
+            400_000,
+        )
+        .unwrap();
+
+        // Bake one page so the replica holds real backfilled scrollback.
+        let request = replica
+            .take_backfill_request("r1", BackfillTrigger::JumpToTop)
+            .unwrap()
+            .expect("fetch planned");
+        let rows_added = replica
+            .apply_history_response(&server.serve_with_budget(&request, 4_096))
+            .unwrap();
+        assert!(rows_added > 0);
+        assert!(!replica.history_exhausted());
+
+        // A tail flood overruns ghostty's cell memory: the oldest rows —
+        // including the baked page — are evicted while the raw budget is
+        // still far from spent.
+        let mut flood = String::new();
+        for line in 0..30_000 {
+            write!(flood, "flood {line:05}\r\n").unwrap();
+        }
+        replica.apply_tail(flood.as_bytes()).unwrap();
+
+        // The next page would stitch under content whose top rows are gone;
+        // the replica must refuse and stop paging instead.
+        let request = replica
+            .take_backfill_request("r2", BackfillTrigger::JumpToTop)
+            .unwrap()
+            .expect("second fetch planned");
+        let rows_added = replica
+            .apply_history_response(&server.serve_with_budget(&request, 4_096))
+            .unwrap();
+        assert_eq!(
+            rows_added, 0,
+            "no page may be stitched over an eviction gap"
+        );
+        assert!(replica.history_exhausted());
+        assert!(replica
+            .take_backfill_request("r3", BackfillTrigger::JumpToTop)
+            .unwrap()
+            .is_none());
+
+        // Contiguity: the replica content is a gap-free suffix of a
+        // reference terminal fed the same bytes with unlimited scrollback.
+        let mut reference = Terminal::new(40, 6, 100_000_000).unwrap();
+        reference.write(input.as_bytes());
+        reference.write(flood.as_bytes());
+        let ref_text = screen_text(&reference);
+        let replica_text = screen_text(replica.terminal());
+        let ref_lines: Vec<&str> = ref_text.lines().collect();
+        let replica_lines: Vec<&str> = replica_text.lines().collect();
+        assert!(!replica_lines.is_empty());
+        assert_eq!(
+            replica_lines[..],
+            ref_lines[ref_lines.len() - replica_lines.len()..],
+            "replica content must be a contiguous suffix, never gapped"
+        );
+    }
+
+    #[test]
+    fn vt_scan_advance_ground_contract() {
+        let scan = |bytes: &[u8]| {
+            bytes.iter().fold(VtScanState::Ground, |state, &byte| {
+                vt_scan_advance(state, byte)
+            })
+        };
+        // Complete sequences end at ground.
+        assert_eq!(scan(b"plain text"), VtScanState::Ground);
+        assert_eq!(scan(b"\x1b[31m"), VtScanState::Ground);
+        assert_eq!(scan(b"\x1b[?1049h"), VtScanState::Ground);
+        assert_eq!(scan(b"\x1b(B"), VtScanState::Ground);
+        assert_eq!(scan(b"\x1b]0;title\x07"), VtScanState::Ground);
+        assert_eq!(scan(b"\x1b]8;;http://x\x1b\\"), VtScanState::Ground);
+        assert_eq!(scan(b"\x1bP1$r\x1b\\"), VtScanState::Ground);
+        assert_eq!(scan("🌍".as_bytes()), VtScanState::Ground);
+        // Incomplete prefixes are not ground.
+        assert_ne!(scan(b"\x1b"), VtScanState::Ground);
+        assert_ne!(scan(b"\x1b[3"), VtScanState::Ground);
+        assert_ne!(scan(b"\x1b]0;tit"), VtScanState::Ground);
+        assert_ne!(scan(b"\x1b]0;tit\x1b"), VtScanState::Ground);
+        assert_ne!(scan(b"\x1b("), VtScanState::Ground);
+        assert_ne!(scan(&"🌍".as_bytes()[..3]), VtScanState::Ground);
+        // A stray continuation byte cannot wedge the scanner.
+        assert_eq!(scan(b"\xf0\x41"), VtScanState::Ground);
     }
 
     #[test]

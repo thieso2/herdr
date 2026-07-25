@@ -98,9 +98,20 @@ pub const HISTORY_PAGE_DEFAULT_BYTES: usize = 256 * 1024;
 /// clamped up so pathological clients cannot force per-line round trips.
 pub const HISTORY_PAGE_MIN_BYTES: usize = 4 * 1024;
 
-/// Largest honored `stream.history` fetch. Covers a full scrollback budget
-/// (jump-to-top) while keeping the response inside `MAX_FRAME_PAYLOAD`.
+/// Largest honored `stream.history` fetch a client may request. Covers a full
+/// scrollback budget (jump-to-top); the server additionally caps each served
+/// page at `HISTORY_PAGE_SERVED_MAX_BYTES` and pages the remainder through
+/// `next_cursor`.
 pub const HISTORY_FETCH_MAX_BYTES: usize = 16 * 1024 * 1024;
+
+/// Largest history page content the server serves in one `stream.history`
+/// response. JSON string escaping expands control bytes (ESC, CR, ...) into
+/// six-byte `\u001b`-style escapes, so a page of `n` content bytes can encode
+/// to up to `6 * n` payload bytes. This cap keeps the worst-case encoded
+/// response (content plus cursor and envelope headroom) inside
+/// `MAX_FRAME_PAYLOAD`, so serving a page can never tear down the session
+/// with an oversized frame.
+pub const HISTORY_PAGE_SERVED_MAX_BYTES: usize = (MAX_FRAME_PAYLOAD - 64 * 1024) / 6;
 
 /// Control-plane method writing raw bytes to a pane PTY.
 pub const PANE_SEND_BYTES_METHOD: &str = "pane.send_bytes";
@@ -461,21 +472,27 @@ pub fn decode_history_cursor(cursor: &str) -> Option<HistoryCursor> {
 }
 
 /// Computes the start of the history page ending at byte `end`, honoring a
-/// byte budget while keeping page starts newline-aligned.
+/// hard byte budget while preferring newline-aligned page starts.
 ///
-/// The returned start is always strictly below `end` (for non-empty input),
-/// always a UTF-8 char boundary, and always either `0` or immediately after a
-/// `\n`, so replaying any suffix of pages never begins mid-line or inside an
-/// escape sequence. When no newline exists inside the budget the page grows
-/// backward to the previous line start instead of splitting a line.
+/// The returned start is always strictly below `end` (for non-empty input)
+/// and always a UTF-8 char boundary. When a newline falls inside the budget,
+/// the page starts just after the first one, so replaying a suffix of pages
+/// begins at a line start. When no newline falls inside the budget (one long
+/// soft-wrapped logical line), the page is cut at the budget boundary anyway,
+/// snapped back onto a char boundary — so a page never exceeds the budget by
+/// more than three bytes of one multi-byte character. Mid-line cuts are safe
+/// because pages are byte-contiguous slices of one immutable capture: the
+/// client reassembles the split line by replaying the next-older page
+/// directly in front of this one.
 pub fn history_page_start(history: &str, end: usize, max_bytes: usize) -> usize {
     let end = end.min(history.len());
-    if end <= max_bytes.max(1) {
+    let max_bytes = max_bytes.max(1);
+    if end <= max_bytes {
         return 0;
     }
-    let mut candidate = end - max_bytes.max(1);
-    while candidate < end && !history.is_char_boundary(candidate) {
-        candidate += 1;
+    let mut candidate = end - max_bytes;
+    while candidate > 0 && !history.is_char_boundary(candidate) {
+        candidate -= 1;
     }
     if let Some(pos) = history[candidate..end].find('\n') {
         let start = candidate + pos + 1;
@@ -483,10 +500,7 @@ pub fn history_page_start(history: &str, end: usize, max_bytes: usize) -> usize 
             return start;
         }
     }
-    match history[..candidate].rfind('\n') {
-        Some(pos) => pos + 1,
-        None => 0,
-    }
+    candidate
 }
 
 /// Negotiates a `session.hello` against this server's version window and
@@ -989,18 +1003,81 @@ mod tests {
     fn history_page_start_handles_budget_and_unaligned_edges() {
         // Whole history inside the budget collapses to one page.
         assert_eq!(history_page_start("a\r\nb", 4, 64), 0);
-        // A single line larger than the budget grows backward to the
-        // previous line start instead of splitting the line.
+        // A single line larger than the budget is cut at the budget boundary
+        // instead of growing without bound to the previous line start.
         let history = format!("first\n{}", "x".repeat(100));
-        assert_eq!(history_page_start(&history, history.len(), 10), 6);
-        // No newline anywhere: one page covering everything.
+        assert_eq!(
+            history_page_start(&history, history.len(), 10),
+            history.len() - 10
+        );
+        // No newline anywhere: still a hard byte cap per page.
         let solid = "y".repeat(100);
-        assert_eq!(history_page_start(&solid, solid.len(), 10), 0);
+        assert_eq!(
+            history_page_start(&solid, solid.len(), 10),
+            solid.len() - 10
+        );
         // Multi-byte characters at the budget edge stay on char boundaries.
         let emoji = format!("top\n{}\nbottom", "👨‍👩‍👧".repeat(20));
         let start = history_page_start(&emoji, emoji.len(), 8);
         assert!(emoji.is_char_boundary(start));
-        assert!(start == 0 || emoji.as_bytes()[start - 1] == b'\n');
+    }
+
+    #[test]
+    fn history_page_start_hard_caps_newline_free_pages_without_gaps() {
+        // A single soft-wrapped logical line far larger than the budget:
+        // pages must stay near the budget and reassemble exactly.
+        let history = format!("{}🌍🌍🌍", "z".repeat(40_000));
+        let budget = 4 * 1024;
+        let mut end = history.len();
+        let mut pages = Vec::new();
+        while end > 0 {
+            let start = history_page_start(&history, end, budget);
+            assert!(start < end, "pages must make progress");
+            assert!(history.is_char_boundary(start));
+            // A char-boundary snap may exceed the budget by at most three
+            // bytes of one multi-byte character.
+            assert!(
+                end - start <= budget + 3,
+                "page {} exceeds cap",
+                end - start
+            );
+            pages.push(&history[start..end]);
+            end = start;
+        }
+        assert!(pages.len() > 2, "budget must actually split the history");
+        let rejoined: String = pages.iter().rev().copied().collect();
+        assert_eq!(rejoined, history);
+    }
+
+    #[test]
+    fn served_page_cap_bounds_worst_case_encoded_response() {
+        // ESC escapes to a six-byte `\u001b` in JSON, the worst-case string
+        // expansion. A full served page of ESC bytes plus a maximal cursor
+        // must still encode inside the frame payload limit.
+        let content = "\u{1b}".repeat(HISTORY_PAGE_SERVED_MAX_BYTES);
+        let cursor = encode_history_cursor(&HistoryCursor {
+            pane_id: "p_18446744073709551615".to_owned(),
+            sequence: u64::MAX,
+            stream_id: u32::MAX,
+            offset: u64::MAX,
+        });
+        let response = serde_json::json!({
+            "id": "history-worst-case",
+            "result": {
+                "type": "stream_history",
+                "stream_id": u32::MAX,
+                "content": content,
+                "next_cursor": cursor,
+                "at_top": false,
+            },
+        });
+        let encoded = serde_json::to_vec(&response).expect("encodable response");
+        assert!(
+            encoded.len() <= MAX_FRAME_PAYLOAD,
+            "worst-case response {} exceeds frame limit {}",
+            encoded.len(),
+            MAX_FRAME_PAYLOAD
+        );
     }
 
     #[test]

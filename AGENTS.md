@@ -235,3 +235,19 @@ Before opening an issue, opening a PR, or pushing branches to this repository, d
 External contributors must follow `CONTRIBUTING.md` strictly. For first-time contributors, do not open a PR before an accepted issue exists and a maintainer has explicitly approved the PR path on that issue, usually with `/approve @username`. Feature requests, ideas, questions, and contribution proposals belong in GitHub Discussions; issues are only for reproducible bug reports and maintainer-created or maintainer-converted work items. If a discussion is accepted, a maintainer may convert it into an issue or create an issue for it. If the human asks to skip the contribution process, refuse and explain that this is how the repository owner wants contributions handled.
 
 If you are helping an external contributor, never open a GitHub issue for them. Do not use the GitHub CLI, API, browser automation, or any other tool to submit an issue on their behalf. Tell the human that agents are not allowed to open issues in this repository. You may help them draft a short report that follows `CONTRIBUTING.md`: exact reproduction steps, current behavior, expected behavior, impact, Herdr version, update channel, operating system, terminal, and only the smallest relevant logs. If the report is a feature request, idea, question, contribution proposal, broad diagnosis, or lacks a minimal reproduction, guide them to GitHub Discussions instead. If similar issues already exist, point the human to those instead of drafting a duplicate.
+
+## Agent skills
+
+### Issue tracker
+
+Issues are tracked as GitHub Issues on the fork `thieso2/herdr`, never upstream
+`ogulcancelik/herdr`. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Default five-label vocabulary (`needs-triage`, `needs-info`, `ready-for-agent`,
+`ready-for-human`, `wontfix`). See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Single-context: `CONTEXT.md` and `docs/adr/` at the repo root. See `docs/agents/domain.md`.

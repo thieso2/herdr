@@ -25,7 +25,7 @@ use super::{
     ScrollbarClickTarget, TAB_DRAG_THRESHOLD, WORKSPACE_DRAG_THRESHOLD,
 };
 
-pub(super) enum MouseAction {
+pub(crate) enum MouseAction {
     NewWorkspace,
     Settings(SettingsAction),
     FocusWorkspace {
@@ -95,7 +95,7 @@ impl AppState {
         }
     }
 
-    pub(super) fn handle_mouse(
+    pub(crate) fn handle_mouse(
         &mut self,
         terminal_runtimes: &mut TerminalRuntimeRegistry,
         mouse: MouseEvent,

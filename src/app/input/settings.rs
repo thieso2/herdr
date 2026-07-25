@@ -12,7 +12,7 @@ use crate::{
 #[derive(Debug, Clone, PartialEq, Eq)]
 // The shared `Save` verb is semantic: these actions persist settings.
 #[allow(clippy::enum_variant_names)]
-pub(super) enum SettingsAction {
+pub(crate) enum SettingsAction {
     SaveTheme(String),
     SaveSound(bool),
     SaveToastDelivery(ToastDelivery),

@@ -15,6 +15,9 @@ mod creation;
 mod git_refresh;
 mod ids;
 mod input;
+// Re-exported for the unix-only pure-client intent interpreter (#20).
+#[cfg(unix)]
+pub(crate) use input::MouseAction;
 mod popup;
 mod runtime;
 mod runtime_mutations;

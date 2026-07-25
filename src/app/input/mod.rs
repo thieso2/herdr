@@ -47,6 +47,7 @@ mod settings;
 mod sidebar;
 mod terminal;
 
+pub(crate) use self::mouse::MouseAction;
 pub(crate) use self::{
     modal::{
         handle_global_menu_key, handle_keybind_help_key, handle_navigator_key,
@@ -62,7 +63,6 @@ use self::{
     modal::{
         modal_action_from_key, ModalAction, ONBOARDING_WELCOME_ACTIONS, RELEASE_NOTES_ACTIONS,
     },
-    mouse::MouseAction,
     settings::SettingsAction,
 };
 use super::state::{AppState, Mode};

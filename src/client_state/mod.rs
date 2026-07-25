@@ -15,6 +15,8 @@ pub(crate) mod chrome;
 pub(crate) mod compose;
 pub(crate) mod connection;
 #[cfg(unix)]
+pub(crate) mod intent;
+#[cfg(unix)]
 pub(crate) mod run;
 
 use std::collections::BTreeMap;

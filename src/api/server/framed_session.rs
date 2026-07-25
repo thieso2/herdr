@@ -42,14 +42,15 @@ use crate::protocol::framed::{
     HistoryCursor, NegotiatedSession, PanePasteImageControlParams, PaneSendBytesControlParams,
     SessionHelloParams, StreamCloseParams, StreamHistoryParams, StreamOpenParams,
     StreamResizeParams, StreamScrollDirection, StreamScrollParams, StreamScrollSource,
-    CAPABILITY_CATALOG, CAPABILITY_NOTIFICATION, CAPABILITY_PANE_STREAM, CAPABILITY_PASTE_IMAGE,
-    CAPABILITY_WINDOW_TITLE, CATALOG_EVENT, CONTROL_STREAM_ID, FRAMED_PROTOCOL_MIN_SUPPORTED,
-    FRAMED_PROTOCOL_VERSION, FRAME_HEADER_BYTES, HISTORY_FETCH_MAX_BYTES,
-    HISTORY_PAGE_DEFAULT_BYTES, HISTORY_PAGE_MIN_BYTES, HISTORY_PAGE_SERVED_MAX_BYTES,
-    MAX_FRAME_PAYLOAD, NOTIFICATION_POSTED_EVENT, PANE_PASTE_IMAGE_METHOD, PANE_SEND_BYTES_METHOD,
-    PING_METHOD, SESSION_HELLO_METHOD, SESSION_SNAPSHOT_METHOD, STREAM_CLOSED_EVENT,
-    STREAM_CLOSE_METHOD, STREAM_HISTORY_METHOD, STREAM_OPEN_METHOD, STREAM_RESIZE_METHOD,
-    STREAM_REVOKED_EVENT, STREAM_SCROLL_METHOD, WINDOW_TITLE_CHANGED_EVENT,
+    API_REQUEST_METHOD, CAPABILITY_CATALOG, CAPABILITY_NOTIFICATION, CAPABILITY_PANE_STREAM,
+    CAPABILITY_PASTE_IMAGE, CAPABILITY_WINDOW_TITLE, CATALOG_EVENT, CONTROL_STREAM_ID,
+    FRAMED_PROTOCOL_MIN_SUPPORTED, FRAMED_PROTOCOL_VERSION, FRAME_HEADER_BYTES,
+    HISTORY_FETCH_MAX_BYTES, HISTORY_PAGE_DEFAULT_BYTES, HISTORY_PAGE_MIN_BYTES,
+    HISTORY_PAGE_SERVED_MAX_BYTES, MAX_FRAME_PAYLOAD, NOTIFICATION_POSTED_EVENT,
+    PANE_PASTE_IMAGE_METHOD, PANE_SEND_BYTES_METHOD, PING_METHOD, SESSION_HELLO_METHOD,
+    SESSION_SNAPSHOT_METHOD, STREAM_CLOSED_EVENT, STREAM_CLOSE_METHOD, STREAM_HISTORY_METHOD,
+    STREAM_OPEN_METHOD, STREAM_RESIZE_METHOD, STREAM_REVOKED_EVENT, STREAM_SCROLL_METHOD,
+    WINDOW_TITLE_CHANGED_EVENT,
 };
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -643,6 +644,7 @@ fn handle_control_request(
         SESSION_SNAPSHOT_METHOD => {
             handle_session_snapshot(stream, session, request, api_tx, event_hub)
         }
+        API_REQUEST_METHOD => handle_api_request_passthrough(stream, session, request, api_tx),
         SESSION_HELLO_METHOD => write_control_allow_disconnect(
             stream,
             &error_response(
@@ -701,6 +703,62 @@ fn handle_session_snapshot(
         Err(_) => response,
     };
     write_control_raw_allow_disconnect(stream, &anchored)
+}
+
+/// Forwards one JSON API request to the app thread verbatim and relays the
+/// response, so framed clients reach the whole Method vocabulary without a
+/// per-method allowlist here. Long-poll methods are rejected: they would
+/// wedge this session thread against the app-response timeout.
+fn handle_api_request_passthrough(
+    stream: &mut LocalStream,
+    session: &NegotiatedSession,
+    request: ControlRequest,
+    api_tx: &ApiRequestSender,
+) -> io::Result<bool> {
+    if let Some(rejection) = capability_rejection(session, CAPABILITY_CATALOG, &request) {
+        return write_control_allow_disconnect(stream, &rejection);
+    }
+    let Some(inner) = request.params.get("request").cloned() else {
+        return write_control_allow_disconnect(
+            stream,
+            &error_response(
+                &request.id,
+                "invalid_params",
+                &format!("{API_REQUEST_METHOD} params carry no request"),
+                None,
+            ),
+        );
+    };
+    let api_request = match serde_json::from_value::<crate::api::schema::Request>(inner) {
+        Ok(api_request) => api_request,
+        Err(err) => {
+            return write_control_allow_disconnect(
+                stream,
+                &error_response(
+                    &request.id,
+                    "invalid_params",
+                    &format!("invalid api request: {err}"),
+                    None,
+                ),
+            );
+        }
+    };
+    if matches!(
+        api_request.method,
+        crate::api::schema::Method::EventsSubscribe(_) | crate::api::schema::Method::EventsWait(_)
+    ) {
+        return write_control_allow_disconnect(
+            stream,
+            &error_response(
+                &request.id,
+                "invalid_params",
+                "long-poll methods are not available over api.request;                  negotiate the catalog capability for events",
+                None,
+            ),
+        );
+    }
+    let response = dispatch_to_app_with_timeout(api_request, api_tx, Some(APP_RESPONSE_TIMEOUT));
+    write_control_raw_allow_disconnect(stream, &response)
 }
 
 /// Opens a pane output stream: allocates the stream id, registers the pending
@@ -2099,6 +2157,92 @@ mod tests {
     }
 
     #[test]
+    fn framed_api_request_passthrough_dispatches_and_relays() {
+        let (api_tx, mut api_rx) = tokio::sync::mpsc::unbounded_channel::<ApiRequestMessage>();
+        let responder = std::thread::spawn(move || {
+            while let Some(msg) = api_rx.blocking_recv() {
+                let Method::WorkspaceFocus(target) = &msg.request.method else {
+                    panic!("unexpected method {:?}", msg.request.method);
+                };
+                assert_eq!(target.workspace_id, "ws_9");
+                msg.respond_to
+                    .send(
+                        serde_json::json!({
+                            "id": msg.request.id,
+                            "result": { "type": "ok" },
+                        })
+                        .to_string(),
+                    )
+                    .unwrap();
+            }
+        });
+
+        let (mut client, server, path) = local_stream_pair("api-request");
+        let (done_rx, thread) = spawn_connection_with(server, api_tx.clone(), EventHub::default());
+
+        hello(&mut client, "h23", &["catalog"]);
+        send_control(
+            &mut client,
+            serde_json::json!({
+                "id": "a1",
+                "method": "api.request",
+                "params": { "request": {
+                    "id": "a1",
+                    "method": "workspace.focus",
+                    "params": { "workspace_id": "ws_9" },
+                }},
+            }),
+        );
+        let response = read_control(&mut client);
+        assert_eq!(response["id"], "a1");
+        assert_eq!(response["result"]["type"], "ok");
+
+        // Long-poll methods are rejected instead of wedging the session.
+        send_control(
+            &mut client,
+            serde_json::json!({
+                "id": "a2",
+                "method": "api.request",
+                "params": { "request": {
+                    "id": "a2",
+                    "method": "events.wait",
+                    "params": {},
+                }},
+            }),
+        );
+        let rejected = read_control(&mut client);
+        assert_eq!(rejected["error"]["code"], "invalid_params");
+
+        finish(client, done_rx, thread, path);
+        drop(api_tx);
+        responder.join().unwrap();
+    }
+
+    #[test]
+    fn framed_api_request_requires_the_catalog_capability() {
+        let (mut client, server, path) = local_stream_pair("api-request-gated");
+        let (done_rx, thread) = spawn_connection(server);
+
+        hello(&mut client, "h24", &["pane-stream"]);
+        send_control(
+            &mut client,
+            serde_json::json!({
+                "id": "a3",
+                "method": "api.request",
+                "params": { "request": {
+                    "id": "a3",
+                    "method": "workspace.focus",
+                    "params": { "workspace_id": "ws_1" },
+                }},
+            }),
+        );
+        let error = read_control(&mut client);
+        assert_eq!(error["error"]["code"], "capability_not_negotiated");
+
+        finish(client, done_rx, thread, path);
+    }
+
+    #[test]
     fn framed_catalog_events_broadcast_when_negotiated() {
         let event_hub = EventHub::default();
         let (mut client, server, path) = local_stream_pair("catalog-events");
@@ -2106,6 +2250,13 @@ mod tests {
         let (done_rx, thread) = spawn_connection_with(server, api_tx, event_hub.clone());
 
         hello(&mut client, "h22", &["catalog"]);
+        // A ping round-trip guarantees the session loop is running and has
+        // anchored its event cursor, so the pushes below are session traffic.
+        send_control(
+            &mut client,
+            serde_json::json!({"id": "p0", "method": "ping", "params": {}}),
+        );
+        assert_eq!(read_control(&mut client)["result"]["type"], "pong");
 
         event_hub.push(crate::api::schema::EventEnvelope {
             event: crate::api::schema::EventKind::PaneClosed,

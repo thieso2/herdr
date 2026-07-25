@@ -87,6 +87,11 @@ pub const SESSION_HELLO_METHOD: &str = "session.hello";
 /// capability.
 pub const SESSION_SNAPSHOT_METHOD: &str = "session.snapshot";
 
+/// Control-plane method carrying one JSON API request verbatim, so a pure
+/// client can drive every session mutation through the existing Method
+/// vocabulary over the framed connection. Requires the `catalog` capability.
+pub const API_REQUEST_METHOD: &str = "api.request";
+
 /// Control-plane heartbeat method.
 pub const PING_METHOD: &str = "ping";
 

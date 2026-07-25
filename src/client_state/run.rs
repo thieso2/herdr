@@ -70,10 +70,12 @@ enum LoopEvent {
 enum Pending {
     Snapshot,
     StreamOpen { pane_id: String },
+    History { stream_id: u32 },
+    Api,
 }
 
 /// One connected framed session.
-struct Session {
+pub(super) struct Session {
     stream: LocalStream,
     next_request_id: u64,
     pending: HashMap<String, Pending>,
@@ -278,7 +280,7 @@ pub(crate) fn run_pure_client(config: &crate::config::Config) -> io::Result<()> 
 }
 
 /// Connection state the loop threads through reconnects.
-enum Link {
+pub(super) enum Link {
     Up(Session),
     Down { retry_at: Instant },
     Incompatible,
@@ -478,6 +480,69 @@ fn sync_mode(app: &mut AppState) {
     }
 }
 
+/// Page keys scroll the replica locally when the pane is a plain screen
+/// (no alternate screen, no app cursor, no mouse reporting), mirroring the
+/// legacy attach's local-scrollback routing. Returns false to forward the
+/// key to the pane instead.
+fn scroll_focused_replica_page(
+    code: crossterm::event::KeyCode,
+    link: &mut Link,
+    mirrors: &mut RemoteMirrors,
+    ids: &mut ComposeIds,
+    app: &mut AppState,
+) -> bool {
+    let Some(public) = focused_public_pane(mirrors, ids, app) else {
+        return false;
+    };
+    let mirror = mirrors.local_mut();
+    let Some(stream_id) = mirror.stream_for_pane(&public) else {
+        return false;
+    };
+    let Some(replica) = mirror.replicas.get_mut(&stream_id) else {
+        return false;
+    };
+    let plain = crate::pane::plain_terminal_input_state(replica.terminal())
+        .is_some_and(|state| state.plain_page_keys_use_host_scrollback());
+    if !plain {
+        return false;
+    }
+    let rows = replica
+        .scroll_metrics()
+        .map(|metrics| metrics.viewport_rows.max(1) as isize)
+        .unwrap_or(24);
+    let delta = if code == crossterm::event::KeyCode::PageUp {
+        -rows
+    } else {
+        rows
+    };
+    replica.scroll_delta(delta);
+    request_backfill_if_needed(link, stream_id, mirrors);
+    true
+}
+
+/// Issues a lazy scrollback backfill for a stream whose viewport approaches
+/// the top of loaded history. The response prepends through the replica's
+/// rebuild path.
+fn request_backfill_if_needed(link: &mut Link, stream_id: u32, mirrors: &mut RemoteMirrors) {
+    let Link::Up(session) = link else {
+        return;
+    };
+    let Some(replica) = mirrors.local_mut().replicas.get_mut(&stream_id) else {
+        return;
+    };
+    let id = session.request_id("history");
+    match replica.take_backfill_request(&id, crate::terminal::replica::BackfillTrigger::Scroll) {
+        Ok(Some(request)) => {
+            session.pending.insert(id, Pending::History { stream_id });
+            if let Err(err) = session.send_control(&request) {
+                warn!(err = %err, "stream.history send failed");
+            }
+        }
+        Ok(None) => {}
+        Err(err) => warn!(err = %err, "backfill planning failed"),
+    }
+}
+
 /// Reads frames off the session socket into the loop channel.
 fn socket_reader_loop(
     mut stream: LocalStream,
@@ -598,6 +663,21 @@ fn handle_server_frame(
                     }
                     Err(None) => warn!(pane = %pane_id, "stream.open answer malformed"),
                 },
+                Some(Pending::History { stream_id }) => {
+                    if let Some(replica) = mirror.replicas.get_mut(&stream_id) {
+                        match replica.apply_history_response(&payload) {
+                            Ok(rows_prepended) => {
+                                debug!(stream = stream_id, rows_prepended, "history page applied")
+                            }
+                            Err(err) => warn!(err = %err, "history page apply failed"),
+                        }
+                    }
+                }
+                Some(Pending::Api) => {
+                    if let Some(error) = control_error(&payload) {
+                        debug!(code = %error.code, message = %error.message, "api.request rejected");
+                    }
+                }
                 None => {
                     if let Some(error) = control_error(&payload) {
                         debug!(code = %error.code, message = %error.message, "control error");
@@ -775,12 +855,17 @@ fn handle_key(
                     app.should_quit = true;
                 }
                 KeyCode::Esc => {}
-                _ => {}
+                _ => super::intent::dispatch_prefix_intent(key, link, mirrors, ids, app),
             }
         }
         Mode::Terminal => {
             if app.is_prefix_key(key) {
                 app.mode = Mode::Prefix;
+                return;
+            }
+            if matches!(key.code, KeyCode::PageUp | KeyCode::PageDown)
+                && scroll_focused_replica_page(key.code, link, mirrors, ids, app)
+            {
                 return;
             }
             forward_key(key, link, mirrors, ids, app);
@@ -914,7 +999,38 @@ fn handle_mouse(
                 lines
             };
             replica.scroll_delta(delta);
+            request_backfill_if_needed(link, stream_id, mirrors);
         }
-        _ => {}
+        _ => {
+            super::intent::dispatch_mouse_intent(mouse, link, mirrors, ids, app);
+        }
     }
 }
+
+/// Sends a JSON API request over the framed control plane. Fire-and-forget:
+/// the response only surfaces errors, and the resulting catalog events
+/// update the mirror.
+pub(super) fn send_api_request(link: &mut Link, method: crate::api::schema::Method) {
+    let Link::Up(session) = link else {
+        return;
+    };
+    let id = session.request_id("api");
+    let request = crate::api::schema::Request {
+        id: id.clone(),
+        method,
+    };
+    let Ok(request_value) = serde_json::to_value(&request) else {
+        return;
+    };
+    let control = serde_json::json!({
+        "id": id.clone(),
+        "method": crate::protocol::framed::API_REQUEST_METHOD,
+        "params": { "request": request_value },
+    });
+    session.pending.insert(id, Pending::Api);
+    if let Err(err) = session.send_control(&control) {
+        warn!(err = %err, "api.request failed");
+    }
+}
+
+pub(super) use Link as SessionLink;

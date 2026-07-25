@@ -15,7 +15,7 @@ use crate::{
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum ModalAction {
+pub(crate) enum ModalAction {
     Continue,
     Save,
     Clear,

@@ -2587,14 +2587,19 @@ impl PaneRuntime {
         (!ansi.trim().is_empty()).then_some(ansi)
     }
 
-    /// Subscribes to this pane's raw PTY output tail and captures the visible
-    /// screen as an ANSI snapshot under the tap lock, so the subscription
-    /// sequence, the snapshot, and the tail are mutually consistent.
+    /// Subscribes to this pane's raw PTY output tail and captures the stream
+    /// seed (state-carrying screen snapshot plus scrollback history) under
+    /// the tap lock, so the subscription sequence, the seed, and the tail are
+    /// mutually consistent: every published byte is inside the seed or
+    /// delivered by the subscription, never both and never neither.
     pub(crate) fn subscribe_output_with_snapshot(
         &self,
-    ) -> (output_tap::PaneOutputSubscription, String) {
+    ) -> (
+        output_tap::PaneOutputSubscription,
+        crate::ghostty::TerminalStreamSeed,
+    ) {
         self.output_tap
-            .subscribe_with_snapshot(|| self.visible_ansi())
+            .subscribe_with_snapshot(|| self.terminal.stream_seed())
     }
 
     pub fn extract_selection(&self, selection: &crate::selection::Selection) -> Option<String> {

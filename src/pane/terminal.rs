@@ -385,6 +385,10 @@ impl PaneTerminal {
         self.ghostty.visible_ansi()
     }
 
+    pub(crate) fn stream_seed(&self) -> crate::ghostty::TerminalStreamSeed {
+        self.ghostty.stream_seed()
+    }
+
     pub fn detection_text(&self) -> String {
         self.ghostty.detection_text()
     }
@@ -1702,6 +1706,17 @@ impl GhosttyPaneTerminal {
             .lock()
             .ok()
             .and_then(|mut core| ghostty_visible_text(&mut core).ok())
+            .unwrap_or_default()
+    }
+
+    /// Captures the pane-stream seed (state-carrying snapshot plus unwrapped
+    /// content-only history) under the terminal core lock. Callers hold the
+    /// output tap lock, so the seed is consistent with the tap sequence.
+    pub(crate) fn stream_seed(&self) -> crate::ghostty::TerminalStreamSeed {
+        self.core
+            .lock()
+            .ok()
+            .and_then(|core| core.terminal.stream_seed().ok())
             .unwrap_or_default()
     }
 

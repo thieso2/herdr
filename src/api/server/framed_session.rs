@@ -31,17 +31,20 @@ use crate::ipc::{
     LocalStreamReadLen,
 };
 use crate::pane::output_tap::{
-    cancel_pending_stream, claim_pending_stream, register_pending_stream, PaneOutputSubscription,
+    cancel_pending_stream, claim_pending_stream, register_pending_stream, PaneStreamAttachment,
 };
 use crate::protocol::framed::{
-    decode_frame_header, negotiate_session_hello, write_frame, Frame, FrameType, FramedCodecError,
-    HelloError, HelloRemedy, NegotiatedSession, PanePasteImageControlParams,
-    PaneSendBytesControlParams, SessionHelloParams, StreamCloseParams, StreamOpenParams,
-    CAPABILITY_NOTIFICATION, CAPABILITY_PANE_STREAM, CAPABILITY_PASTE_IMAGE,
+    decode_frame_header, decode_history_cursor, encode_history_cursor, history_page_start,
+    negotiate_session_hello, write_frame, Frame, FrameType, FramedCodecError, HelloError,
+    HelloRemedy, HistoryCursor, NegotiatedSession, PanePasteImageControlParams,
+    PaneSendBytesControlParams, SessionHelloParams, StreamCloseParams, StreamHistoryParams,
+    StreamOpenParams, CAPABILITY_NOTIFICATION, CAPABILITY_PANE_STREAM, CAPABILITY_PASTE_IMAGE,
     CAPABILITY_WINDOW_TITLE, CONTROL_STREAM_ID, FRAMED_PROTOCOL_MIN_SUPPORTED,
-    FRAMED_PROTOCOL_VERSION, FRAME_HEADER_BYTES, NOTIFICATION_POSTED_EVENT,
+    FRAMED_PROTOCOL_VERSION, FRAME_HEADER_BYTES, HISTORY_FETCH_MAX_BYTES,
+    HISTORY_PAGE_DEFAULT_BYTES, HISTORY_PAGE_MIN_BYTES, NOTIFICATION_POSTED_EVENT,
     PANE_PASTE_IMAGE_METHOD, PANE_SEND_BYTES_METHOD, PING_METHOD, SESSION_HELLO_METHOD,
-    STREAM_CLOSED_EVENT, STREAM_CLOSE_METHOD, STREAM_OPEN_METHOD, WINDOW_TITLE_CHANGED_EVENT,
+    STREAM_CLOSED_EVENT, STREAM_CLOSE_METHOD, STREAM_HISTORY_METHOD, STREAM_OPEN_METHOD,
+    WINDOW_TITLE_CHANGED_EVENT,
 };
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -129,8 +132,9 @@ pub(super) fn serve(
     );
 
     // Open pane output streams, keyed by server-allocated stream id. Dropping
-    // a subscription detaches it from the pane tap.
-    let mut streams: HashMap<u32, PaneOutputSubscription> = HashMap::new();
+    // an attachment detaches its subscription from the pane tap and releases
+    // its history capture.
+    let mut streams: HashMap<u32, PaneStreamAttachment> = HashMap::new();
     // Events published before the handshake are history, not session traffic.
     let mut event_cursor = event_hub.current_sequence();
 
@@ -143,30 +147,14 @@ pub(super) fn serve(
                 if !running.load(Ordering::Relaxed) {
                     break SessionEnd::ServerStopped;
                 }
-                match pump_session_output(
+                if let Some(end) = pump_session_output_or_end(
                     &mut stream,
                     &session,
                     &mut streams,
                     event_hub,
                     &mut event_cursor,
                 )? {
-                    PumpOutcome::Continue => {}
-                    PumpOutcome::PeerClosed => break SessionEnd::PeerClosed,
-                    PumpOutcome::Overloaded(stream_id) => {
-                        let _ = write_control_allow_disconnect(
-                            &mut stream,
-                            &error_response(
-                                "",
-                                "stream_overloaded",
-                                &format!(
-                                    "stream {stream_id} overran the bounded output buffer; \
-                                     reconnect and reopen the stream to reseed"
-                                ),
-                                Some(serde_json::json!({ "stream_id": stream_id })),
-                            ),
-                        )?;
-                        break SessionEnd::Overloaded;
-                    }
+                    break end;
                 }
                 std::thread::sleep(if streams.is_empty() {
                     CONNECTION_POLL_INTERVAL
@@ -202,6 +190,19 @@ pub(super) fn serve(
                     {
                         break SessionEnd::PeerClosed;
                     }
+                    // Drain stream output after every control frame too, so a
+                    // burst of control traffic or a slow app dispatch cannot
+                    // stall DATA tails long enough to overflow the bounded
+                    // subscriber buffers under a fast producer.
+                    if let Some(end) = pump_session_output_or_end(
+                        &mut stream,
+                        &session,
+                        &mut streams,
+                        event_hub,
+                        &mut event_cursor,
+                    )? {
+                        break end;
+                    }
                 }
             },
         }
@@ -216,18 +217,49 @@ pub(super) fn serve(
     Ok(())
 }
 
+/// Runs one output pump pass, translating the outcome into the session end
+/// it forces, if any. Writes the overload error itself so both call sites
+/// (idle poll and post-control-frame drain) behave identically.
+fn pump_session_output_or_end(
+    stream: &mut LocalStream,
+    session: &NegotiatedSession,
+    streams: &mut HashMap<u32, PaneStreamAttachment>,
+    event_hub: &EventHub,
+    event_cursor: &mut u64,
+) -> io::Result<Option<SessionEnd>> {
+    match pump_session_output(stream, session, streams, event_hub, event_cursor)? {
+        PumpOutcome::Continue => Ok(None),
+        PumpOutcome::PeerClosed => Ok(Some(SessionEnd::PeerClosed)),
+        PumpOutcome::Overloaded(stream_id) => {
+            let _ = write_control_allow_disconnect(
+                stream,
+                &error_response(
+                    "",
+                    "stream_overloaded",
+                    &format!(
+                        "stream {stream_id} overran the bounded output buffer; \
+                         reconnect and reopen the stream to reseed"
+                    ),
+                    Some(serde_json::json!({ "stream_id": stream_id })),
+                ),
+            )?;
+            Ok(Some(SessionEnd::Overloaded))
+        }
+    }
+}
+
 /// Drains open stream subscriptions into DATA frames and broadcasts
 /// capability-gated events from the hub. Runs on every idle poll tick.
 fn pump_session_output(
     stream: &mut LocalStream,
     session: &NegotiatedSession,
-    streams: &mut HashMap<u32, PaneOutputSubscription>,
+    streams: &mut HashMap<u32, PaneStreamAttachment>,
     event_hub: &EventHub,
     event_cursor: &mut u64,
 ) -> io::Result<PumpOutcome> {
     let mut closed_streams = Vec::new();
-    for (&stream_id, subscription) in streams.iter() {
-        let drain = subscription.drain();
+    for (&stream_id, attachment) in streams.iter() {
+        let drain = attachment.subscription.drain();
         if drain.overloaded {
             return Ok(PumpOutcome::Overloaded(stream_id));
         }
@@ -407,7 +439,7 @@ fn handle_control_request(
     session: &NegotiatedSession,
     frame: &Frame,
     api_tx: &ApiRequestSender,
-    streams: &mut HashMap<u32, PaneOutputSubscription>,
+    streams: &mut HashMap<u32, PaneStreamAttachment>,
 ) -> io::Result<bool> {
     let request = match serde_json::from_slice::<ControlRequest>(&frame.payload) {
         Ok(request) => request,
@@ -438,6 +470,7 @@ fn handle_control_request(
         ),
         STREAM_OPEN_METHOD => handle_stream_open(stream, session, request, api_tx, streams),
         STREAM_CLOSE_METHOD => handle_stream_close(stream, session, request, streams),
+        STREAM_HISTORY_METHOD => handle_stream_history(stream, session, request, streams),
         PANE_SEND_BYTES_METHOD => {
             if let Some(rejection) = capability_rejection(session, CAPABILITY_PANE_STREAM, &request)
             {
@@ -539,7 +572,7 @@ fn handle_stream_open(
     session: &NegotiatedSession,
     request: ControlRequest,
     api_tx: &ApiRequestSender,
-    streams: &mut HashMap<u32, PaneOutputSubscription>,
+    streams: &mut HashMap<u32, PaneStreamAttachment>,
 ) -> io::Result<bool> {
     if let Some(rejection) = capability_rejection(session, CAPABILITY_PANE_STREAM, &request) {
         return write_control_allow_disconnect(stream, &rejection);
@@ -591,8 +624,8 @@ fn handle_stream_open(
     }
 
     match claim_pending_stream(stream_id) {
-        Some(subscription) => {
-            streams.insert(stream_id, subscription);
+        Some(attachment) => {
+            streams.insert(stream_id, attachment);
             write_control_raw_allow_disconnect(stream, &response)
         }
         None => {
@@ -616,7 +649,7 @@ fn handle_stream_close(
     stream: &mut LocalStream,
     session: &NegotiatedSession,
     request: ControlRequest,
-    streams: &mut HashMap<u32, PaneOutputSubscription>,
+    streams: &mut HashMap<u32, PaneStreamAttachment>,
 ) -> io::Result<bool> {
     if let Some(rejection) = capability_rejection(session, CAPABILITY_PANE_STREAM, &request) {
         return write_control_allow_disconnect(stream, &rejection);
@@ -655,6 +688,113 @@ fn handle_stream_close(
             "result": {
                 "type": "stream_closed",
                 "stream_id": params.stream_id,
+            },
+        }),
+    )
+}
+
+/// Serves one `stream.history` page from the history capture held with the
+/// open stream, walking backward from the opaque cursor.
+///
+/// The capture is immutable and was taken under the pane output tap lock at
+/// the `stream.open` sequence, so pages are byte-contiguous slices of one
+/// consistent buffer: chaining `next_cursor` yields the exact capture bytes,
+/// gap-free and duplicate-free, regardless of concurrent pane output. Pages
+/// are unwrapped, content-only ANSI and never re-assert terminal modes.
+/// Served session-locally, without dispatching to the app thread.
+fn handle_stream_history(
+    stream: &mut LocalStream,
+    session: &NegotiatedSession,
+    request: ControlRequest,
+    streams: &mut HashMap<u32, PaneStreamAttachment>,
+) -> io::Result<bool> {
+    if let Some(rejection) = capability_rejection(session, CAPABILITY_PANE_STREAM, &request) {
+        return write_control_allow_disconnect(stream, &rejection);
+    }
+    let params = match serde_json::from_value::<StreamHistoryParams>(request.params) {
+        Ok(params) => params,
+        Err(err) => {
+            return write_control_allow_disconnect(
+                stream,
+                &error_response(
+                    &request.id,
+                    "invalid_params",
+                    &format!("invalid {STREAM_HISTORY_METHOD} params: {err}"),
+                    None,
+                ),
+            );
+        }
+    };
+
+    let Some(cursor) = decode_history_cursor(&params.cursor) else {
+        return write_control_allow_disconnect(
+            stream,
+            &error_response(
+                &request.id,
+                "invalid_cursor",
+                "history cursor is not decodable; reopen the stream for a fresh cursor",
+                None,
+            ),
+        );
+    };
+    let Some(attachment) = streams.get(&cursor.stream_id) else {
+        return write_control_allow_disconnect(
+            stream,
+            &error_response(
+                &request.id,
+                "unknown_stream",
+                &format!("no open stream with id {}", cursor.stream_id),
+                None,
+            ),
+        );
+    };
+
+    let history = &attachment.history;
+    let end = usize::try_from(cursor.offset).unwrap_or(usize::MAX);
+    if cursor.pane_id != history.pane_id
+        || cursor.sequence != history.sequence
+        || end > history.content.len()
+        || !history.content.is_char_boundary(end)
+    {
+        return write_control_allow_disconnect(
+            stream,
+            &error_response(
+                &request.id,
+                "invalid_cursor",
+                "history cursor does not match the open stream's capture; \
+                 reopen the stream for a fresh cursor",
+                None,
+            ),
+        );
+    }
+
+    let max_bytes = usize::try_from(
+        params
+            .max_bytes
+            .unwrap_or(HISTORY_PAGE_DEFAULT_BYTES as u64),
+    )
+    .unwrap_or(HISTORY_FETCH_MAX_BYTES)
+    .clamp(HISTORY_PAGE_MIN_BYTES, HISTORY_FETCH_MAX_BYTES);
+    let start = history_page_start(&history.content, end, max_bytes);
+    let next_cursor = (start > 0).then(|| {
+        encode_history_cursor(&HistoryCursor {
+            pane_id: history.pane_id.clone(),
+            sequence: history.sequence,
+            stream_id: cursor.stream_id,
+            offset: start as u64,
+        })
+    });
+
+    write_control_allow_disconnect(
+        stream,
+        &serde_json::json!({
+            "id": request.id,
+            "result": {
+                "type": "stream_history",
+                "stream_id": cursor.stream_id,
+                "content": &history.content[start..end],
+                "next_cursor": next_cursor,
+                "at_top": start == 0,
             },
         }),
     )
@@ -806,8 +946,8 @@ mod tests {
     use crate::api::schema::{Method, ResponseResult, SuccessResponse};
     use crate::api::{ApiRequestMessage, EventHub};
     use crate::ipc::{bind_local_listener, connect_local_stream};
-    use crate::pane::output_tap::{fulfill_pending_stream, PaneOutputTap};
-    use crate::protocol::framed::{encode_history_cursor, read_frame, FRAMED_MAGIC};
+    use crate::pane::output_tap::{fulfill_pending_stream, PaneOutputTap, PaneStreamHistory};
+    use crate::protocol::framed::{read_frame, FRAMED_MAGIC};
     use interprocess::local_socket::traits::Listener as _;
     use std::io::{BufRead, BufReader, Write as _};
     use std::path::PathBuf;
@@ -861,6 +1001,14 @@ mod tests {
         tap: std::sync::Weak<PaneOutputTap>,
         requests: mpsc::Sender<Method>,
     ) -> (crate::api::ApiRequestSender, std::thread::JoinHandle<()>) {
+        spawn_pane_stream_responder_with_history(tap, requests, String::new())
+    }
+
+    fn spawn_pane_stream_responder_with_history(
+        tap: std::sync::Weak<PaneOutputTap>,
+        requests: mpsc::Sender<Method>,
+        history: String,
+    ) -> (crate::api::ApiRequestSender, std::thread::JoinHandle<()>) {
         let (api_tx, mut api_rx) = tokio::sync::mpsc::unbounded_channel::<ApiRequestMessage>();
         let responder = std::thread::spawn(move || {
             while let Some(msg) = api_rx.blocking_recv() {
@@ -871,7 +1019,17 @@ mod tests {
                         let (subscription, snapshot) =
                             tap.subscribe_with_snapshot(|| "SNAPSHOT".to_owned());
                         let sequence = subscription.sequence();
-                        assert!(fulfill_pending_stream(params.stream_id, subscription));
+                        let capture = Arc::new(PaneStreamHistory {
+                            pane_id: "pane_1".into(),
+                            sequence,
+                            content: history.clone(),
+                        });
+                        let history_len = capture.content.len() as u64;
+                        assert!(fulfill_pending_stream(
+                            params.stream_id,
+                            subscription,
+                            capture
+                        ));
                         serde_json::to_string(&SuccessResponse {
                             id: msg.request.id,
                             result: ResponseResult::PaneStreamOpened {
@@ -881,7 +1039,16 @@ mod tests {
                                     stream_id: params.stream_id,
                                     sequence,
                                     snapshot,
-                                    history_cursor: encode_history_cursor("pane_1", sequence),
+                                    history_cursor: crate::protocol::framed::encode_history_cursor(
+                                        &HistoryCursor {
+                                            pane_id: "pane_1".into(),
+                                            sequence,
+                                            stream_id: params.stream_id,
+                                            offset: history_len,
+                                        },
+                                    ),
+                                    cols: 80,
+                                    rows: 24,
                                 },
                             },
                         })
@@ -1142,13 +1309,15 @@ mod tests {
         assert_ne!(stream_id, CONTROL_STREAM_ID);
         assert_eq!(opened["result"]["stream"]["sequence"], 14);
         assert_eq!(opened["result"]["stream"]["snapshot"], "SNAPSHOT");
-        let cursor = opened["result"]["stream"]["history_cursor"]
-            .as_str()
-            .unwrap();
-        assert_eq!(
-            crate::protocol::framed::decode_history_cursor(cursor),
-            Some(("pane_1".to_owned(), 14))
-        );
+        let cursor = crate::protocol::framed::decode_history_cursor(
+            opened["result"]["stream"]["history_cursor"]
+                .as_str()
+                .unwrap(),
+        )
+        .expect("history cursor decodes");
+        assert_eq!(cursor.pane_id, "pane_1");
+        assert_eq!(cursor.sequence, 14);
+        assert_eq!(cursor.stream_id, stream_id);
         assert!(matches!(
             request_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
             Method::PaneStreamOpen(_)
@@ -1473,6 +1642,211 @@ mod tests {
         finish(client, done_rx, thread, path);
         drop(api_tx);
         responder.join().unwrap();
+    }
+
+    #[test]
+    fn framed_stream_history_pages_walk_backward_gap_free() {
+        let mut history = String::new();
+        for line in 0..1500 {
+            history.push_str(&format!("history line {line:04}\r\n"));
+        }
+        history.push_str("newest history line");
+
+        let tap = Arc::new(PaneOutputTap::default());
+        let (request_tx, _request_rx) = mpsc::channel();
+        let (api_tx, responder) = spawn_pane_stream_responder_with_history(
+            Arc::downgrade(&tap),
+            request_tx,
+            history.clone(),
+        );
+
+        let (mut client, server, path) = local_stream_pair("history-pages");
+        let (done_rx, thread) = spawn_connection_with(server, api_tx.clone(), EventHub::default());
+
+        hello(&mut client, "h13", &["pane-stream"]);
+        send_control(
+            &mut client,
+            serde_json::json!({"id": "s1", "method": "stream.open", "params": {"pane_id": "pane_1"}}),
+        );
+        let opened = read_control(&mut client);
+        let stream_id = opened["result"]["stream"]["stream_id"].as_u64().unwrap();
+        let mut cursor = opened["result"]["stream"]["history_cursor"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        // Page backward with a small budget; the pages must reassemble the
+        // capture exactly: gap-free, duplicate-free, newline-aligned.
+        let mut pages: Vec<String> = Vec::new();
+        loop {
+            send_control(
+                &mut client,
+                crate::protocol::framed::stream_history_request("hp", &cursor, 1),
+            );
+            let page = crate::protocol::framed::parse_stream_history(&read_control(&mut client))
+                .expect("history page");
+            assert_eq!(u64::from(page.stream_id), stream_id);
+            assert!(!page.content.is_empty(), "pages must make progress");
+            assert!(
+                !page.content.contains("\x1b[?"),
+                "history pages must never re-assert modes"
+            );
+            pages.push(page.content);
+            match page.next_cursor {
+                Some(next) => {
+                    assert!(!page.at_top);
+                    cursor = next;
+                }
+                None => {
+                    assert!(page.at_top);
+                    break;
+                }
+            }
+        }
+        assert!(pages.len() > 2, "budget must split the capture");
+        let rejoined: String = pages.iter().rev().map(String::as_str).collect();
+        assert_eq!(rejoined, history);
+        // Newline alignment: every page after the first arrived ends exactly
+        // where the previous started, which is right after a newline.
+        for page in &pages[1..] {
+            assert!(
+                page.ends_with('\n'),
+                "page boundary must be newline-aligned"
+            );
+        }
+
+        // A jump-to-top sized fetch from the original cursor returns the
+        // whole capture in one page.
+        let full_cursor = opened["result"]["stream"]["history_cursor"]
+            .as_str()
+            .unwrap();
+        send_control(
+            &mut client,
+            crate::protocol::framed::stream_history_request(
+                "jt",
+                full_cursor,
+                HISTORY_FETCH_MAX_BYTES,
+            ),
+        );
+        let full = crate::protocol::framed::parse_stream_history(&read_control(&mut client))
+            .expect("jump-to-top page");
+        assert!(full.at_top);
+        assert!(full.next_cursor.is_none());
+        assert_eq!(full.content, history);
+
+        finish(client, done_rx, thread, path);
+        drop(api_tx);
+        responder.join().unwrap();
+    }
+
+    #[test]
+    fn framed_stream_history_rejects_bad_cursors_and_empty_history_is_at_top() {
+        let tap = Arc::new(PaneOutputTap::default());
+        let (request_tx, _request_rx) = mpsc::channel();
+        let (api_tx, responder) = spawn_pane_stream_responder_with_history(
+            Arc::downgrade(&tap),
+            request_tx,
+            String::new(),
+        );
+
+        let (mut client, server, path) = local_stream_pair("history-errors");
+        let (done_rx, thread) = spawn_connection_with(server, api_tx.clone(), EventHub::default());
+
+        hello(&mut client, "h14", &["pane-stream"]);
+        send_control(
+            &mut client,
+            serde_json::json!({"id": "s1", "method": "stream.open", "params": {"pane_id": "pane_1"}}),
+        );
+        let opened = read_control(&mut client);
+        let stream_id = opened["result"]["stream"]["stream_id"].as_u64().unwrap() as u32;
+        let cursor = opened["result"]["stream"]["history_cursor"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        // Empty history: the very first page is already the top.
+        send_control(
+            &mut client,
+            crate::protocol::framed::stream_history_request("e1", &cursor, 4096),
+        );
+        let page = crate::protocol::framed::parse_stream_history(&read_control(&mut client))
+            .expect("empty history page");
+        assert!(page.at_top);
+        assert!(page.content.is_empty());
+        assert!(page.next_cursor.is_none());
+
+        // Undecodable cursor.
+        send_control(
+            &mut client,
+            crate::protocol::framed::stream_history_request("e2", "not-a-cursor", 4096),
+        );
+        assert_eq!(read_control(&mut client)["error"]["code"], "invalid_cursor");
+
+        // Cursor for a stream this session does not hold.
+        let stray = crate::protocol::framed::encode_history_cursor(&HistoryCursor {
+            pane_id: "pane_1".into(),
+            sequence: 0,
+            stream_id: stream_id.wrapping_add(7),
+            offset: 0,
+        });
+        send_control(
+            &mut client,
+            crate::protocol::framed::stream_history_request("e3", &stray, 4096),
+        );
+        assert_eq!(read_control(&mut client)["error"]["code"], "unknown_stream");
+
+        // Cursor whose capture identity does not match (stale sequence or
+        // out-of-range offset).
+        let stale = crate::protocol::framed::encode_history_cursor(&HistoryCursor {
+            pane_id: "pane_1".into(),
+            sequence: 99,
+            stream_id,
+            offset: 0,
+        });
+        send_control(
+            &mut client,
+            crate::protocol::framed::stream_history_request("e4", &stale, 4096),
+        );
+        assert_eq!(read_control(&mut client)["error"]["code"], "invalid_cursor");
+        let overshoot = crate::protocol::framed::encode_history_cursor(&HistoryCursor {
+            pane_id: "pane_1".into(),
+            sequence: 0,
+            stream_id,
+            offset: 10_000,
+        });
+        send_control(
+            &mut client,
+            crate::protocol::framed::stream_history_request("e5", &overshoot, 4096),
+        );
+        assert_eq!(read_control(&mut client)["error"]["code"], "invalid_cursor");
+
+        // The session survives all rejections.
+        send_control(
+            &mut client,
+            serde_json::json!({"id": "p1", "method": "ping", "params": {}}),
+        );
+        assert_eq!(read_control(&mut client)["result"]["type"], "pong");
+
+        finish(client, done_rx, thread, path);
+        drop(api_tx);
+        responder.join().unwrap();
+    }
+
+    #[test]
+    fn framed_stream_history_requires_pane_stream_capability() {
+        let (mut client, server, path) = local_stream_pair("history-gated");
+        let (done_rx, thread) = spawn_connection(server);
+
+        hello(&mut client, "h15", &[]);
+        send_control(
+            &mut client,
+            crate::protocol::framed::stream_history_request("g1", "whatever", 4096),
+        );
+        let rejection = read_control(&mut client);
+        assert_eq!(rejection["error"]["code"], "capability_not_negotiated");
+        assert_eq!(rejection["error"]["data"]["capability"], "pane-stream");
+
+        finish(client, done_rx, thread, path);
     }
 
     #[test]

@@ -345,10 +345,18 @@ pub struct PaneStreamOpenInfo {
     /// Pane output byte sequence captured with the snapshot. The stream's
     /// DATA tail begins at the byte after this sequence.
     pub sequence: u64,
-    /// ANSI snapshot of the visible screen at the subscription point.
+    /// ANSI snapshot of the active screen area at the subscription point.
+    /// Carries mode/cursor/style state so a replica seeded from it tracks
+    /// the live tail faithfully.
     pub snapshot: String,
-    /// Opaque cursor identifying the snapshot point in pane history.
+    /// Opaque cursor identifying the snapshot point in pane history. Feed it
+    /// to `stream.history` to page scrollback backward; content-only pages
+    /// never re-assert modes.
     pub history_cursor: String,
+    /// Terminal width at the subscription point.
+    pub cols: u16,
+    /// Terminal height at the subscription point.
+    pub rows: u16,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]

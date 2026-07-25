@@ -228,6 +228,23 @@ The release workflows must publish these four assets:
 
 `nix/package.nix` imports `Cargo.lock` directly with `cargoLock.lockFile`, so release version bumps do not require a separate Nix cargo hash update. If Cargo git dependencies are added later, add the required `cargoLock.outputHashes` entries as part of that dependency change.
 
+## Agent skills
+
+### Issue tracker
+
+Issues and specs live as local markdown under `.local/issues/<feature>/`; agents
+must not open GitHub issues in this repo. See `.agents/issue-tracker.md`.
+
+### Triage labels
+
+The five canonical triage roles, each label string equal to its name, recorded
+as a `Status:` line in the issue file. See `.agents/triage-labels.md`.
+
+### Domain docs
+
+Single-context: `CONTEXT.md` and `docs/adr/` at the repo root, both created
+lazily. See `.agents/domain.md`.
+
 ## External contributor guardrail
 
 Before opening an issue, opening a PR, or pushing branches to this repository, detect the acting GitHub account when possible. Check `gh auth status`, the configured git remote, or the available environment context. If the acting account is not `ogulcancelik`, treat the human as an *external contributor* unless this is clearly a private or custom fork.

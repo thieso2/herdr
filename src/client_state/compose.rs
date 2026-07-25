@@ -980,6 +980,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fleet_view_renders_strip_gutter_and_remote_tokens() {
+        let (mirrors, descriptors) = fleet_fixture();
+        let chrome = GlobalChrome::new();
+        let mut ids = ComposeIds::new();
+        let mut app = AppState::test_new();
+        compose_fleet_into(&mirrors, &descriptors, &chrome, &mut ids, &mut app);
+
+        crate::ui::compute_view(&mut app, Rect::new(0, 0, 106, 30));
+        assert!(
+            app.view.remote_chip_strip_rect.height > 0,
+            "the strip reserves rows atop the sidebar"
+        );
+        assert_eq!(app.view.remote_chip_hit_areas.len(), 3);
+
+        let mut terminal = Terminal::new(TestBackend::new(106, 30)).expect("test backend");
+        terminal
+            .draw(|frame| crate::ui::render(&app, frame))
+            .expect("render");
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(rendered.contains("remotes"), "strip header renders");
+        assert!(rendered.contains("buildbox"), "chip names render");
+        assert!(rendered.contains("gpu-01"), "chip names render");
+        assert!(rendered.contains("▎"), "per-remote hue gutter renders");
+        assert!(
+            rendered.contains("· local"),
+            "dim remote token rides the space rows: {rendered:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn creation_targets_the_remote_owning_the_focused_context() {
         let (mirrors, descriptors) = fleet_fixture();
         let mut chrome = GlobalChrome::new();
@@ -1006,6 +1042,7 @@ mod tests {
             &mirrors,
             &ids,
             &app,
+            0,
         )
         .expect("new tab intent");
         assert_eq!(remote, 1);
@@ -1020,6 +1057,7 @@ mod tests {
             &mirrors,
             &ids,
             &app,
+            0,
         )
         .expect("new space intent");
         assert_eq!(remote, 1);

@@ -39,7 +39,12 @@ pub(super) fn dispatch_prefix_intent(
         return;
     }
 
-    let Some((remote, method)) = prefix_intent_method(key, mirrors, ids, app) else {
+    // With nothing focused (for example a solo'd remote with no spaces
+    // yet), creation still goes to the focused remote, never silently to
+    // local.
+    let fallback_remote = chrome.selection.focused_remote;
+    let Some((remote, method)) = prefix_intent_method(key, mirrors, ids, app, fallback_remote)
+    else {
         return;
     };
     // Acting on a remote's content moves the client focus to that remote
@@ -58,9 +63,9 @@ pub(super) fn prefix_intent_method(
     mirrors: &RemoteMirrors,
     ids: &ComposeIds,
     app: &AppState,
+    fallback_remote: usize,
 ) -> Option<(usize, Method)> {
-    let target_remote =
-        super::fleet_view::creation_target_remote(app, ids, super::LOCAL_REMOTE_INDEX);
+    let target_remote = super::fleet_view::creation_target_remote(app, ids, fallback_remote);
     let catalog = &mirrors.get(target_remote)?.catalog;
     let keybinds = &app.keybinds;
     // Control-plane calls carry the remote's own public ids, never the
@@ -254,7 +259,9 @@ pub(super) fn dispatch_mouse_intent(
         app.mode = mode_before;
         app.context_menu = None;
     }
-    let Some((remote, method)) = mouse_intent_method(action, mirrors, ids, app) else {
+    let fallback_remote = chrome.selection.focused_remote;
+    let Some((remote, method)) = mouse_intent_method(action, mirrors, ids, app, fallback_remote)
+    else {
         return;
     };
     // Clicking into a remote's content moves the client focus there.
@@ -270,11 +277,11 @@ pub(super) fn mouse_intent_method(
     mirrors: &RemoteMirrors,
     ids: &ComposeIds,
     app: &AppState,
+    fallback_remote: usize,
 ) -> Option<(usize, Method)> {
     match action? {
         crate::app::MouseAction::NewWorkspace => {
-            let remote =
-                super::fleet_view::creation_target_remote(app, ids, super::LOCAL_REMOTE_INDEX);
+            let remote = super::fleet_view::creation_target_remote(app, ids, fallback_remote);
             Some((
                 remote,
                 Method::WorkspaceCreate(WorkspaceCreateParams {
@@ -356,8 +363,9 @@ mod tests {
 
         // Default binds: c = new tab, % / " = splits, x = close pane,
         // arrows = pane focus (all through the configured keybinds).
-        let (remote, method) = prefix_intent_method(key(KeyCode::Char('c')), &mirrors, &ids, &app)
-            .expect("new tab intent");
+        let (remote, method) =
+            prefix_intent_method(key(KeyCode::Char('c')), &mirrors, &ids, &app, 0)
+                .expect("new tab intent");
         assert_eq!(remote, 0, "adversarial fixture is local-only");
         let Method::TabCreate(params) = method else {
             panic!("expected tab.create, got {method:?}");
@@ -365,8 +373,9 @@ mod tests {
         assert_eq!(params.workspace_id.as_deref(), Some("ws_2"));
         assert!(params.focus);
 
-        let (remote, method) = prefix_intent_method(key(KeyCode::Char('v')), &mirrors, &ids, &app)
-            .expect("split intent");
+        let (remote, method) =
+            prefix_intent_method(key(KeyCode::Char('v')), &mirrors, &ids, &app, 0)
+                .expect("split intent");
         assert_eq!(remote, 0, "adversarial fixture is local-only");
         let Method::PaneSplit(params) = method else {
             panic!("expected pane.split, got {method:?}");
@@ -374,16 +383,18 @@ mod tests {
         assert_eq!(params.direction, SplitDirection::Right);
         assert_eq!(params.target_pane_id.as_deref(), Some("p_2_1"));
 
-        let (remote, method) = prefix_intent_method(key(KeyCode::Char('x')), &mirrors, &ids, &app)
-            .expect("close pane intent");
+        let (remote, method) =
+            prefix_intent_method(key(KeyCode::Char('x')), &mirrors, &ids, &app, 0)
+                .expect("close pane intent");
         assert_eq!(remote, 0, "adversarial fixture is local-only");
         let Method::PaneClose(target) = method else {
             panic!("expected pane.close, got {method:?}");
         };
         assert_eq!(target.pane_id, "p_2_1");
 
-        let (remote, method) = prefix_intent_method(key(KeyCode::Char('l')), &mirrors, &ids, &app)
-            .expect("focus direction intent");
+        let (remote, method) =
+            prefix_intent_method(key(KeyCode::Char('l')), &mirrors, &ids, &app, 0)
+                .expect("focus direction intent");
         assert_eq!(remote, 0, "adversarial fixture is local-only");
         let Method::PaneFocusDirection(params) = method else {
             panic!("expected pane.focus_direction, got {method:?}");
@@ -396,8 +407,9 @@ mod tests {
         let (mirrors, ids, mut app) = composed();
         // next_workspace is unbound by default; bind it like a user would.
         app.keybinds.next_workspace = crate::config::ActionKeybinds::prefix("n");
-        let (remote, method) = prefix_intent_method(key(KeyCode::Char('n')), &mirrors, &ids, &app)
-            .expect("next workspace intent");
+        let (remote, method) =
+            prefix_intent_method(key(KeyCode::Char('n')), &mirrors, &ids, &app, 0)
+                .expect("next workspace intent");
         assert_eq!(remote, 0, "adversarial fixture is local-only");
         let Method::WorkspaceFocus(target) = method else {
             panic!("expected workspace.focus, got {method:?}");
@@ -409,7 +421,7 @@ mod tests {
     #[test]
     fn unbound_prefix_keys_map_to_nothing() {
         let (mirrors, ids, app) = composed();
-        assert!(prefix_intent_method(key(KeyCode::Char('~')), &mirrors, &ids, &app).is_none());
+        assert!(prefix_intent_method(key(KeyCode::Char('~')), &mirrors, &ids, &app, 0).is_none());
     }
 
     #[test]
@@ -437,6 +449,7 @@ mod tests {
             &mirrors,
             &ids,
             &app,
+            0,
         )
         .expect("tab focus intent");
         assert_eq!(remote, 0, "adversarial fixture is local-only");
@@ -487,6 +500,7 @@ mod tests {
             &mirrors,
             &ids,
             &app,
+            0,
         )
         .expect("workspace focus intent");
         assert_eq!(remote, 0, "adversarial fixture is local-only");
@@ -503,6 +517,7 @@ mod tests {
             &mirrors,
             &ids,
             &app,
+            0,
         )
         .expect("pane focus intent");
         assert_eq!(remote, 0, "adversarial fixture is local-only");

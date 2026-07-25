@@ -1091,6 +1091,15 @@ impl App {
             Method::PaneGraphicsStreamClose(params) => {
                 return self.handle_pane_graphics_stream_close(request.id, params);
             }
+            Method::PaneStreamOpen(params) => {
+                return self.handle_pane_stream_open(request.id, params);
+            }
+            Method::PaneSendBytes(params) => {
+                return self.handle_pane_send_bytes(request.id, params);
+            }
+            Method::PanePasteImage(params) => {
+                return self.handle_pane_paste_image(request.id, params);
+            }
             Method::PaneReportAgent(params) => {
                 return self.handle_pane_report_agent(request.id, params);
             }

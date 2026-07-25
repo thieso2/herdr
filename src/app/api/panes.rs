@@ -6,12 +6,13 @@ use crate::api::schema::{
     PaneFocusDirectionReason, PaneFocusDirectionResult, PaneInfo, PaneLayoutPane, PaneLayoutParams,
     PaneLayoutRect, PaneLayoutSnapshot, PaneLayoutSplit, PaneListParams, PaneMoveDestination,
     PaneMoveParams, PaneMoveReason, PaneMoveResult, PaneNeighborParams, PaneNeighborResult,
-    PaneProcessInfo, PaneProcessInfoParams, PaneProcessInfoProcess, PaneReadParams, PaneReadResult,
-    PaneReleaseAgentParams, PaneRenameParams, PaneReportAgentParams, PaneReportAgentSessionParams,
-    PaneReportMetadataParams, PaneResizeParams, PaneResizeReason, PaneResizeResult,
-    PaneSendInputParams, PaneSendKeysParams, PaneSendTextParams, PaneSplitParams, PaneSwapParams,
-    PaneSwapReason, PaneSwapResult, PaneTarget, PaneZoomMode, PaneZoomParams, PaneZoomReason,
-    PaneZoomResult, ResponseResult,
+    PanePasteImageParams, PaneProcessInfo, PaneProcessInfoParams, PaneProcessInfoProcess,
+    PaneReadParams, PaneReadResult, PaneReleaseAgentParams, PaneRenameParams,
+    PaneReportAgentParams, PaneReportAgentSessionParams, PaneReportMetadataParams,
+    PaneResizeParams, PaneResizeReason, PaneResizeResult, PaneSendBytesParams, PaneSendInputParams,
+    PaneSendKeysParams, PaneSendTextParams, PaneSplitParams, PaneStreamOpenInfo,
+    PaneStreamOpenParams, PaneSwapParams, PaneSwapReason, PaneSwapResult, PaneTarget, PaneZoomMode,
+    PaneZoomParams, PaneZoomReason, PaneZoomResult, ResponseResult,
 };
 use crate::app::actions::{PaneZoomCommand, PaneZoomNoopReason};
 use crate::app::App;
@@ -1517,6 +1518,133 @@ impl App {
         encode_success(id, ResponseResult::Ok {})
     }
 
+    pub(super) fn handle_pane_stream_open(
+        &mut self,
+        id: String,
+        params: PaneStreamOpenParams,
+    ) -> String {
+        let Some((ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
+            return pane_not_found(id, &params.pane_id);
+        };
+        let Some(public_pane_id) = self.public_pane_id(ws_idx, pane_id) else {
+            return pane_not_found(id, &params.pane_id);
+        };
+        let Some((runtime, workspace_id)) = self.lookup_runtime(ws_idx, pane_id) else {
+            return pane_not_found(id, &params.pane_id);
+        };
+        let (subscription, snapshot) = runtime.subscribe_output_with_snapshot();
+        let sequence = subscription.sequence();
+        if !crate::pane::output_tap::fulfill_pending_stream(params.stream_id, subscription) {
+            return encode_error(
+                id,
+                "stream_cancelled",
+                "pane stream request was cancelled before the subscription attached",
+            );
+        }
+        let history_cursor =
+            crate::protocol::framed::encode_history_cursor(&public_pane_id, sequence);
+
+        encode_success(
+            id,
+            ResponseResult::PaneStreamOpened {
+                stream: PaneStreamOpenInfo {
+                    pane_id: public_pane_id,
+                    workspace_id,
+                    stream_id: params.stream_id,
+                    sequence,
+                    snapshot,
+                    history_cursor,
+                },
+            },
+        )
+    }
+
+    pub(super) fn handle_pane_send_bytes(
+        &mut self,
+        id: String,
+        params: PaneSendBytesParams,
+    ) -> String {
+        use base64::Engine as _;
+
+        let Some((ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
+            return pane_not_found(id, &params.pane_id);
+        };
+        let Some(runtime) = self.lookup_runtime_sender(ws_idx, pane_id) else {
+            return pane_not_found(id, &params.pane_id);
+        };
+        let bytes = match base64::engine::general_purpose::STANDARD.decode(&params.data_base64) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                return encode_error(id, "invalid_params", format!("invalid base64 data: {err}"));
+            }
+        };
+        if let Err(err) = runtime.try_send_bytes(Bytes::from(bytes)) {
+            return encode_error(id, "pane_send_failed", err.to_string());
+        }
+
+        encode_success(id, ResponseResult::Ok {})
+    }
+
+    pub(super) fn handle_pane_paste_image(
+        &mut self,
+        id: String,
+        params: PanePasteImageParams,
+    ) -> String {
+        use base64::Engine as _;
+
+        let Some((ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
+            return pane_not_found(id, &params.pane_id);
+        };
+        let Some(runtime) = self.lookup_runtime_sender(ws_idx, pane_id) else {
+            return pane_not_found(id, &params.pane_id);
+        };
+        let data = match base64::engine::general_purpose::STANDARD.decode(&params.data_base64) {
+            Ok(data) => data,
+            Err(err) => {
+                return encode_error(id, "invalid_params", format!("invalid base64 data: {err}"));
+            }
+        };
+        if data.is_empty() {
+            return encode_error(id, "invalid_params", "image data is empty");
+        }
+        if data.len() > crate::protocol::MAX_CLIPBOARD_IMAGE_PAYLOAD {
+            return encode_error(
+                id,
+                "image_too_large",
+                format!(
+                    "image is {} bytes; the limit is {} bytes",
+                    data.len(),
+                    crate::protocol::MAX_CLIPBOARD_IMAGE_PAYLOAD
+                ),
+            );
+        }
+        // The staging namespace expects a client id; API-pasted images are not
+        // tied to a legacy client connection, so a fixed namespace is used and
+        // stale files are cleaned up by the staging dir's age-based sweep.
+        const API_PASTE_CLIENT_ID: u64 = 0;
+        let staged = match crate::server::clipboard_image::stage(
+            API_PASTE_CLIENT_ID,
+            &params.extension,
+            &data,
+        ) {
+            Ok(staged) => staged,
+            Err(err) => {
+                return encode_error(
+                    id,
+                    "paste_image_failed",
+                    format!("failed to stage image: {err}"),
+                );
+            }
+        };
+        let payload =
+            crate::server::terminal_attach::paste_payload_for_runtime(runtime, &staged.paste_text);
+        if let Err(err) = runtime.try_send_bytes(Bytes::from(payload)) {
+            return encode_error(id, "pane_send_failed", err.to_string());
+        }
+
+        encode_success(id, ResponseResult::Ok {})
+    }
+
     pub(super) fn handle_pane_close(&mut self, id: String, target: PaneTarget) -> String {
         match self.close_pane(id.clone(), &target) {
             Ok(()) => encode_success(id, ResponseResult::Ok {}),
@@ -1999,6 +2127,144 @@ mod tests {
         assert_eq!(scroll.offset_from_bottom, 3);
         assert!(scroll.max_offset_from_bottom >= scroll.offset_from_bottom);
         assert_eq!(scroll.viewport_rows, 5);
+    }
+
+    #[tokio::test]
+    async fn api_pane_stream_open_returns_consistent_snapshot_and_tail() {
+        let (mut app, public_pane_id, pane_id) = app_with_scrollback_runtime();
+        const STREAM_ID: u32 = 4_000_000_001;
+        crate::pane::output_tap::register_pending_stream(STREAM_ID);
+
+        let response = app.handle_pane_stream_open(
+            "req".into(),
+            PaneStreamOpenParams {
+                pane_id: public_pane_id.clone(),
+                stream_id: STREAM_ID,
+            },
+        );
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        let ResponseResult::PaneStreamOpened { stream } = success.result else {
+            panic!("expected pane stream opened response");
+        };
+        assert_eq!(stream.pane_id, public_pane_id);
+        assert_eq!(stream.stream_id, STREAM_ID);
+        // The scrollback fixture seeds the terminal directly, not through the
+        // PTY tap, so the tap sequence starts at zero.
+        assert_eq!(stream.sequence, 0);
+        assert!(stream.snapshot.contains("line 19"));
+        assert_eq!(
+            crate::protocol::framed::decode_history_cursor(&stream.history_cursor),
+            Some((public_pane_id, stream.sequence))
+        );
+
+        // The handler deposited the live subscription for the session thread.
+        let subscription =
+            crate::pane::output_tap::claim_pending_stream(STREAM_ID).expect("subscription");
+        let runtime = app
+            .state
+            .runtime_for_pane_in_workspace(&app.terminal_runtimes, 0, pane_id)
+            .expect("runtime");
+        runtime.test_process_pty_bytes(b"tail bytes");
+        assert_eq!(subscription.drain().bytes, b"tail bytes");
+    }
+
+    #[tokio::test]
+    async fn api_pane_stream_open_rejects_cancelled_slot_and_unknown_pane() {
+        let (mut app, public_pane_id, _pane_id) = app_with_scrollback_runtime();
+
+        // Unregistered (cancelled) slot: the subscription cannot attach.
+        let response = app.handle_pane_stream_open(
+            "req".into(),
+            PaneStreamOpenParams {
+                pane_id: public_pane_id,
+                stream_id: 4_000_000_002,
+            },
+        );
+        let error: ErrorResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(error.error.code, "stream_cancelled");
+
+        let response = app.handle_pane_stream_open(
+            "req".into(),
+            PaneStreamOpenParams {
+                pane_id: "p_99".into(),
+                stream_id: 4_000_000_003,
+            },
+        );
+        let error: ErrorResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(error.error.code, "pane_not_found");
+    }
+
+    #[tokio::test]
+    async fn api_pane_send_bytes_decodes_base64_into_raw_pty_input() {
+        use base64::Engine as _;
+
+        let (mut app, public_pane_id, mut rx) = app_with_send_key_runtime(3);
+
+        let response = app.handle_pane_send_bytes(
+            "req".into(),
+            PaneSendBytesParams {
+                pane_id: public_pane_id.clone(),
+                data_base64: base64::engine::general_purpose::STANDARD.encode(b"\x1b[Araw"),
+            },
+        );
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(success.result, ResponseResult::Ok {});
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            bytes::Bytes::from_static(b"\x1b[Araw")
+        );
+
+        let response = app.handle_pane_send_bytes(
+            "req".into(),
+            PaneSendBytesParams {
+                pane_id: public_pane_id,
+                data_base64: "not base64!!".into(),
+            },
+        );
+        let error: ErrorResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(error.error.code, "invalid_params");
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn api_pane_paste_image_stages_file_and_pastes_its_path() {
+        use base64::Engine as _;
+
+        let (mut app, public_pane_id, mut rx) = app_with_send_key_runtime(3);
+
+        let response = app.handle_pane_paste_image(
+            "req".into(),
+            PanePasteImageParams {
+                pane_id: public_pane_id.clone(),
+                extension: "png".into(),
+                data_base64: base64::engine::general_purpose::STANDARD.encode([1_u8, 2, 3]),
+            },
+        );
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(success.result, ResponseResult::Ok {});
+
+        let pasted = rx.try_recv().unwrap();
+        let path = String::from_utf8(pasted.to_vec()).unwrap();
+        assert!(
+            path.ends_with(".png"),
+            "pasted text is the staged path: {path}"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), vec![1_u8, 2, 3]);
+        let _ = std::fs::remove_file(&path);
+
+        // Oversized images are rejected before staging.
+        let oversized = vec![0_u8; crate::protocol::MAX_CLIPBOARD_IMAGE_PAYLOAD + 1];
+        let response = app.handle_pane_paste_image(
+            "req".into(),
+            PanePasteImageParams {
+                pane_id: public_pane_id,
+                extension: "png".into(),
+                data_base64: base64::engine::general_purpose::STANDARD.encode(&oversized),
+            },
+        );
+        let error: ErrorResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(error.error.code, "image_too_large");
+        assert!(rx.try_recv().is_err());
     }
 
     #[tokio::test]

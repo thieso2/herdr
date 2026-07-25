@@ -97,6 +97,14 @@ fn wait_for_live_handoff_response_write(
     }
 }
 
+fn notification_event_kind(kind: &protocol::NotifyKind) -> api::schema::NotificationEventKind {
+    match kind {
+        protocol::NotifyKind::Sound => api::schema::NotificationEventKind::Sound,
+        protocol::NotifyKind::Toast => api::schema::NotificationEventKind::Toast,
+        protocol::NotifyKind::SystemToast => api::schema::NotificationEventKind::SystemToast,
+    }
+}
+
 fn sound_notify_message(sound: crate::sound::Sound) -> &'static str {
     match sound {
         crate::sound::Sound::Done => "agent done",
@@ -1855,9 +1863,21 @@ impl HeadlessServer {
         message: impl Into<String>,
         body: Option<String>,
     ) -> bool {
+        let message = message.into();
+        // Promote the notification to the shared event hub so framed clients
+        // with the `notification` capability receive it even when no legacy
+        // foreground client is attached.
+        self.app.event_hub.push(api::schema::EventEnvelope {
+            event: api::schema::EventKind::NotificationPosted,
+            data: api::schema::EventData::NotificationPosted {
+                kind: notification_event_kind(&kind),
+                message: message.clone(),
+                body: body.clone(),
+            },
+        });
         self.send_to_foreground_client(ServerMessage::Notify {
             kind,
-            message: message.into(),
+            message,
             body,
         })
     }
@@ -1970,6 +1990,14 @@ impl HeadlessServer {
             None => None,
         };
         let set_title = title.is_some();
+        // Promote the title change to the shared event hub for framed clients
+        // with the `window-title` capability.
+        self.app.event_hub.push(api::schema::EventEnvelope {
+            event: api::schema::EventKind::WindowTitleChanged,
+            data: api::schema::EventData::WindowTitleChanged {
+                title: title.clone(),
+            },
+        });
         let changed = self.send_to_foreground_client(ServerMessage::WindowTitle { title });
         let reason = match (changed, set_title) {
             (true, true) => ClientWindowTitleReason::Set,
@@ -4706,6 +4734,52 @@ mod tests {
             Some(expected_version.as_str())
         );
         assert!(server.app.event_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn notify_and_window_title_promote_to_event_hub() {
+        let event_hub = api::EventHub::default();
+        let mut server = test_headless_server_with_event_hub(event_hub.clone());
+
+        // No foreground client is attached; the events must still promote.
+        assert!(!server.send_notify_to_foreground_client(
+            protocol::NotifyKind::Toast,
+            "pi finished",
+            Some("workspace 1".to_string()),
+        ));
+        let response =
+            server.handle_client_window_title_api("title_req".into(), Some("herdr — work".into()));
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(response["result"]["type"], "client_window_title");
+
+        let events = event_hub.events_after(0);
+        assert_eq!(events.len(), 2);
+        assert_eq!(
+            events[0].1.event,
+            api::schema::EventKind::NotificationPosted
+        );
+        match &events[0].1.data {
+            api::schema::EventData::NotificationPosted {
+                kind,
+                message,
+                body,
+            } => {
+                assert_eq!(*kind, api::schema::NotificationEventKind::Toast);
+                assert_eq!(message, "pi finished");
+                assert_eq!(body.as_deref(), Some("workspace 1"));
+            }
+            other => panic!("unexpected event data: {other:?}"),
+        }
+        assert_eq!(
+            events[1].1.event,
+            api::schema::EventKind::WindowTitleChanged
+        );
+        match &events[1].1.data {
+            api::schema::EventData::WindowTitleChanged { title } => {
+                assert_eq!(title.as_deref(), Some("herdr — work"));
+            }
+            other => panic!("unexpected event data: {other:?}"),
+        }
     }
 
     #[tokio::test]

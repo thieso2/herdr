@@ -19,6 +19,7 @@ use crate::input::TerminalKey;
 
 use super::chrome::GlobalChrome;
 use super::compose::ComposeIds;
+use super::fleet_view::RemoteDescriptor;
 use super::run::Links;
 use super::RemoteMirrors;
 
@@ -30,6 +31,7 @@ pub(super) fn dispatch_prefix_intent(
     links: &mut Links,
     mirrors: &mut RemoteMirrors,
     ids: &mut ComposeIds,
+    descriptors: &[RemoteDescriptor],
     app: &mut AppState,
     chrome: &mut GlobalChrome,
 ) {
@@ -40,9 +42,9 @@ pub(super) fn dispatch_prefix_intent(
     }
 
     // With nothing focused (for example a solo'd remote with no spaces
-    // yet), creation still goes to the focused remote, never silently to
-    // local.
-    let fallback_remote = chrome.selection.focused_remote;
+    // yet), creation still goes to the *effective* focused remote, never
+    // silently to local — and never to a remote filtered out of view.
+    let fallback_remote = chrome.selection.effective_focused_remote(descriptors);
     let Some((remote, method)) = prefix_intent_method(key, mirrors, ids, app, fallback_remote)
     else {
         return;
@@ -239,6 +241,7 @@ pub(super) fn dispatch_mouse_intent(
     links: &mut Links,
     mirrors: &mut RemoteMirrors,
     ids: &mut ComposeIds,
+    descriptors: &[RemoteDescriptor],
     app: &mut AppState,
     chrome: &mut GlobalChrome,
 ) {
@@ -259,7 +262,7 @@ pub(super) fn dispatch_mouse_intent(
         app.mode = mode_before;
         app.context_menu = None;
     }
-    let fallback_remote = chrome.selection.focused_remote;
+    let fallback_remote = chrome.selection.effective_focused_remote(descriptors);
     let Some((remote, method)) = mouse_intent_method(action, mirrors, ids, app, fallback_remote)
     else {
         return;
@@ -479,6 +482,7 @@ mod tests {
             &mut links,
             &mut mirrors,
             &mut ids,
+            &[RemoteDescriptor::local()],
             &mut app,
             &mut chrome,
         );
@@ -489,6 +493,47 @@ mod tests {
             "unsupported modal modes must not survive the dispatch"
         );
         assert!(app.context_menu.is_none(), "no dead context menu remains");
+    }
+
+    #[test]
+    fn creation_fallback_never_targets_a_remote_filtered_out_of_view() {
+        // Nothing focused: creation falls back to the effective focused
+        // remote, which must be in view.
+        let mut mirrors = RemoteMirrors::with_local();
+        mirrors.insert(super::super::RemoteMirror::new(1, "buildbox"));
+        let mut ids = ComposeIds::new();
+        let mut app = AppState::test_new();
+        app.keybinds = crate::config::Config::default().keybinds();
+        let descriptors =
+            super::super::fleet_view::remote_descriptors(&[crate::fleet::config::RemoteEntry {
+                name: "buildbox".into(),
+                target: "can@buildbox.example".into(),
+                session: "default".into(),
+                enabled: true,
+            }]);
+        let mut links = Links::new();
+        let mut chrome = GlobalChrome::new();
+        // The user focused buildbox, then toggled its chip out of view.
+        chrome.selection.focused_remote = 1;
+        chrome
+            .selection
+            .toggle(1, &descriptors)
+            .expect("filter buildbox out");
+        assert!(app.active.is_none(), "nothing focused in the empty view");
+
+        dispatch_prefix_intent(
+            key(KeyCode::Char('c')),
+            &mut links,
+            &mut mirrors,
+            &mut ids,
+            &descriptors,
+            &mut app,
+            &mut chrome,
+        );
+        assert_eq!(
+            chrome.selection.focused_remote, 0,
+            "creation targets the effective (in-view) remote, not the hidden one"
+        );
     }
 
     #[test]

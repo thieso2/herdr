@@ -67,6 +67,10 @@ pub(crate) fn split_sidebar_for_chip_strip(
     }
 
     let mut hit_areas = Vec::with_capacity(chips.len());
+    // Rows that actually hold a chip: a wrap that overflows `max_rows`
+    // bumps `row` before the fit check rejects the chip, and that empty
+    // row must not be reserved in the strip.
+    let mut placed_rows: u16 = 0;
     let mut row: u16 = 0;
     let mut x: u16 = 1;
     for chip in chips {
@@ -85,10 +89,11 @@ pub(crate) fn split_sidebar_for_chip_strip(
             width,
             1,
         ));
+        placed_rows = row + 1;
         x = x + width + 1;
     }
 
-    let chip_rows = row + 1;
+    let chip_rows = placed_rows.max(1);
     let strip_h = chip_rows + STRIP_CHROME_ROWS;
     let strip_rect = Rect::new(sidebar_area.x, sidebar_area.y, sidebar_area.width, strip_h);
     let add_w = display_width_u16(ADD_LABEL);
@@ -413,6 +418,25 @@ mod tests {
         let (layout, rest) = split_sidebar_for_chip_strip(&[chip("a"), chip("b")], area, false);
         assert_eq!(layout.strip_rect, Rect::default());
         assert_eq!(rest, area);
+    }
+
+    #[test]
+    fn overflowing_chips_do_not_reserve_a_phantom_blank_row() {
+        // Height 9 leaves exactly one chip row: every chip lands on row 0
+        // or is dropped, and the strip must not reserve a blank second row.
+        let area = Rect::new(0, 0, 26, 9);
+        let chips = vec![chip("local"), chip("buildbox"), chip("gpu-01")];
+        let (layout, rest) = split_sidebar_for_chip_strip(&chips, area, false);
+        assert!(layout.chip_hit_areas[0].width > 0);
+        assert!(layout.chip_hit_areas[1].width > 0);
+        assert_eq!(
+            layout.chip_hit_areas[2],
+            Rect::default(),
+            "gpu-01 does not fit the single row"
+        );
+        // header + one chip row + gap: no phantom blank chip row.
+        assert_eq!(layout.strip_rect.height, 3);
+        assert_eq!(rest.height, 6, "sections keep their guaranteed rows");
     }
 
     #[test]

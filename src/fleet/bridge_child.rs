@@ -58,8 +58,29 @@ pub fn remote_bridge_command(session: &str) -> String {
 /// A live SSH bridge child. Dropping it kills and reaps the child, which
 /// closes both pipe halves.
 pub struct BridgeChild {
-    child: Child,
+    child: Arc<Mutex<Child>>,
     stderr_tail: Arc<Mutex<String>>,
+}
+
+/// Detached kill handle for deadline watchdogs: kills the bridge child
+/// without owning the guard, unblocking any thread reading its stdout.
+// Consumed only by the unix-only pure-client run path (#20/#23).
+#[cfg_attr(windows, allow(dead_code))]
+pub struct BridgeChildKiller {
+    child: Arc<Mutex<Child>>,
+}
+
+impl BridgeChildKiller {
+    /// Kills and reaps the child. Idempotent: killing an already-dead or
+    /// already-reaped child is a no-op.
+    // Consumed only by the unix-only pure-client run path (#20/#23).
+    #[cfg_attr(windows, allow(dead_code))]
+    pub fn kill(&self) {
+        if let Ok(mut child) = self.child.lock() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
 }
 
 impl BridgeChild {
@@ -100,19 +121,37 @@ impl BridgeChild {
                 warn!("failed to spawn ssh bridge stderr reader thread");
             }
         }
-        Ok((Self { child, stderr_tail }, stdout, stdin))
+        Ok((
+            Self {
+                child: Arc::new(Mutex::new(child)),
+                stderr_tail,
+            },
+            stdout,
+            stdin,
+        ))
     }
 
     /// Shared handle to the bounded stderr tail for failure diagnostics.
     pub fn stderr_tail(&self) -> Arc<Mutex<String>> {
         Arc::clone(&self.stderr_tail)
     }
+
+    /// A kill handle usable from another thread (handshake watchdogs).
+    // Consumed only by the unix-only pure-client run path (#20/#23).
+    #[cfg_attr(windows, allow(dead_code))]
+    pub fn killer(&self) -> BridgeChildKiller {
+        BridgeChildKiller {
+            child: Arc::clone(&self.child),
+        }
+    }
 }
 
 impl Drop for BridgeChild {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        if let Ok(mut child) = self.child.lock() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
     }
 }
 

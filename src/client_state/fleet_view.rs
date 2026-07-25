@@ -143,22 +143,33 @@ impl FleetSelection {
         self.focused_remote = index;
     }
 
-    /// Drops selection state for remotes no longer configured and repairs
-    /// the focused remote if it went away.
-    pub(crate) fn retain(&mut self, descriptors: &[RemoteDescriptor]) {
-        self.hidden
-            .retain(|index| descriptors.iter().any(|d| d.index == *index));
+    /// Remaps selection state across a config change. Hidden and focus
+    /// state follow remote *identity* (the config name), not the index:
+    /// removing or reordering remotes shifts later indices, and positional
+    /// retention would silently transfer filter or focus state to a
+    /// different remote.
+    pub(crate) fn remap(&mut self, old: &[RemoteDescriptor], new: &[RemoteDescriptor]) {
+        let new_index_of = |name: &str| {
+            new.iter()
+                .find(|descriptor| descriptor.name == name)
+                .map(|descriptor| descriptor.index)
+        };
+        self.hidden = self
+            .hidden
+            .iter()
+            .filter_map(|index| old.iter().find(|descriptor| descriptor.index == *index))
+            .filter_map(|descriptor| new_index_of(&descriptor.name))
+            .collect();
+        self.focused_remote = old
+            .iter()
+            .find(|descriptor| descriptor.index == self.focused_remote)
+            .and_then(|descriptor| new_index_of(&descriptor.name))
+            .unwrap_or(LOCAL_REMOTE_INDEX);
         // A config change must never leave the view empty: when everything
         // still configured is hidden (for example the soloed remote was
         // removed), the whole fleet comes back into view.
-        if self.in_view(descriptors).is_empty() {
+        if self.in_view(new).is_empty() {
             self.hidden.clear();
-        }
-        if !descriptors
-            .iter()
-            .any(|descriptor| descriptor.index == self.focused_remote)
-        {
-            self.focused_remote = self.effective_focused_remote(descriptors);
         }
     }
 }
@@ -315,17 +326,39 @@ mod tests {
     }
 
     #[test]
-    fn retain_drops_selection_state_for_removed_remotes() {
+    fn remap_drops_selection_state_for_removed_remotes() {
         let descriptors = remote_descriptors(&[entry("a", true), entry("b", true)]);
         let mut selection = FleetSelection::new();
         selection.solo(2, &descriptors);
 
         // b is removed from the config: the solo selection must repair.
         let shrunk = remote_descriptors(&[entry("a", true)]);
-        selection.retain(&shrunk);
+        selection.remap(&descriptors, &shrunk);
         assert!(descriptors.len() > shrunk.len());
         assert_eq!(selection.effective_focused_remote(&shrunk), 0);
         assert!(selection.is_in_view(0) || selection.is_in_view(1));
+    }
+
+    #[test]
+    fn remap_keys_selection_by_remote_identity_across_removals() {
+        let old = remote_descriptors(&[entry("buildbox", true), entry("gpu-01", true)]);
+        let mut selection = FleetSelection::new();
+        selection.toggle(1, &old).expect("hide buildbox");
+        selection.focused_remote = 2; // gpu-01
+
+        // buildbox is removed: gpu-01 shifts from index 2 to index 1 and
+        // must carry its own selection state, not inherit buildbox's.
+        let new = remote_descriptors(&[entry("gpu-01", true)]);
+        selection.remap(&old, &new);
+        assert!(
+            selection.is_in_view(1),
+            "gpu-01 must not inherit buildbox's hidden state"
+        );
+        assert_eq!(
+            selection.focused_remote, 1,
+            "focus follows gpu-01 to its new index"
+        );
+        assert_eq!(selection.effective_focused_remote(&new), 1);
     }
 
     #[test]

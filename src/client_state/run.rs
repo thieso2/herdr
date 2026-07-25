@@ -70,14 +70,33 @@ pub(crate) fn pure_client_enabled(config: &crate::config::Config) -> bool {
 const CHIP_DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(350);
 /// How long a chip status flash (refused toggle) stays visible.
 const STATUS_FLASH_TTL: Duration = Duration::from_millis(2500);
+/// Handshake deadline for a fleet remote's `session.hello` answer, matching
+/// the fleet manager's tuning. A watchdog kills the bridge child at the
+/// deadline so the connect thread's blocking read always returns.
+const REMOTE_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Heartbeat ping cadence on established fleet remote sessions.
+const REMOTE_PING_INTERVAL: Duration = Duration::from_secs(5);
+/// A fleet remote with no inbound frame for this long is treated as dead:
+/// a silently dropped transport must not keep a connected chip dot.
+const REMOTE_PONG_TIMEOUT: Duration = Duration::from_secs(15);
+/// Bound on encoded frames queued to one fleet remote's writer thread; a
+/// stalled remote fails its writes instead of blocking the run loop.
+const REMOTE_WRITE_QUEUE_FRAMES: usize = 1024;
+/// One visual spinner step (`spinner_frame` divides the tick by 8).
+const SPINNER_FRAME_INTERVAL: Duration = Duration::from_millis(120);
 
 /// Events the pure-client loop multiplexes, tagged with the remote they
 /// belong to.
 enum LoopEvent {
     Stdin(Vec<u8>),
     Resize(u16, u16),
-    Frame(usize, Frame),
-    Disconnected(usize),
+    /// A frame read by a remote's reader thread, tagged with the link
+    /// generation it was read under so frames from a torn-down session
+    /// never reach a successor's fresh mirror.
+    Frame(usize, u64, Frame),
+    /// A reader thread's transport died. Generation-tagged like frames so
+    /// a stale reader cannot demote its successor's link.
+    Disconnected(usize, u64),
     /// A fleet remote's connect thread finished its handshake. The
     /// generation drops results from threads whose link was reconciled
     /// away (or replaced) while they were connecting.
@@ -102,18 +121,44 @@ enum RemoteEstablished {
 /// In-flight control requests awaiting their response frame.
 enum Pending {
     Snapshot,
-    StreamOpen { pane_id: String, mode: StreamMode },
-    History { stream_id: u32 },
-    Resize { stream_id: u32 },
+    /// Heartbeat ping; any inbound frame already proves liveness, so the
+    /// pong itself needs no further handling.
+    Ping,
+    StreamOpen {
+        pane_id: String,
+        mode: StreamMode,
+    },
+    History {
+        stream_id: u32,
+    },
+    Resize {
+        stream_id: u32,
+    },
     Api,
+}
+
+/// Where a session's encoded frames go.
+enum SessionWriter {
+    /// Blocking writes on the loop thread (the local socket).
+    Direct(Box<dyn io::Write + Send>),
+    /// Frames handed to a per-remote writer thread. A full queue fails the
+    /// write instead of blocking the run loop on one stalled remote's pipe.
+    Threaded(mpsc::SyncSender<Vec<u8>>),
 }
 
 /// One connected framed session (local socket or SSH bridge child stdio).
 pub(super) struct Session {
-    writer: Box<dyn io::Write + Send>,
+    writer: SessionWriter,
     /// Keeps the SSH bridge child alive for the session's lifetime; dropped
     /// with the session, which kills the child and unblocks its reader.
     _guard: Option<BridgeChild>,
+    /// The link generation this session and its reader thread belong to;
+    /// events tagged with another generation are stale.
+    generation: u64,
+    /// When the last frame arrived, for the fleet heartbeat.
+    last_inbound: Instant,
+    /// When the next heartbeat ping is due (fleet remotes only).
+    next_ping: Instant,
     next_request_id: u64,
     pending: HashMap<String, Pending>,
     /// Last size sent per stream id, to keep stream.resize idempotent.
@@ -134,16 +179,30 @@ impl Session {
     fn send_control(&mut self, value: &serde_json::Value) -> io::Result<()> {
         let payload = serde_json::to_vec(value)
             .map_err(|err| io::Error::other(format!("failed to encode control frame: {err}")))?;
-        write_frame(
-            &mut self.writer,
-            FrameType::Control,
-            CONTROL_STREAM_ID,
-            &payload,
-        )
-        .map_err(|err| match err {
+        let map_codec = |err: FramedCodecError| match err {
             FramedCodecError::Io(err) => err,
             other => io::Error::new(io::ErrorKind::InvalidData, other.to_string()),
-        })
+        };
+        match &mut self.writer {
+            SessionWriter::Direct(writer) => {
+                write_frame(writer, FrameType::Control, CONTROL_STREAM_ID, &payload)
+                    .map_err(map_codec)
+            }
+            SessionWriter::Threaded(tx) => {
+                let mut buf = Vec::with_capacity(payload.len() + 16);
+                write_frame(&mut buf, FrameType::Control, CONTROL_STREAM_ID, &payload)
+                    .map_err(map_codec)?;
+                tx.try_send(buf).map_err(|err| match err {
+                    mpsc::TrySendError::Full(_) => io::Error::new(
+                        io::ErrorKind::WouldBlock,
+                        "remote write queue full (stalled connection)",
+                    ),
+                    mpsc::TrySendError::Disconnected(_) => {
+                        io::Error::new(io::ErrorKind::BrokenPipe, "remote writer thread ended")
+                    }
+                })
+            }
+        }
     }
 }
 
@@ -153,7 +212,7 @@ pub(super) type Links = BTreeMap<usize, Link>;
 /// The live session for a remote, when its link is up.
 fn session_for(links: &mut Links, remote: usize) -> Option<&mut Session> {
     match links.get_mut(&remote) {
-        Some(Link::Up(session)) => Some(session),
+        Some(Link::Up(session)) => Some(session.as_mut()),
         _ => None,
     }
 }
@@ -205,10 +264,14 @@ fn interpret_hello_answer(
     }
 }
 
-fn fresh_session(writer: Box<dyn io::Write + Send>, guard: Option<BridgeChild>) -> Session {
+fn fresh_session(writer: SessionWriter, guard: Option<BridgeChild>, generation: u64) -> Session {
+    let now = Instant::now();
     Session {
         writer,
         _guard: guard,
+        generation,
+        last_inbound: now,
+        next_ping: now + REMOTE_PING_INTERVAL,
         next_request_id: 1,
         pending: HashMap::new(),
         sent_sizes: HashMap::new(),
@@ -268,7 +331,9 @@ fn connect() -> ConnectOutcome {
                 Err(err) => return ConnectOutcome::Failed(format!("socket clone failed: {err}")),
             };
             ConnectOutcome::Connected(Box::new(ConnectedLocal {
-                session: fresh_session(Box::new(stream), None),
+                // Generation 0 placeholder; `establish_local` stamps the
+                // real link generation before the reader thread starts.
+                session: fresh_session(SessionWriter::Direct(Box::new(stream)), None, 0),
                 reader,
                 welcome,
             }))
@@ -295,6 +360,22 @@ fn remote_connect_and_read(
     let established = (|| {
         let (child, mut stdout, mut stdin) = BridgeChild::spawn(target, &descriptor.session)
             .map_err(|err| format!("ssh bridge spawn failed: {err}"))?;
+        // Watchdog: the hello-answer read below is a blocking pipe read with
+        // no native timeout, so a remote that accepts the connection but
+        // never answers would wedge this thread and its link forever.
+        // Killing the child at the deadline forces the read to fail into
+        // the normal retry path.
+        let handshake_started = Instant::now();
+        let (handshake_done_tx, handshake_done_rx) = mpsc::channel::<()>();
+        let killer = child.killer();
+        std::thread::spawn(move || {
+            if handshake_done_rx
+                .recv_timeout(REMOTE_HANDSHAKE_TIMEOUT)
+                .is_err()
+            {
+                killer.kill();
+            }
+        });
         stdin
             .write_all(&FRAMED_MAGIC)
             .and_then(|()| stdin.flush())
@@ -306,6 +387,12 @@ fn remote_connect_and_read(
             .map_err(|err| format!("session.hello send failed: {err}"))?;
         let response = loop {
             let frame = read_frame(&mut stdout).map_err(|err| {
+                if handshake_started.elapsed() >= REMOTE_HANDSHAKE_TIMEOUT {
+                    return format!(
+                        "session.hello timed out after {}s",
+                        REMOTE_HANDSHAKE_TIMEOUT.as_secs()
+                    );
+                }
                 let tail = child
                     .stderr_tail()
                     .lock()
@@ -318,8 +405,11 @@ fn remote_connect_and_read(
                 }
             })?;
             if frame.frame_type == FrameType::Control {
-                break serde_json::from_slice::<serde_json::Value>(&frame.payload)
+                let response = serde_json::from_slice::<serde_json::Value>(&frame.payload)
                     .map_err(|err| format!("invalid hello answer: {err}"))?;
+                // The handshake answered; stand the watchdog down.
+                let _ = handshake_done_tx.send(());
+                break response;
             }
         };
         Ok((child, stdout, stdin, response))
@@ -377,13 +467,16 @@ fn remote_connect_and_read(
     while !should_quit.load(Ordering::Acquire) {
         match read_frame(&mut stdout) {
             Ok(frame) => {
-                if event_tx.send(LoopEvent::Frame(remote, frame)).is_err() {
+                if event_tx
+                    .send(LoopEvent::Frame(remote, generation, frame))
+                    .is_err()
+                {
                     return;
                 }
             }
             Err(err) => {
                 debug!(remote, err = %err, "fleet remote session read ended");
-                let _ = event_tx.send(LoopEvent::Disconnected(remote));
+                let _ = event_tx.send(LoopEvent::Disconnected(remote, generation));
                 return;
             }
         }
@@ -488,7 +581,8 @@ pub(crate) fn run_pure_client(config: &crate::config::Config) -> io::Result<()> 
 
 /// Connection state the loop threads through reconnects.
 pub(super) enum Link {
-    Up(Session),
+    /// Boxed: the session is much larger than the other variants.
+    Up(Box<Session>),
     /// A fleet remote's connect thread is in flight.
     Pending {
         generation: u64,
@@ -509,8 +603,10 @@ struct InteractionState {
     status_flash: Option<(String, Instant)>,
     /// Last window title written to the host terminal.
     last_window_title: Option<String>,
-    /// Generation source for remote connect threads.
+    /// Generation source for connect threads and reader threads.
     next_generation: u64,
+    /// When the connecting spinner last advanced one visual frame.
+    last_spinner_step: Option<Instant>,
 }
 
 /// Everything one input or frame event may touch. Bundled so the event
@@ -541,9 +637,25 @@ impl LoopCtx<'_> {
             LoopEvent::Resize(cols, rows) => {
                 debug!(cols, rows, "host terminal resized");
             }
-            LoopEvent::Frame(remote, frame) => handle_server_frame(remote, frame, self),
-            LoopEvent::Disconnected(remote) => {
-                drop_link(remote, self, "connection closed");
+            LoopEvent::Frame(remote, generation, frame) => {
+                if link_generation(self.links.get(&remote)) != Some(generation) {
+                    debug!(remote, generation, "dropping frame from a stale reader");
+                    return;
+                }
+                if let Some(Link::Up(session)) = self.links.get_mut(&remote) {
+                    session.last_inbound = Instant::now();
+                }
+                handle_server_frame(remote, frame, self);
+            }
+            LoopEvent::Disconnected(remote, generation) => {
+                if link_generation(self.links.get(&remote)) == Some(generation) {
+                    drop_link(remote, self, "connection closed");
+                } else {
+                    debug!(
+                        remote,
+                        generation, "ignoring disconnect from a stale reader"
+                    );
+                }
             }
             LoopEvent::Established(remote, generation, outcome) => {
                 handle_established(remote, generation, *outcome, self);
@@ -570,7 +682,7 @@ fn run_loop(
     let mut links: Links = BTreeMap::new();
     links.insert(
         LOCAL_REMOTE_INDEX,
-        establish_local(mirrors, chrome, event_tx, should_quit),
+        establish_local(mirrors, chrome, &mut ui, event_tx, should_quit),
     );
     for descriptor in descriptors.iter().skip(1) {
         let link = establish_remote(descriptor, mirrors, &mut ui, event_tx, should_quit);
@@ -617,7 +729,13 @@ fn run_loop(
             .collect();
         for remote in due {
             let link = if remote == LOCAL_REMOTE_INDEX {
-                establish_local(ctx.mirrors, ctx.chrome, ctx.event_tx, ctx.should_quit)
+                establish_local(
+                    ctx.mirrors,
+                    ctx.chrome,
+                    ctx.ui,
+                    ctx.event_tx,
+                    ctx.should_quit,
+                )
             } else if let Some(descriptor) = ctx
                 .descriptors
                 .iter()
@@ -634,6 +752,15 @@ fn run_loop(
                 continue;
             };
             ctx.links.insert(remote, link);
+            dirty = true;
+        }
+
+        // Liveness and animation are time-driven: the recv timeout below
+        // wakes this loop even when no events arrive.
+        if service_remote_heartbeats(&mut ctx) {
+            dirty = true;
+        }
+        if service_ui_ticks(&mut ctx) {
             dirty = true;
         }
 
@@ -717,12 +844,15 @@ fn apply_window_title(ctx: &mut LoopCtx<'_>) {
 fn establish_local(
     mirrors: &mut RemoteMirrors,
     chrome: &mut GlobalChrome,
+    ui: &mut InteractionState,
     event_tx: &mpsc::SyncSender<LoopEvent>,
     should_quit: &Arc<AtomicBool>,
 ) -> Link {
     let mirror = mirrors.local_mut();
     debug!(remote = mirror.remote_index, name = %mirror.name, "connecting");
     mirror.connection.connect_started();
+    ui.next_generation += 1;
+    let generation = ui.next_generation;
     match connect() {
         ConnectOutcome::Connected(connected) => {
             let ConnectedLocal {
@@ -730,6 +860,7 @@ fn establish_local(
                 reader,
                 welcome,
             } = *connected;
+            session.generation = generation;
             // The mirror holds what the server actually negotiated, not what
             // this client asked for: capability gates (pane streams) and any
             // protocol downgrade must reflect the welcome.
@@ -757,8 +888,10 @@ fn establish_local(
 
             let frame_tx = event_tx.clone();
             let reader_quit = Arc::clone(should_quit);
-            std::thread::spawn(move || socket_reader_loop(reader, frame_tx, &reader_quit));
-            Link::Up(session)
+            std::thread::spawn(move || {
+                socket_reader_loop(reader, generation, frame_tx, &reader_quit)
+            });
+            Link::Up(Box::new(session))
         }
         ConnectOutcome::Incompatible { message } => {
             mirror.connection.incompatible(
@@ -851,7 +984,34 @@ fn handle_established(
                     capabilities: welcome.capabilities,
                 });
             mirror.begin_resync();
-            let mut session = fresh_session(Box::new(writer), Some(guard));
+            // Outbound frames go through a dedicated writer thread so a
+            // stalled remote's full pipe can never block the run loop (and
+            // with it every other remote and local pane). The thread ends
+            // when the session drops (channel closes) or the write fails
+            // (child killed).
+            let (writer_tx, writer_rx) = mpsc::sync_channel::<Vec<u8>>(REMOTE_WRITE_QUEUE_FRAMES);
+            let spawned = std::thread::Builder::new()
+                .name("fleet-remote-writer".to_owned())
+                .spawn(move || {
+                    let mut stdin = writer;
+                    while let Ok(buf) = writer_rx.recv() {
+                        if stdin.write_all(&buf).and_then(|()| stdin.flush()).is_err() {
+                            return;
+                        }
+                    }
+                });
+            if let Err(err) = spawned {
+                mirror.connection_lost(format!("writer thread spawn failed: {err}"));
+                ctx.links.insert(
+                    remote,
+                    Link::Down {
+                        retry_at: Instant::now() + Duration::from_secs(1),
+                    },
+                );
+                return;
+            }
+            let mut session =
+                fresh_session(SessionWriter::Threaded(writer_tx), Some(guard), generation);
             let id = session.request_id("snapshot");
             session.pending.insert(id.clone(), Pending::Snapshot);
             if let Err(err) = session.send_control(&session_snapshot_request(&id)) {
@@ -865,7 +1025,7 @@ fn handle_established(
                 );
                 return;
             }
-            ctx.links.insert(remote, Link::Up(session));
+            ctx.links.insert(remote, Link::Up(Box::new(session)));
         }
         RemoteEstablished::Incompatible { message } => {
             warn!(remote, message = %message, "fleet remote protocol incompatible");
@@ -894,6 +1054,88 @@ fn handle_established(
             );
         }
     }
+}
+
+/// The generation of a link's current session or in-flight connect.
+fn link_generation(link: Option<&Link>) -> Option<u64> {
+    match link {
+        Some(Link::Up(session)) => Some(session.generation),
+        Some(Link::Pending { generation }) => Some(*generation),
+        _ => None,
+    }
+}
+
+/// Sends heartbeat pings on established fleet links and fails links whose
+/// remote has been silent past the pong timeout, so a silently dead
+/// transport cannot keep a connected chip dot. The local socket is exempt,
+/// matching the legacy client. Returns true when a link changed state.
+fn service_remote_heartbeats(ctx: &mut LoopCtx<'_>) -> bool {
+    let now = Instant::now();
+    let mut dead: Vec<usize> = Vec::new();
+    for (remote, link) in ctx.links.iter_mut() {
+        if *remote == LOCAL_REMOTE_INDEX {
+            continue;
+        }
+        let Link::Up(session) = link else {
+            continue;
+        };
+        if now.duration_since(session.last_inbound) >= REMOTE_PONG_TIMEOUT {
+            dead.push(*remote);
+            continue;
+        }
+        if now >= session.next_ping {
+            session.next_ping = now + REMOTE_PING_INTERVAL;
+            let id = session.request_id("ping");
+            session.pending.insert(id.clone(), Pending::Ping);
+            if let Err(err) = session.send_control(&crate::protocol::framed::ping_request(&id)) {
+                debug!(remote = *remote, err = %err, "heartbeat ping send failed");
+                session.pending.remove(&id);
+            }
+        }
+    }
+    let changed = !dead.is_empty();
+    for remote in dead {
+        drop_link(remote, ctx, "heartbeat timed out");
+    }
+    changed
+}
+
+/// Expires the status flash and animates the connecting spinner. Both are
+/// time-driven: without this, an idle loop would freeze the spinner on its
+/// first frame and pin an expired toast to the screen until the next event.
+fn service_ui_ticks(ctx: &mut LoopCtx<'_>) -> bool {
+    let mut dirty = false;
+    if ctx
+        .ui
+        .status_flash
+        .as_ref()
+        .is_some_and(|(_, at)| at.elapsed() > STATUS_FLASH_TTL)
+    {
+        ctx.ui.status_flash = None;
+        dirty = true;
+    }
+    let connecting = ctx.mirrors.iter().any(|mirror| {
+        matches!(
+            mirror.connection,
+            super::ClientConnectionState::Connecting { .. }
+        )
+    });
+    if connecting {
+        let due = ctx
+            .ui
+            .last_spinner_step
+            .is_none_or(|at| at.elapsed() >= SPINNER_FRAME_INTERVAL);
+        if due {
+            // `spinner_frame` divides the tick by 8, so stepping by 8
+            // advances exactly one visual frame per interval.
+            ctx.app.spinner_tick = ctx.app.spinner_tick.wrapping_add(8);
+            ctx.ui.last_spinner_step = Some(Instant::now());
+            dirty = true;
+        }
+    } else {
+        ctx.ui.last_spinner_step = None;
+    }
+    dirty
 }
 
 /// Drops a remote's link after its transport died and schedules the retry.
@@ -998,18 +1240,19 @@ fn request_backfill_if_needed(
 /// Reads frames off the session socket into the loop channel.
 fn socket_reader_loop(
     mut stream: LocalStream,
+    generation: u64,
     event_tx: mpsc::SyncSender<LoopEvent>,
     should_quit: &Arc<AtomicBool>,
 ) {
     if stream.set_nonblocking(false).is_err() {
-        let _ = event_tx.send(LoopEvent::Disconnected(LOCAL_REMOTE_INDEX));
+        let _ = event_tx.send(LoopEvent::Disconnected(LOCAL_REMOTE_INDEX, generation));
         return;
     }
     while !should_quit.load(Ordering::Acquire) {
         match read_frame(&mut stream) {
             Ok(frame) => {
                 if event_tx
-                    .send(LoopEvent::Frame(LOCAL_REMOTE_INDEX, frame))
+                    .send(LoopEvent::Frame(LOCAL_REMOTE_INDEX, generation, frame))
                     .is_err()
                 {
                     return;
@@ -1017,7 +1260,7 @@ fn socket_reader_loop(
             }
             Err(err) => {
                 debug!(err = %err, "pure client session read ended");
-                let _ = event_tx.send(LoopEvent::Disconnected(LOCAL_REMOTE_INDEX));
+                let _ = event_tx.send(LoopEvent::Disconnected(LOCAL_REMOTE_INDEX, generation));
                 return;
             }
         }
@@ -1284,6 +1527,9 @@ fn handle_server_frame(remote: usize, frame: Frame, ctx: &mut LoopCtx<'_>) {
                         session.sent_sizes.remove(&stream_id);
                     }
                 }
+                Some(Pending::Ping) => {
+                    // Liveness was already recorded when the frame arrived.
+                }
                 Some(Pending::Api) => {
                     if let Some(error) = control_error(&payload) {
                         debug!(code = %error.code, message = %error.message, "api.request rejected");
@@ -1536,6 +1782,7 @@ fn handle_key(key: crate::input::TerminalKey, ctx: &mut LoopCtx<'_>) {
                     ctx.links,
                     ctx.mirrors,
                     ctx.ids,
+                    ctx.descriptors,
                     ctx.app,
                     ctx.chrome,
                 ),
@@ -1635,6 +1882,7 @@ fn remove_edited_remote(ctx: &mut LoopCtx<'_>) {
 /// get a fresh mirror and a link the reconnect scan picks up immediately.
 fn reconcile_fleet(entries: &[crate::fleet::config::RemoteEntry], ctx: &mut LoopCtx<'_>) {
     let new_descriptors = remote_descriptors(entries);
+    let old_descriptors = ctx.descriptors.clone();
     for old in ctx.descriptors.iter().skip(1) {
         let unchanged = new_descriptors.get(old.index).is_some_and(|new| {
             new.name == old.name && new.target == old.target && new.session == old.session
@@ -1656,7 +1904,9 @@ fn reconcile_fleet(entries: &[crate::fleet::config::RemoteEntry], ctx: &mut Loop
         });
     }
     *ctx.descriptors = new_descriptors;
-    ctx.chrome.selection.retain(ctx.descriptors);
+    ctx.chrome
+        .selection
+        .remap(&old_descriptors, ctx.descriptors);
     let valid: std::collections::BTreeSet<usize> = ctx
         .descriptors
         .iter()
@@ -1848,6 +2098,7 @@ fn handle_mouse(mouse: MouseEvent, ctx: &mut LoopCtx<'_>) {
                 ctx.links,
                 ctx.mirrors,
                 ctx.ids,
+                ctx.descriptors,
                 ctx.app,
                 ctx.chrome,
             );
@@ -2227,6 +2478,113 @@ mod tests {
                 ctx.mirrors.get(1).map(|mirror| &mirror.connection),
                 Some(super::super::ClientConnectionState::Incompatible { .. })
             ));
+        });
+    }
+
+    /// A test session over a threaded writer whose receive half is kept
+    /// alive by the returned receiver.
+    fn threaded_session(generation: u64, bound: usize) -> (Session, mpsc::Receiver<Vec<u8>>) {
+        let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(bound);
+        (
+            fresh_session(SessionWriter::Threaded(tx), None, generation),
+            rx,
+        )
+    }
+
+    #[tokio::test]
+    async fn stale_reader_events_cannot_touch_a_successor_link() {
+        with_test_ctx(three_descriptors(), |ctx| {
+            let (mut session, _rx) = threaded_session(7, 8);
+            let backdated = Instant::now() - Duration::from_secs(1);
+            session.last_inbound = backdated;
+            ctx.links.insert(1, Link::Up(Box::new(session)));
+            let mut framer = crate::raw_input::RawInputFramer::for_host_input();
+            let last_inbound = |links: &Links| match links.get(&1) {
+                Some(Link::Up(session)) => Some(session.last_inbound),
+                _ => None,
+            };
+
+            // A disconnect from a torn-down reader (older generation) must
+            // not demote the successor's link.
+            ctx.handle_event(LoopEvent::Disconnected(1, 6), &mut framer);
+            assert!(matches!(ctx.links.get(&1), Some(Link::Up(_))));
+
+            // A stale reader's frame never reaches the successor's session.
+            let frame = Frame {
+                frame_type: FrameType::Data,
+                stream_id: 9,
+                payload: b"x".to_vec(),
+            };
+            ctx.handle_event(LoopEvent::Frame(1, 6, frame), &mut framer);
+            assert_eq!(last_inbound(ctx.links), Some(backdated));
+
+            // The current generation's frame counts as liveness.
+            let frame = Frame {
+                frame_type: FrameType::Data,
+                stream_id: 9,
+                payload: b"x".to_vec(),
+            };
+            ctx.handle_event(LoopEvent::Frame(1, 7, frame), &mut framer);
+            assert!(last_inbound(ctx.links).expect("link is up") > backdated);
+
+            // The current generation's disconnect still tears the link down.
+            ctx.handle_event(LoopEvent::Disconnected(1, 7), &mut framer);
+            assert!(matches!(ctx.links.get(&1), Some(Link::Down { .. })));
+        });
+    }
+
+    #[tokio::test]
+    async fn silent_remotes_fail_the_heartbeat_and_pings_keep_live_ones_honest() {
+        with_test_ctx(three_descriptors(), |ctx| {
+            // Remote 1: silent past the pong timeout — the link must drop.
+            let (mut session, _rx1) = threaded_session(1, 8);
+            session.last_inbound = Instant::now() - REMOTE_PONG_TIMEOUT;
+            ctx.links.insert(1, Link::Up(Box::new(session)));
+
+            // Remote 2: alive but idle with a due ping — a ping must go out.
+            let (mut session, rx2) = threaded_session(2, 8);
+            session.next_ping = Instant::now();
+            ctx.links.insert(2, Link::Up(Box::new(session)));
+
+            assert!(service_remote_heartbeats(ctx), "a dead link changed state");
+            assert!(matches!(ctx.links.get(&1), Some(Link::Down { .. })));
+            assert!(matches!(ctx.links.get(&2), Some(Link::Up(_))));
+            assert!(rx2.try_recv().is_ok(), "heartbeat ping was written");
+        });
+    }
+
+    #[test]
+    fn a_full_remote_write_queue_fails_instead_of_blocking_the_loop() {
+        let (mut session, _rx) = threaded_session(1, 1);
+        assert!(session
+            .send_control(&serde_json::json!({"id": "a"}))
+            .is_ok());
+        let err = session
+            .send_control(&serde_json::json!({"id": "b"}))
+            .expect_err("second frame overflows the bound-1 queue");
+        assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+    }
+
+    #[tokio::test]
+    async fn ui_ticks_expire_the_status_flash_and_animate_the_spinner() {
+        with_test_ctx(three_descriptors(), |ctx| {
+            ctx.ui.status_flash = Some((
+                "at least one remote stays in view".to_owned(),
+                Instant::now() - STATUS_FLASH_TTL - Duration::from_millis(50),
+            ));
+            assert!(service_ui_ticks(ctx), "expiry forces a recompose");
+            assert!(ctx.ui.status_flash.is_none());
+
+            // No remote connecting: the spinner does not tick.
+            assert!(!service_ui_ticks(ctx));
+
+            // A connecting remote advances the spinner one visual frame.
+            if let Some(mirror) = ctx.mirrors.get_mut(1) {
+                mirror.connection.connect_started();
+            }
+            let before = ctx.app.spinner_tick;
+            assert!(service_ui_ticks(ctx), "spinner tick forces a redraw");
+            assert_ne!(ctx.app.spinner_tick, before);
         });
     }
 

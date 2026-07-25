@@ -1913,7 +1913,10 @@ fn bridge_connection(
     }
 }
 
-fn copy_flush<R: io::Read, W: io::Write>(reader: &mut R, writer: &mut W) -> io::Result<u64> {
+pub(crate) fn copy_flush<R: io::Read, W: io::Write>(
+    reader: &mut R,
+    writer: &mut W,
+) -> io::Result<u64> {
     let mut buffer = [0_u8; 16 * 1024];
     let mut total = 0;
 

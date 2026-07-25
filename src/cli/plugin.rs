@@ -1618,7 +1618,7 @@ fn current_unix_ms() -> u64 {
         .unwrap_or(0)
 }
 
-fn is_connection_error(err: &std::io::Error) -> bool {
+pub(super) fn is_connection_error(err: &std::io::Error) -> bool {
     matches!(
         err.kind(),
         std::io::ErrorKind::NotFound

@@ -15,6 +15,7 @@ use super::plugins::{
     InstalledPluginInfo, PluginActionInfo, PluginCommandLogInfo, PluginInvocationContext,
     PluginPaneInfo,
 };
+use super::remotes::RemoteInfo;
 use super::server::ServerCapabilities;
 use super::session::SessionSnapshot;
 use super::tabs::TabInfo;
@@ -50,6 +51,9 @@ pub enum ResponseResult {
     },
     SessionSnapshot {
         snapshot: Box<SessionSnapshot>,
+    },
+    RemoteList {
+        remotes: Vec<RemoteInfo>,
     },
     WorkspaceInfo {
         workspace: WorkspaceInfo,

@@ -4308,6 +4308,9 @@ pub fn run_server() -> io::Result<()> {
         );
         print_ready_message(&api::socket_path(), &client_socket_path());
         server.app.run_plugin_startup_hooks();
+        // Connects all configured remotes in parallel without blocking the
+        // server loop; the fleet self-heals from here on.
+        server.app.start_fleet();
 
         server.run().await
     });
@@ -4411,6 +4414,7 @@ fn run_handoff_import_server(socket_path: &Path, token: &str) -> io::Result<()> 
         info!("handoff import server started");
         print_ready_message(&api::socket_path(), &client_socket_path());
         server.app.run_plugin_startup_hooks();
+        server.app.start_fleet();
         server.run().await
     });
 

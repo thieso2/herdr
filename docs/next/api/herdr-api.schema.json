@@ -3568,6 +3568,18 @@
           ],
           "type": "string"
         },
+        "RemoteTargetParams": {
+          "description": "Names one fleet remote (for example for `remote.reset`).",
+          "properties": {
+            "name": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "name"
+          ],
+          "type": "object"
+        },
         "ServerLiveHandoffParams": {
           "properties": {
             "expected_protocol": {
@@ -4464,6 +4476,54 @@
           "properties": {
             "method": {
               "const": "session.snapshot",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/EmptyParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "remote.list",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/EmptyParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "remote.reset",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/RemoteTargetParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "remote.reload",
               "type": "string"
             },
             "params": {
@@ -8443,6 +8503,103 @@
           ],
           "type": "string"
         },
+        "RemoteConnectionStateInfo": {
+          "description": "Connection state of one fleet remote as reported by `remote.list`.",
+          "oneOf": [
+            {
+              "const": "local",
+              "description": "The implicit local runtime (remote `#0`).",
+              "type": "string"
+            },
+            {
+              "const": "connecting",
+              "description": "A connect-plus-handshake attempt is in flight.",
+              "type": "string"
+            },
+            {
+              "const": "connected",
+              "description": "Live negotiated framed session.",
+              "type": "string"
+            },
+            {
+              "const": "offline",
+              "description": "Not connected; automatic reconnects continue until the remote is\nremoved or disabled.",
+              "type": "string"
+            },
+            {
+              "const": "disabled",
+              "description": "Disabled in the fleet config; no connection is attempted.",
+              "type": "string"
+            },
+            {
+              "const": "unknown",
+              "description": "The fleet holds no live state for this remote (for example when the\nconfig is read without a running fleet).",
+              "type": "string"
+            }
+          ]
+        },
+        "RemoteInfo": {
+          "description": "One fleet remote with its live connection state. The local runtime is the\nimplicit entry at index 0.",
+          "properties": {
+            "attempt": {
+              "description": "Reconnect attempt counter while offline or connecting.",
+              "format": "uint32",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "enabled": {
+              "type": "boolean"
+            },
+            "index": {
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "last_error": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "name": {
+              "type": "string"
+            },
+            "retry_in_ms": {
+              "description": "Milliseconds until the next automatic reconnect while offline.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "session": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "state": {
+              "$ref": "#/schemas/success_response/$defs/RemoteConnectionStateInfo"
+            },
+            "target": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "index",
+            "name",
+            "enabled",
+            "state"
+          ],
+          "type": "object"
+        },
         "ResponseResult": {
           "oneOf": [
             {
@@ -8491,6 +8648,25 @@
               "required": [
                 "type",
                 "snapshot"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "remotes": {
+                  "items": {
+                    "$ref": "#/schemas/success_response/$defs/RemoteInfo"
+                  },
+                  "type": "array"
+                },
+                "type": {
+                  "const": "remote_list",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "remotes"
               ],
               "type": "object"
             },

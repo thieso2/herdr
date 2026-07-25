@@ -119,8 +119,6 @@ pub enum FramedCodecError {
     /// An I/O error occurred while reading or writing.
     Io(io::Error),
     /// The connection closed before a complete frame could be read.
-    // Only `read_frame` constructs this; see the allow note there.
-    #[allow(dead_code)]
     UnexpectedEof,
 }
 
@@ -211,10 +209,10 @@ pub fn write_frame<W: Write>(
 }
 
 /// Reads one complete frame, reassembling partial reads.
-// The blocking-read half of the codec seam. The server uses a non-blocking
-// buffered reader instead; this is for framed clients, which arrive with the
-// next migration stage. Until then only tests exercise it.
-#[allow(dead_code)]
+///
+/// The blocking-read half of the codec seam, generic over any `Read`
+/// transport: framed clients use it over local sockets and SSH bridge child
+/// stdio alike. The server keeps its own non-blocking buffered reader.
 pub fn read_frame<R: Read>(reader: &mut R) -> Result<Frame, FramedCodecError> {
     let mut header_bytes = [0u8; FRAME_HEADER_BYTES];
     read_exact_or_eof(reader, &mut header_bytes)?;
@@ -230,8 +228,6 @@ pub fn read_frame<R: Read>(reader: &mut R) -> Result<Frame, FramedCodecError> {
     })
 }
 
-// Only `read_frame` calls this; see the allow note there.
-#[allow(dead_code)]
 fn read_exact_or_eof<R: Read>(reader: &mut R, buf: &mut [u8]) -> Result<(), FramedCodecError> {
     reader.read_exact(buf).map_err(|err| {
         if err.kind() == io::ErrorKind::UnexpectedEof {
@@ -358,6 +354,115 @@ pub(crate) fn negotiate_capabilities(client: &[String], server: &[&str]) -> Vec<
         }
     }
     negotiated
+}
+
+// ---------------------------------------------------------------------------
+// Client-side control vocabulary
+// ---------------------------------------------------------------------------
+
+/// Capability flags a framed client advertises during `session.hello`.
+pub const CLIENT_CAPABILITIES: &[&str] = &[];
+
+/// Builds the opening `session.hello` control request for this build's
+/// version window and client capabilities.
+pub fn session_hello_request(id: &str) -> serde_json::Value {
+    serde_json::json!({
+        "id": id,
+        "method": SESSION_HELLO_METHOD,
+        "params": {
+            "protocol": FRAMED_PROTOCOL_VERSION,
+            "min_protocol": FRAMED_PROTOCOL_MIN_SUPPORTED,
+            "capabilities": CLIENT_CAPABILITIES,
+        },
+    })
+}
+
+/// Builds a heartbeat `ping` control request.
+pub fn ping_request(id: &str) -> serde_json::Value {
+    serde_json::json!({
+        "id": id,
+        "method": PING_METHOD,
+        "params": {},
+    })
+}
+
+/// The server's answer to a successful `session.hello`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionWelcome {
+    pub protocol: u32,
+    pub min_protocol: u32,
+    pub capabilities: Vec<String>,
+    pub server_version: String,
+}
+
+fn control_error_message(response: &serde_json::Value) -> Option<String> {
+    let error = response.get("error")?;
+    Some(
+        error
+            .get("message")
+            .and_then(|message| message.as_str())
+            .unwrap_or("unknown error")
+            .to_string(),
+    )
+}
+
+/// Parses a `session.welcome` control response, surfacing server rejections
+/// (including out-of-window hellos) as errors.
+pub fn parse_session_welcome(response: &serde_json::Value) -> Result<SessionWelcome, String> {
+    if let Some(message) = control_error_message(response) {
+        return Err(format!("session.hello rejected: {message}"));
+    }
+    let result = response
+        .get("result")
+        .ok_or_else(|| "session.hello response carries no result".to_string())?;
+    if result.get("type").and_then(|value| value.as_str()) != Some("session.welcome") {
+        return Err("session.hello response is not a session.welcome".to_string());
+    }
+    let protocol = result
+        .get("protocol")
+        .and_then(|value| value.as_u64())
+        .ok_or_else(|| "session.welcome carries no protocol".to_string())?;
+    let min_protocol = result
+        .get("min_protocol")
+        .and_then(|value| value.as_u64())
+        .unwrap_or(protocol);
+    let capabilities = result
+        .get("capabilities")
+        .and_then(|value| value.as_array())
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(|value| value.as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default();
+    let server_version = result
+        .get("server_version")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default()
+        .to_string();
+    Ok(SessionWelcome {
+        protocol: protocol as u32,
+        min_protocol: min_protocol as u32,
+        capabilities,
+        server_version,
+    })
+}
+
+/// Parses a `pong` control response.
+pub fn parse_pong(response: &serde_json::Value) -> Result<(), String> {
+    if let Some(message) = control_error_message(response) {
+        return Err(format!("ping rejected: {message}"));
+    }
+    if response
+        .get("result")
+        .and_then(|result| result.get("type"))
+        .and_then(|value| value.as_str())
+        != Some("pong")
+    {
+        return Err("ping response is not a pong".to_string());
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -620,6 +725,82 @@ mod tests {
         ];
         let negotiated = negotiate_capabilities(&client, &["notification", "pane-stream"]);
         assert_eq!(negotiated, vec!["pane-stream", "notification"]);
+    }
+
+    // ---- Client-side control vocabulary ----
+
+    #[test]
+    fn client_hello_request_carries_this_builds_window() {
+        let hello = session_hello_request("h1");
+        assert_eq!(hello["id"], "h1");
+        assert_eq!(hello["method"], SESSION_HELLO_METHOD);
+        assert_eq!(hello["params"]["protocol"], FRAMED_PROTOCOL_VERSION);
+        assert_eq!(
+            hello["params"]["min_protocol"],
+            FRAMED_PROTOCOL_MIN_SUPPORTED
+        );
+        // The client hello must decode with the server-side params type.
+        let params: SessionHelloParams = serde_json::from_value(hello["params"].clone()).unwrap();
+        assert!(negotiate_session_hello(&params).is_ok());
+    }
+
+    #[test]
+    fn parse_session_welcome_roundtrips_the_server_welcome_shape() {
+        let welcome = parse_session_welcome(&serde_json::json!({
+            "id": "h1",
+            "result": {
+                "type": "session.welcome",
+                "protocol": 1,
+                "min_protocol": 1,
+                "capabilities": ["pane-stream"],
+                "server_version": "0.9.9",
+            },
+        }))
+        .unwrap();
+        assert_eq!(
+            welcome,
+            SessionWelcome {
+                protocol: 1,
+                min_protocol: 1,
+                capabilities: vec!["pane-stream".to_string()],
+                server_version: "0.9.9".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_session_welcome_surfaces_rejections() {
+        let err = parse_session_welcome(&serde_json::json!({
+            "id": "h1",
+            "error": {"code": "protocol_out_of_window", "message": "upgrade this herdr server"},
+        }))
+        .unwrap_err();
+        assert!(err.contains("upgrade this herdr server"), "{err}");
+
+        assert!(parse_session_welcome(&serde_json::json!({
+            "id": "h1",
+            "result": {"type": "pong"},
+        }))
+        .is_err());
+    }
+
+    #[test]
+    fn parse_pong_accepts_pongs_and_rejects_errors() {
+        assert!(parse_pong(&serde_json::json!({
+            "id": "p1",
+            "result": {"type": "pong", "version": "x", "protocol": 1},
+        }))
+        .is_ok());
+        assert!(parse_pong(&serde_json::json!({
+            "id": "p1",
+            "error": {"code": "unknown_method", "message": "nope"},
+        }))
+        .is_err());
+        assert!(parse_pong(&serde_json::json!({
+            "id": "p1",
+            "result": {"type": "session.welcome"},
+        }))
+        .is_err());
     }
 
     #[test]

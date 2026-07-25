@@ -65,6 +65,7 @@ mod client;
 mod config;
 mod detect;
 mod events;
+mod fleet;
 mod ghostty;
 mod handoff_runtime;
 mod input;
@@ -496,6 +497,11 @@ fn main() -> io::Result<()> {
         return remote::run_remote_client_bridge();
     }
 
+    // Far side of an SSH fleet bridge: pump stdio to the API socket.
+    if args.get(1).map(|s| s.as_str()) == Some("bridge") {
+        return fleet::bridge::run_bridge();
+    }
+
     if args.get(1).map(|s| s.as_str()) == Some("server") {
         return server::headless::run_server();
     }
@@ -556,6 +562,7 @@ fn main() -> io::Result<()> {
         println!("       herdr agent <subcommand> ...");
         println!("       herdr pane <subcommand> ...");
         println!("       herdr session <subcommand> ...");
+        println!("       herdr remote <subcommand> ...");
         println!("       herdr integration <subcommand> ...");
         println!();
         println!("Common commands:");
@@ -617,6 +624,10 @@ fn main() -> io::Result<()> {
                 "Manage named persistent sessions",
             ),
             (
+                "herdr remote <subcommand>",
+                "Manage fleet remotes and their connections",
+            ),
+            (
                 "herdr integration <subcommand>",
                 "Manage built-in agent integrations",
             ),
@@ -626,6 +637,10 @@ fn main() -> io::Result<()> {
         println!();
         println!("Advanced commands:");
         println!("  {:<32} Run as headless server", "herdr server");
+        println!(
+            "  {:<32} Far side of an SSH fleet bridge (run via ssh)",
+            "herdr bridge"
+        );
         println!();
         println!("Options:");
         println!("  --no-session        Run monolithically (no server/client, escape hatch)");
@@ -679,6 +694,8 @@ fn main() -> io::Result<()> {
                 "server",
                 "client",
                 "remote-client-bridge",
+                "bridge",
+                "remote",
                 "update",
                 "status",
                 "config",

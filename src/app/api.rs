@@ -9,6 +9,7 @@ mod layouts;
 mod pane_graphics;
 mod panes;
 pub(crate) mod plugins;
+mod remotes;
 mod responses;
 mod session;
 mod tabs;
@@ -974,6 +975,11 @@ impl App {
                 );
             }
             Method::SessionSnapshot(_) => return self.handle_session_snapshot(request.id),
+            Method::RemoteList(_) => return self.handle_remote_list(request.id),
+            Method::RemoteReset(params) => {
+                return self.handle_remote_reset(request.id, params);
+            }
+            Method::RemoteReload(_) => return self.handle_remote_reload(request.id),
             Method::WorkspaceList(_) => return self.handle_workspace_list(request.id),
             Method::WorkspaceGet(target) => return self.handle_workspace_get(request.id, target),
             Method::WorkspaceCreate(params) => {

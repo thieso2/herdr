@@ -153,6 +153,10 @@ pub struct App {
     /// even when an App-internal drain consumes the event before the forwarding drain.
     pub(crate) local_input_source_switch: bool,
     pub(crate) config_reloaded_from_disk: bool,
+    /// Live fleet of remote runtimes. Started explicitly by the production
+    /// server entry points via `start_fleet`; `None` until then so tests and
+    /// helper Apps never spawn SSH bridges.
+    pub(crate) fleet: Option<crate::fleet::FleetManager>,
     prefix_input_source: Box<dyn crate::platform::PrefixInputSource>,
 }
 
@@ -785,8 +789,26 @@ impl App {
             local_terminal_notifications: true,
             local_input_source_switch: true,
             config_reloaded_from_disk: false,
+            fleet: None,
             prefix_input_source: Box::new(crate::platform::RealPrefixInputSource::default()),
         }
+    }
+
+    /// Starts the fleet connection manager: loads `remotes.toml` and connects
+    /// all enabled remotes in parallel over SSH stdio bridges. Non-blocking —
+    /// only worker threads are spawned. The reseed hook is a no-op until VT
+    /// replay lands with the pane stream work.
+    pub fn start_fleet(&mut self) {
+        if self.fleet.is_some() {
+            return;
+        }
+        let entries = crate::fleet::config::load();
+        self.fleet = Some(crate::fleet::FleetManager::start(
+            entries,
+            std::sync::Arc::new(crate::fleet::manager::SshBridgeTransport),
+            crate::fleet::manager::FleetTuning::default(),
+            std::sync::Arc::new(|_remote: &str| {}),
+        ));
     }
 
     #[cfg(unix)]

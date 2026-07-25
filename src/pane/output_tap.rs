@@ -40,6 +40,31 @@ struct SubscriberState {
     closed: bool,
 }
 
+/// Immutable scrollback history captured together with a stream
+/// subscription's snapshot, under the tap lock, so its content is exactly the
+/// pane history above the snapshot at the subscription sequence. The framed
+/// session serves `stream.history` pages as byte-contiguous slices of this
+/// capture, which is what makes paging gap-free and duplicate-free.
+pub(crate) struct PaneStreamHistory {
+    /// Public pane id the capture belongs to.
+    pub(crate) pane_id: String,
+    /// Pane output byte sequence at capture time.
+    pub(crate) sequence: u64,
+    /// Unwrapped, content-only ANSI of the scrollback above the snapshot.
+    pub(crate) content: String,
+}
+
+/// A fulfilled `stream.open`: the live output subscription, the history
+/// capture the session serves pages from, and, for write-mode streams, the
+/// pane write grant the session holds for as long as the stream is open.
+pub(crate) struct PaneStreamAttachment {
+    pub(crate) subscription: PaneOutputSubscription,
+    /// Write grant held for as long as a write-mode stream is open. Dropping
+    /// it releases the pane for the next writer.
+    pub(crate) write_grant: Option<crate::pane::write_grant::WriteGrant>,
+    pub(crate) history: Arc<PaneStreamHistory>,
+}
+
 /// One subscriber's live view of a pane's raw output tail.
 pub(crate) struct PaneOutputSubscription {
     /// Pane output byte sequence at subscribe time.
@@ -97,6 +122,19 @@ impl PaneOutputTap {
     /// Subscribes to the output tail, capturing `snapshot` under the tap lock
     /// so the subscription sequence and the snapshot describe the same
     /// instant of terminal state.
+    ///
+    /// The capture (for pane streams: the full stream seed, including the
+    /// scrollback history walk) deliberately runs while the tap lock is
+    /// held, stalling the PTY publish path for its duration. This is not
+    /// avoidable at this layer: releasing the tap lock before the capture
+    /// lets `publish_with` ingest bytes that the capture then also contains,
+    /// so the client would double-apply them from the tail. Re-reading the
+    /// sequence after an unlocked capture cannot fix that pairing either,
+    /// because terminal ingestion takes the terminal core lock *inside* the
+    /// tap lock — capturing core-first inverts that order and deadlocks, and
+    /// any formatter walk blocks ingestion on the core lock anyway. The
+    /// stall is bounded by one full-history format and only paid per
+    /// `stream.open`, not on the steady-state output path.
     pub(crate) fn subscribe_with_snapshot<R>(
         &self,
         snapshot: impl FnOnce() -> R,
@@ -154,25 +192,6 @@ impl PaneOutputSubscription {
 // the app-side handler fulfills the slot with the live subscription, and the
 // session claims it after the response arrives. Cancelling the slot makes a
 // late fulfillment drop the subscription instead of leaking it.
-
-/// What the app thread hands back for one opened pane stream: the live
-/// output subscription plus, for write-mode streams, the pane write grant the
-/// session holds for as long as the stream is open.
-pub(crate) struct PaneStreamAttachment {
-    pub(crate) subscription: PaneOutputSubscription,
-    pub(crate) write_grant: Option<crate::pane::write_grant::WriteGrant>,
-}
-
-impl PaneStreamAttachment {
-    /// Read-mode attachment: output tail only.
-    #[cfg(test)]
-    pub(crate) fn read_only(subscription: PaneOutputSubscription) -> Self {
-        Self {
-            subscription,
-            write_grant: None,
-        }
-    }
-}
 
 static PENDING_STREAM_SUBSCRIPTIONS: OnceLock<Mutex<HashMap<u32, Option<PaneStreamAttachment>>>> =
     OnceLock::new();
@@ -318,12 +337,23 @@ mod tests {
     #[test]
     fn pending_stream_registry_round_trips_and_cancels() {
         let tap = PaneOutputTap::default();
+        let history = || {
+            Arc::new(PaneStreamHistory {
+                pane_id: "p_1".to_owned(),
+                sequence: 0,
+                content: String::new(),
+            })
+        };
 
         // Fulfill without registration is rejected.
         let (orphan, ()) = tap.subscribe_with_snapshot(|| ());
         assert!(!fulfill_pending_stream(
             u32::MAX,
-            PaneStreamAttachment::read_only(orphan)
+            PaneStreamAttachment {
+                subscription: orphan,
+                write_grant: None,
+                history: history(),
+            }
         ));
         assert!(claim_pending_stream(u32::MAX).is_none());
 
@@ -332,9 +362,14 @@ mod tests {
         let (subscription, ()) = tap.subscribe_with_snapshot(|| ());
         assert!(fulfill_pending_stream(
             u32::MAX - 1,
-            PaneStreamAttachment::read_only(subscription)
+            PaneStreamAttachment {
+                subscription,
+                write_grant: None,
+                history: history(),
+            }
         ));
         let claimed = claim_pending_stream(u32::MAX - 1).expect("fulfilled slot");
+        assert_eq!(claimed.history.pane_id, "p_1");
         tap.publish_with(b"z", || ());
         assert_eq!(claimed.subscription.drain().bytes, b"z");
         assert!(claim_pending_stream(u32::MAX - 1).is_none());
@@ -345,7 +380,11 @@ mod tests {
         let (late, ()) = tap.subscribe_with_snapshot(|| ());
         assert!(!fulfill_pending_stream(
             u32::MAX - 2,
-            PaneStreamAttachment::read_only(late)
+            PaneStreamAttachment {
+                subscription: late,
+                write_grant: None,
+                history: history(),
+            }
         ));
 
         // Registered but unfulfilled slot claims as empty.

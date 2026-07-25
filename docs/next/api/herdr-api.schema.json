@@ -7933,12 +7933,26 @@
         "PaneStreamOpenInfo": {
           "description": "Result payload of a successful framed `stream.open`.",
           "properties": {
+            "cols": {
+              "description": "Terminal width at the subscription point.",
+              "format": "uint16",
+              "maximum": 65535,
+              "minimum": 0,
+              "type": "integer"
+            },
             "history_cursor": {
-              "description": "Opaque cursor identifying the snapshot point in pane history.",
+              "description": "Opaque cursor identifying the snapshot point in pane history. Feed it\nto `stream.history` to page scrollback backward; content-only pages\nnever re-assert modes.",
               "type": "string"
             },
             "pane_id": {
               "type": "string"
+            },
+            "rows": {
+              "description": "Terminal height at the subscription point.",
+              "format": "uint16",
+              "maximum": 65535,
+              "minimum": 0,
+              "type": "integer"
             },
             "sequence": {
               "description": "Pane output byte sequence captured with the snapshot. The stream's\nDATA tail begins at the byte after this sequence.",
@@ -7947,7 +7961,7 @@
               "type": "integer"
             },
             "snapshot": {
-              "description": "ANSI snapshot of the visible screen at the subscription point.",
+              "description": "ANSI snapshot of the active screen area at the subscription point.\nCarries mode/cursor/style state so a replica seeded from it tracks\nthe live tail faithfully.",
               "type": "string"
             },
             "stream_id": {
@@ -7966,7 +7980,9 @@
             "stream_id",
             "sequence",
             "snapshot",
-            "history_cursor"
+            "history_cursor",
+            "cols",
+            "rows"
           ],
           "type": "object"
         },

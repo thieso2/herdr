@@ -93,6 +93,33 @@ pub const STREAM_RESIZE_METHOD: &str = "stream.resize";
 /// the pane's own wheel and page-key routing rules.
 pub const STREAM_SCROLL_METHOD: &str = "stream.scroll";
 
+/// Control-plane method fetching a page of pane scrollback history for an
+/// open stream, walking backward from the opaque cursor minted by
+/// `stream.open`.
+pub const STREAM_HISTORY_METHOD: &str = "stream.history";
+
+/// Default `stream.history` page size in bytes when the request names none.
+pub const HISTORY_PAGE_DEFAULT_BYTES: usize = 256 * 1024;
+
+/// Smallest honored `stream.history` page size. Requests below this are
+/// clamped up so pathological clients cannot force per-line round trips.
+pub const HISTORY_PAGE_MIN_BYTES: usize = 4 * 1024;
+
+/// Largest honored `stream.history` fetch a client may request. Covers a full
+/// scrollback budget (jump-to-top); the server additionally caps each served
+/// page at `HISTORY_PAGE_SERVED_MAX_BYTES` and pages the remainder through
+/// `next_cursor`.
+pub const HISTORY_FETCH_MAX_BYTES: usize = 16 * 1024 * 1024;
+
+/// Largest history page content the server serves in one `stream.history`
+/// response. JSON string escaping expands control bytes (ESC, CR, ...) into
+/// six-byte `\u001b`-style escapes, so a page of `n` content bytes can encode
+/// to up to `6 * n` payload bytes. This cap keeps the worst-case encoded
+/// response (content plus cursor and envelope headroom) inside
+/// `MAX_FRAME_PAYLOAD`, so serving a page can never tear down the session
+/// with an oversized frame.
+pub const HISTORY_PAGE_SERVED_MAX_BYTES: usize = (MAX_FRAME_PAYLOAD - 64 * 1024) / 6;
+
 /// Control-plane method writing raw bytes to a pane PTY.
 pub const PANE_SEND_BYTES_METHOD: &str = "pane.send_bytes";
 
@@ -449,6 +476,19 @@ pub struct StreamCloseParams {
     pub stream_id: u32,
 }
 
+/// Parameters of the `stream.history` control request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StreamHistoryParams {
+    /// Opaque history cursor from `stream.open` or a previous
+    /// `stream.history` response.
+    pub cursor: String,
+    /// Requested page size in bytes. Defaults to
+    /// `HISTORY_PAGE_DEFAULT_BYTES`; clamped into
+    /// `HISTORY_PAGE_MIN_BYTES..=HISTORY_FETCH_MAX_BYTES`.
+    #[serde(default)]
+    pub max_bytes: Option<u64>,
+}
+
 /// Parameters of the `pane.send_bytes` control request.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PaneSendBytesControlParams {
@@ -472,29 +512,102 @@ pub struct PanePasteImageControlParams {
 /// Version prefix of the opaque history cursor format.
 const HISTORY_CURSOR_PREFIX: &str = "hdrc1";
 
-/// Encodes an opaque history cursor from a pane identity and the pane output
-/// byte sequence captured with the snapshot. Clients must treat the value as
-/// opaque; only the server interprets it.
-pub fn encode_history_cursor(pane_id: &str, sequence: u64) -> String {
+/// Server-side identity of a position in a pane stream's history.
+///
+/// A cursor names the pane, the pane output byte sequence captured with the
+/// `stream.open` snapshot, the open stream serving the history, and the byte
+/// offset into the server's immutable history capture up to which content is
+/// still unfetched: bytes `[0, offset)` of the capture remain to be paged.
+/// Walking `stream.history` therefore yields byte-contiguous pages — no gaps
+/// and no duplicates — because every page is a slice of one capture and each
+/// response's `next_cursor` carries the exact start offset of the page it
+/// returned.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HistoryCursor {
+    /// Public pane id the history belongs to.
+    pub pane_id: String,
+    /// Pane output byte sequence captured with the `stream.open` snapshot.
+    pub sequence: u64,
+    /// Server-allocated id of the stream holding the history capture.
+    pub stream_id: u32,
+    /// Exclusive end offset of the not-yet-fetched history prefix.
+    pub offset: u64,
+}
+
+/// Encodes an opaque history cursor. Clients must treat the value as opaque;
+/// only the server interprets it.
+pub fn encode_history_cursor(cursor: &HistoryCursor) -> String {
     use base64::Engine as _;
-    let raw = format!("{HISTORY_CURSOR_PREFIX}:{sequence}:{pane_id}");
+    let raw = format!(
+        "{HISTORY_CURSOR_PREFIX}:{}:{}:{}:{}",
+        cursor.sequence, cursor.stream_id, cursor.offset, cursor.pane_id
+    );
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(raw.as_bytes())
 }
 
-/// Decodes an opaque history cursor back into `(pane_id, sequence)`.
-// The server-side consumer arrives with the history-replay migration stage;
-// until then only tests exercise the decode half of the cursor codec.
-#[allow(dead_code)]
-pub fn decode_history_cursor(cursor: &str) -> Option<(String, u64)> {
+/// Decodes an opaque history cursor.
+pub fn decode_history_cursor(cursor: &str) -> Option<HistoryCursor> {
     use base64::Engine as _;
     let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(cursor.as_bytes())
         .ok()?;
     let raw = String::from_utf8(raw).ok()?;
     let rest = raw.strip_prefix(HISTORY_CURSOR_PREFIX)?.strip_prefix(':')?;
-    let (sequence, pane_id) = rest.split_once(':')?;
+    let (sequence, rest) = rest.split_once(':')?;
+    let (stream_id, rest) = rest.split_once(':')?;
+    let (offset, pane_id) = rest.split_once(':')?;
     let sequence = sequence.parse().ok()?;
-    (!pane_id.is_empty()).then(|| (pane_id.to_owned(), sequence))
+    let stream_id = stream_id.parse().ok()?;
+    let offset = offset.parse().ok()?;
+    (!pane_id.is_empty()).then(|| HistoryCursor {
+        pane_id: pane_id.to_owned(),
+        sequence,
+        stream_id,
+        offset,
+    })
+}
+
+/// Computes the start of the history page ending at byte `end`, honoring a
+/// hard byte budget while preferring newline-aligned page starts.
+///
+/// The returned start is always strictly below `end` (for non-empty input)
+/// and always a UTF-8 char boundary. When a newline falls inside the budget,
+/// the page starts just after the first one, so replaying a suffix of pages
+/// begins at a line start. When no newline falls inside the budget (one long
+/// soft-wrapped logical line), the page is cut at the budget boundary anyway,
+/// snapped back onto a char boundary — so a page never exceeds the budget by
+/// more than three bytes of one multi-byte character. Mid-line cuts are safe
+/// because pages are byte-contiguous slices of one immutable capture: the
+/// client reassembles the split line by replaying the next-older page
+/// directly in front of this one.
+pub fn history_page_start(history: &str, end: usize, max_bytes: usize) -> usize {
+    let end = end.min(history.len());
+    let max_bytes = max_bytes.max(1);
+    if end <= max_bytes {
+        return 0;
+    }
+    let mut candidate = end - max_bytes;
+    while candidate > 0 && !history.is_char_boundary(candidate) {
+        candidate -= 1;
+    }
+    if let Some(pos) = history[candidate..end].find('\n') {
+        let start = candidate + pos + 1;
+        if start < end {
+            return start;
+        }
+    }
+    candidate
+}
+
+/// True when the history page ending at byte `end` of the capture was cut
+/// mid-line: the byte before the boundary is not a newline and younger
+/// capture content continues the same logical line at `end`. This happens
+/// when the younger page's [`history_page_start`] hit the hard byte cap
+/// without a newline inside the budget. Clients must join such a page to the
+/// content below it without fabricating a line break. The capture end itself
+/// is never mid-line -- the last history row simply has no trailing newline.
+pub fn history_page_end_cut_mid_line(history: &str, end: usize) -> bool {
+    end > 0 && end < history.len() && history.as_bytes()[end - 1] != b'\n'
 }
 
 /// Negotiates a `session.hello` against this server's version window and
@@ -658,6 +771,19 @@ pub fn stream_scroll_request(id: &str, params: StreamScrollParams) -> serde_json
     })
 }
 
+/// Builds a `stream.history` control request for one page ending at the
+/// opaque cursor.
+pub fn stream_history_request(id: &str, cursor: &str, max_bytes: usize) -> serde_json::Value {
+    serde_json::json!({
+        "id": id,
+        "method": STREAM_HISTORY_METHOD,
+        "params": {
+            "cursor": cursor,
+            "max_bytes": max_bytes as u64,
+        },
+    })
+}
+
 /// Builds a `pane.send_bytes` control request carrying raw pane input.
 pub fn pane_send_bytes_request(id: &str, pane_id: &str, data: &[u8]) -> serde_json::Value {
     use base64::Engine as _;
@@ -749,6 +875,65 @@ pub fn parse_stream_opened(
             .and_then(|value| value.as_str())
             .unwrap_or_default()
             .to_string(),
+    })
+}
+
+/// One page of pane scrollback history returned by `stream.history`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamHistoryPage {
+    /// Stream the page belongs to.
+    pub stream_id: u32,
+    /// Unwrapped, content-only ANSI for this page. Never re-asserts terminal
+    /// modes; the `stream.open` snapshot alone carries mode/cursor state.
+    pub content: String,
+    /// Cursor for the next-older page, absent at the top of history.
+    pub next_cursor: Option<String>,
+    /// True when this page reaches the oldest retained history.
+    pub at_top: bool,
+    /// True when the page's end is a mid-line cut: the younger content
+    /// already at the client continues the same logical line, so the page
+    /// must be joined to it without inserting a line break.
+    pub end_cut_mid_line: bool,
+}
+
+/// Parses a `stream.history` control response.
+pub fn parse_stream_history(response: &serde_json::Value) -> Result<StreamHistoryPage, String> {
+    if let Some(message) = control_error_message(response) {
+        return Err(format!("stream.history rejected: {message}"));
+    }
+    let result = response
+        .get("result")
+        .ok_or_else(|| "stream.history response carries no result".to_string())?;
+    if result.get("type").and_then(|value| value.as_str()) != Some("stream_history") {
+        return Err("stream.history response is not a stream_history".to_string());
+    }
+    let stream_id = result
+        .get("stream_id")
+        .and_then(|value| value.as_u64())
+        .ok_or_else(|| "stream_history carries no stream_id".to_string())?;
+    let content = result
+        .get("content")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| "stream_history carries no content".to_string())?
+        .to_string();
+    let next_cursor = result
+        .get("next_cursor")
+        .and_then(|value| value.as_str())
+        .map(str::to_owned);
+    let at_top = result
+        .get("at_top")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(next_cursor.is_none());
+    let end_cut_mid_line = result
+        .get("end_cut_mid_line")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+    Ok(StreamHistoryPage {
+        stream_id: stream_id as u32,
+        content,
+        next_cursor,
+        at_top,
+        end_cut_mid_line,
     })
 }
 
@@ -1038,16 +1223,150 @@ mod tests {
 
     #[test]
     fn history_cursor_round_trips_and_is_opaque() {
-        let cursor = encode_history_cursor("p_2_7", 123_456_789);
-        assert!(!cursor.contains("p_2_7"), "cursor must look opaque");
-        assert_eq!(
-            decode_history_cursor(&cursor),
-            Some(("p_2_7".to_owned(), 123_456_789))
-        );
+        let cursor = HistoryCursor {
+            pane_id: "p_2_7".to_owned(),
+            sequence: 123_456_789,
+            stream_id: 42,
+            offset: 987_654,
+        };
+        let encoded = encode_history_cursor(&cursor);
+        assert!(!encoded.contains("p_2_7"), "cursor must look opaque");
+        assert_eq!(decode_history_cursor(&encoded), Some(cursor));
 
         assert_eq!(decode_history_cursor(""), None);
         assert_eq!(decode_history_cursor("not-base64!!"), None);
         assert_eq!(decode_history_cursor("aGVsbG8"), None);
+        // Truncated field lists never decode.
+        use base64::Engine as _;
+        let short = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b"hdrc1:1:p_1");
+        assert_eq!(decode_history_cursor(&short), None);
+    }
+
+    #[test]
+    fn history_page_start_walks_backward_newline_aligned_without_gaps() {
+        let mut history = String::new();
+        for line in 0..200 {
+            history.push_str(&format!("line {line:03}\r\n"));
+        }
+        history.push_str("final row without newline");
+
+        let mut end = history.len();
+        let mut pages = Vec::new();
+        while end > 0 {
+            let start = history_page_start(&history, end, 256);
+            assert!(start < end, "pages must make progress");
+            assert!(
+                start == 0 || history.as_bytes()[start - 1] == b'\n',
+                "page start must be newline-aligned"
+            );
+            assert!(history.is_char_boundary(start));
+            pages.push(&history[start..end]);
+            end = start;
+        }
+        assert!(pages.len() > 2, "budget must actually split the history");
+
+        // Reassembling the backward walk yields the exact original bytes:
+        // no gaps, no duplicates.
+        let rejoined: String = pages.iter().rev().copied().collect();
+        assert_eq!(rejoined, history);
+    }
+
+    #[test]
+    fn history_page_start_handles_budget_and_unaligned_edges() {
+        // Whole history inside the budget collapses to one page.
+        assert_eq!(history_page_start("a\r\nb", 4, 64), 0);
+        // A single line larger than the budget is cut at the budget boundary
+        // instead of growing without bound to the previous line start.
+        let history = format!("first\n{}", "x".repeat(100));
+        assert_eq!(
+            history_page_start(&history, history.len(), 10),
+            history.len() - 10
+        );
+        // No newline anywhere: still a hard byte cap per page.
+        let solid = "y".repeat(100);
+        assert_eq!(
+            history_page_start(&solid, solid.len(), 10),
+            solid.len() - 10
+        );
+        // Multi-byte characters at the budget edge stay on char boundaries.
+        let emoji = format!("top\n{}\nbottom", "👨‍👩‍👧".repeat(20));
+        let start = history_page_start(&emoji, emoji.len(), 8);
+        assert!(emoji.is_char_boundary(start));
+    }
+
+    #[test]
+    fn history_page_start_hard_caps_newline_free_pages_without_gaps() {
+        // A single soft-wrapped logical line far larger than the budget:
+        // pages must stay near the budget and reassemble exactly.
+        let history = format!("{}🌍🌍🌍", "z".repeat(40_000));
+        let budget = 4 * 1024;
+        let mut end = history.len();
+        let mut pages = Vec::new();
+        while end > 0 {
+            let start = history_page_start(&history, end, budget);
+            assert!(start < end, "pages must make progress");
+            assert!(history.is_char_boundary(start));
+            // A char-boundary snap may exceed the budget by at most three
+            // bytes of one multi-byte character.
+            assert!(
+                end - start <= budget + 3,
+                "page {} exceeds cap",
+                end - start
+            );
+            pages.push(&history[start..end]);
+            end = start;
+        }
+        assert!(pages.len() > 2, "budget must actually split the history");
+        let rejoined: String = pages.iter().rev().copied().collect();
+        assert_eq!(rejoined, history);
+    }
+
+    #[test]
+    fn history_page_end_cut_mid_line_contract() {
+        let history = "aaa\nbbb\nccc";
+        // The capture end is never a mid-line cut: the last row simply has
+        // no trailing newline.
+        assert!(!history_page_end_cut_mid_line(history, history.len()));
+        // A newline-aligned interior boundary is not a cut.
+        assert!(!history_page_end_cut_mid_line(history, 4));
+        assert!(!history_page_end_cut_mid_line(history, 8));
+        // An interior boundary inside a line is a cut.
+        assert!(history_page_end_cut_mid_line(history, 2));
+        assert!(history_page_end_cut_mid_line(history, 9));
+        // Degenerate boundaries are not cuts.
+        assert!(!history_page_end_cut_mid_line(history, 0));
+        assert!(!history_page_end_cut_mid_line("", 0));
+    }
+
+    #[test]
+    fn served_page_cap_bounds_worst_case_encoded_response() {
+        // ESC escapes to a six-byte `\u001b` in JSON, the worst-case string
+        // expansion. A full served page of ESC bytes plus a maximal cursor
+        // must still encode inside the frame payload limit.
+        let content = "\u{1b}".repeat(HISTORY_PAGE_SERVED_MAX_BYTES);
+        let cursor = encode_history_cursor(&HistoryCursor {
+            pane_id: "p_18446744073709551615".to_owned(),
+            sequence: u64::MAX,
+            stream_id: u32::MAX,
+            offset: u64::MAX,
+        });
+        let response = serde_json::json!({
+            "id": "history-worst-case",
+            "result": {
+                "type": "stream_history",
+                "stream_id": u32::MAX,
+                "content": content,
+                "next_cursor": cursor,
+                "at_top": false,
+            },
+        });
+        let encoded = serde_json::to_vec(&response).expect("encodable response");
+        assert!(
+            encoded.len() <= MAX_FRAME_PAYLOAD,
+            "worst-case response {} exceeds frame limit {}",
+            encoded.len(),
+            MAX_FRAME_PAYLOAD
+        );
     }
 
     #[test]
@@ -1071,6 +1390,15 @@ mod tests {
         let close: StreamCloseParams =
             serde_json::from_value(serde_json::json!({"stream_id": 7})).unwrap();
         assert_eq!(close.stream_id, 7);
+
+        let history: StreamHistoryParams =
+            serde_json::from_value(serde_json::json!({"cursor": "abc"})).unwrap();
+        assert_eq!(history.cursor, "abc");
+        assert_eq!(history.max_bytes, None);
+        let history: StreamHistoryParams =
+            serde_json::from_value(serde_json::json!({"cursor": "abc", "max_bytes": 1024}))
+                .unwrap();
+        assert_eq!(history.max_bytes, Some(1024));
 
         let send: PaneSendBytesControlParams =
             serde_json::from_value(serde_json::json!({"pane_id": "p_1", "data_base64": "aGk="}))
@@ -1373,6 +1701,80 @@ mod tests {
             .any(|capability| capability == CAPABILITY_PANE_STREAM));
         let session = negotiate_session_hello(&params).unwrap();
         assert!(session.has_capability(CAPABILITY_PANE_STREAM));
+    }
+
+    #[test]
+    fn stream_history_request_and_response_round_trip() {
+        let request = stream_history_request("r1", "cursor-x", 1024);
+        assert_eq!(request["method"], STREAM_HISTORY_METHOD);
+        assert_eq!(request["params"]["cursor"], "cursor-x");
+        assert_eq!(request["params"]["max_bytes"], 1024);
+        let params: StreamHistoryParams =
+            serde_json::from_value(request["params"].clone()).unwrap();
+        assert_eq!(params.cursor, "cursor-x");
+        assert_eq!(params.max_bytes, Some(1024));
+
+        let page = parse_stream_history(&serde_json::json!({
+            "id": "r1",
+            "result": {
+                "type": "stream_history",
+                "stream_id": 9,
+                "content": "line\r\n",
+                "next_cursor": "older",
+                "at_top": false,
+            },
+        }))
+        .unwrap();
+        assert_eq!(
+            page,
+            StreamHistoryPage {
+                stream_id: 9,
+                content: "line\r\n".to_owned(),
+                next_cursor: Some("older".to_owned()),
+                at_top: false,
+                // Absent on the wire decodes as a newline-aligned boundary.
+                end_cut_mid_line: false,
+            }
+        );
+
+        let cut = parse_stream_history(&serde_json::json!({
+            "id": "r1b",
+            "result": {
+                "type": "stream_history",
+                "stream_id": 9,
+                "content": "partial line tail",
+                "next_cursor": "older",
+                "at_top": false,
+                "end_cut_mid_line": true,
+            },
+        }))
+        .unwrap();
+        assert!(cut.end_cut_mid_line);
+
+        let top = parse_stream_history(&serde_json::json!({
+            "id": "r2",
+            "result": {
+                "type": "stream_history",
+                "stream_id": 9,
+                "content": "",
+                "next_cursor": null,
+                "at_top": true,
+            },
+        }))
+        .unwrap();
+        assert!(top.at_top);
+        assert!(top.next_cursor.is_none());
+
+        assert!(parse_stream_history(&serde_json::json!({
+            "id": "r3",
+            "error": {"code": "invalid_cursor", "message": "stale"},
+        }))
+        .is_err());
+        assert!(parse_stream_history(&serde_json::json!({
+            "id": "r4",
+            "result": {"type": "pong"},
+        }))
+        .is_err());
     }
 
     #[test]

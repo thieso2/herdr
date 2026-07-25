@@ -1,5 +1,6 @@
 mod id;
 pub(crate) mod pane_scroll;
+pub(crate) mod replica;
 mod runtime;
 mod runtime_registry;
 pub mod state;

@@ -1591,13 +1591,20 @@ impl App {
         let Some((runtime, workspace_id)) = self.lookup_runtime(ws_idx, pane_id) else {
             return pane_not_found(id, &params.pane_id);
         };
-        let (subscription, snapshot) = runtime.subscribe_output_with_snapshot();
+        let (subscription, seed) = runtime.subscribe_output_with_snapshot();
         let sequence = subscription.sequence();
+        let history = std::sync::Arc::new(crate::pane::output_tap::PaneStreamHistory {
+            pane_id: public_pane_id.clone(),
+            sequence,
+            content: seed.history,
+        });
+        let history_len = history.content.len() as u64;
         if !crate::pane::output_tap::fulfill_pending_stream(
             params.stream_id,
             crate::pane::output_tap::PaneStreamAttachment {
                 subscription,
                 write_grant,
+                history,
             },
         ) {
             return encode_error(
@@ -1620,8 +1627,14 @@ impl App {
             }
         }
 
-        let history_cursor =
-            crate::protocol::framed::encode_history_cursor(&public_pane_id, sequence);
+        let history_cursor = crate::protocol::framed::encode_history_cursor(
+            &crate::protocol::framed::HistoryCursor {
+                pane_id: public_pane_id.clone(),
+                sequence,
+                stream_id: params.stream_id,
+                offset: history_len,
+            },
+        );
 
         encode_success(
             id,
@@ -1631,8 +1644,10 @@ impl App {
                     workspace_id,
                     stream_id: params.stream_id,
                     sequence,
-                    snapshot,
+                    snapshot: seed.snapshot,
                     history_cursor,
+                    cols: seed.cols,
+                    rows: seed.rows,
                 },
             },
         )
@@ -2351,21 +2366,31 @@ mod tests {
         // PTY tap, so the tap sequence starts at zero.
         assert_eq!(stream.sequence, 0);
         assert!(stream.snapshot.contains("line 19"));
-        assert_eq!(
-            crate::protocol::framed::decode_history_cursor(&stream.history_cursor),
-            Some((public_pane_id, stream.sequence))
-        );
+        assert!(stream.cols > 0 && stream.rows > 0);
+        let cursor = crate::protocol::framed::decode_history_cursor(&stream.history_cursor)
+            .expect("history cursor decodes");
+        assert_eq!(cursor.pane_id, public_pane_id);
+        assert_eq!(cursor.sequence, stream.sequence);
+        assert_eq!(cursor.stream_id, STREAM_ID);
 
-        // The handler deposited the live subscription for the session thread.
+        // The handler deposited the live subscription and its history
+        // capture for the session thread. History covers the scrolled-out
+        // lines only; the active screen area stays in the snapshot.
         let attachment =
             crate::pane::output_tap::claim_pending_stream(STREAM_ID).expect("subscription");
-        let subscription = attachment.subscription;
+        assert_eq!(cursor.offset, attachment.history.content.len() as u64);
+        assert!(attachment.history.content.contains("line 1"));
+        assert!(!attachment.history.content.contains("line 19"));
+        assert!(
+            !attachment.history.content.contains("\x1b[?"),
+            "history pages must never re-assert modes"
+        );
         let runtime = app
             .state
             .runtime_for_pane_in_workspace(&app.terminal_runtimes, 0, pane_id)
             .expect("runtime");
         runtime.test_process_pty_bytes(b"tail bytes");
-        assert_eq!(subscription.drain().bytes, b"tail bytes");
+        assert_eq!(attachment.subscription.drain().bytes, b"tail bytes");
     }
 
     #[tokio::test]

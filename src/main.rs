@@ -62,6 +62,10 @@ mod build_info;
 mod checksum;
 mod cli;
 mod client;
+// Consumed by the experimental pure-client run path wired in a later stage
+// of #20; until then only unit tests exercise this module.
+#[cfg_attr(not(test), allow(dead_code))]
+mod client_state;
 mod config;
 mod detect;
 mod events;

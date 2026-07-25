@@ -15,6 +15,9 @@ pub enum RemoteConnectionStateInfo {
     Offline,
     /// Disabled in the fleet config; no connection is attempted.
     Disabled,
+    /// The protocol version windows do not overlap; no automatic reconnects
+    /// until one side is upgraded.
+    Incompatible,
     /// The fleet holds no live state for this remote (for example when the
     /// config is read without a running fleet).
     Unknown,

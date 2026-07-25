@@ -8698,6 +8698,11 @@
               "type": "string"
             },
             {
+              "const": "incompatible",
+              "description": "The protocol version windows do not overlap; no automatic reconnects\nuntil one side is upgraded.",
+              "type": "string"
+            },
+            {
               "const": "unknown",
               "description": "The fleet holds no live state for this remote (for example when the\nconfig is read without a running fleet).",
               "type": "string"

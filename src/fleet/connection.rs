@@ -69,6 +69,10 @@ pub enum ConnectionState {
         retry_at: Instant,
         last_error: String,
     },
+    /// The protocol version windows do not overlap. Terminal for this
+    /// configuration: no automatic retries until a side is upgraded; a manual
+    /// reset or config change forces another attempt.
+    Incompatible { message: String },
 }
 
 /// State machine driving one remote's connection lifecycle.
@@ -125,7 +129,9 @@ impl ConnectionMachine {
         let attempt = match &self.state {
             ConnectionState::Offline { attempt, .. } => attempt.saturating_add(1),
             ConnectionState::Connecting { attempt } => *attempt,
-            ConnectionState::Connected { .. } | ConnectionState::Disabled => return,
+            ConnectionState::Connected { .. }
+            | ConnectionState::Disabled
+            | ConnectionState::Incompatible { .. } => return,
         };
         self.state = ConnectionState::Connecting { attempt };
     }
@@ -138,6 +144,18 @@ impl ConnectionMachine {
             _ => {}
         }
         self.state = ConnectionState::Connected { since: now };
+    }
+
+    /// The handshake failed because the protocol version windows do not
+    /// overlap. Terminal until a manual reset or a config change: retrying
+    /// cannot succeed while either side stays on its current version.
+    pub fn on_incompatible(&mut self, message: impl Into<String>) {
+        if matches!(self.state, ConnectionState::Disabled) {
+            return;
+        }
+        self.state = ConnectionState::Incompatible {
+            message: message.into(),
+        };
     }
 
     /// The attempt failed or a live session dropped (transport error,
@@ -157,7 +175,7 @@ impl ConnectionMachine {
                 }
             }
             ConnectionState::Offline { attempt, .. } => attempt.saturating_add(1),
-            ConnectionState::Disabled => return,
+            ConnectionState::Disabled | ConnectionState::Incompatible { .. } => return,
         };
         self.state = ConnectionState::Offline {
             attempt,
@@ -192,6 +210,8 @@ impl ConnectionMachine {
                     last_error: String::new(),
                 };
             }
+            // Incompatible stays terminal until a manual reset; the enable
+            // flag alone changes nothing about the version windows.
             (true, _) => {}
         }
     }
@@ -355,6 +375,38 @@ mod tests {
             machine.next_deadline(),
             Some(reset_at + Duration::from_secs(1))
         );
+    }
+
+    #[test]
+    fn incompatible_is_terminal_until_reset() {
+        let now = Instant::now();
+        let mut machine = machine(now);
+        machine.on_connect_started();
+        machine.on_incompatible("protocol windows do not overlap");
+        assert_eq!(
+            machine.state(),
+            &ConnectionState::Incompatible {
+                message: "protocol windows do not overlap".into()
+            }
+        );
+        // No automatic retries: never ready, no deadline, transitions inert.
+        assert!(!machine.ready_to_connect(now + Duration::from_secs(3600)));
+        assert_eq!(machine.next_deadline(), None);
+        machine.on_connect_started();
+        machine.on_disconnected(now, "noise".into(), 0.5);
+        assert!(matches!(
+            machine.state(),
+            ConnectionState::Incompatible { .. }
+        ));
+
+        // A manual reset is the escape hatch.
+        machine.on_reset(now);
+        assert!(machine.ready_to_connect(now));
+
+        // Disabled machines never become incompatible.
+        let mut disabled = ConnectionMachine::new(false, now, T);
+        disabled.on_incompatible("x");
+        assert_eq!(disabled.state(), &ConnectionState::Disabled);
     }
 
     #[test]

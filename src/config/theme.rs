@@ -46,6 +46,9 @@ pub struct CustomThemeColors {
     pub blue: Option<String>,
     pub teal: Option<String>,
     pub peach: Option<String>,
+    /// Per-remote identity hues for the fleet chip strip and sidebar
+    /// gutter, in fleet config order (index 0 is the local runtime).
+    pub remote_hues: Option<Vec<String>>,
 }
 
 /// Parse a color string into a ratatui Color.

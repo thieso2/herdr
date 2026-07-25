@@ -302,6 +302,7 @@ fn subcommand_help_explains_automation_semantics_without_a_server() {
             .env_remove("HERDR_SOCKET_PATH")
             .env_remove("HERDR_CLIENT_SOCKET_PATH")
             .env_remove("HERDR_ENV")
+            .env_remove("HERDR_STARTUP_CWD")
             .output()
             .unwrap();
         assert!(
@@ -399,6 +400,7 @@ fn completion_command_prints_zsh_script_without_session_startup() {
         .env_remove("HERDR_SOCKET_PATH")
         .env_remove("HERDR_CLIENT_SOCKET_PATH")
         .env_remove("HERDR_ENV")
+        .env_remove("HERDR_STARTUP_CWD")
         .output()
         .unwrap();
 

@@ -1100,6 +1100,15 @@ impl App {
             Method::PaneStreamOpen(params) => {
                 return self.handle_pane_stream_open(request.id, params);
             }
+            Method::PaneStreamClose(params) => {
+                return self.handle_pane_stream_close(request.id, params);
+            }
+            Method::PaneStreamResize(params) => {
+                return self.handle_pane_stream_resize(request.id, params);
+            }
+            Method::PaneStreamScroll(params) => {
+                return self.handle_pane_stream_scroll(request.id, params);
+            }
             Method::PaneSendBytes(params) => {
                 return self.handle_pane_send_bytes(request.id, params);
             }

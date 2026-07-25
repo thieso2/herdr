@@ -124,7 +124,7 @@ Direct attach streams the current rendered terminal state, then live ANSI frames
 
 Detach with `ctrl+b q`. Send a literal `ctrl+b` with `ctrl+b ctrl+b`.
 
-Only one writable direct attach client owns input and resize for a terminal. Use `--takeover` to replace an existing owner:
+Only one writable direct attach client owns input and resize for a terminal. A second attach without `--takeover` is refused and says so; use `--takeover` to replace the existing owner, which then detaches:
 
 ```bash
 herdr terminal attach term_abc123 --takeover
@@ -138,9 +138,10 @@ herdr terminal session observe w1:p1 --cols 120 --rows 40
 ```
 
 It prints newline-delimited JSON `terminal.frame` records with base64 ANSI
-bytes, then a `terminal.closed` record when the server closes the stream.
-Multiple observers can watch the same terminal without taking input, resize,
-scroll, or takeover ownership.
+bytes — the first one is a full screen snapshot, the rest are the raw output
+that followed — then a `terminal.closed` record when the server closes the
+stream. Multiple observers can watch the same terminal without taking input,
+resize, scroll, or takeover ownership.
 
 For an interactive bridge, use a writable terminal session controller:
 

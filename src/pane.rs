@@ -31,6 +31,7 @@ mod osc;
 pub(crate) mod output_tap;
 mod state;
 mod terminal;
+pub(crate) mod write_grant;
 mod xtgettcap;
 
 use self::agent_detection::{
@@ -2590,11 +2591,18 @@ impl PaneRuntime {
     /// Subscribes to this pane's raw PTY output tail and captures the visible
     /// screen as an ANSI snapshot under the tap lock, so the subscription
     /// sequence, the snapshot, and the tail are mutually consistent.
+    ///
+    /// The snapshot opens with a mode seed (see [`snapshot_mode_seed`]) so a
+    /// raw-tail client that replays it starts mode-consistent with the pane
+    /// instead of desynced until the pane's next mode change.
     pub(crate) fn subscribe_output_with_snapshot(
         &self,
     ) -> (output_tap::PaneOutputSubscription, String) {
-        self.output_tap
-            .subscribe_with_snapshot(|| self.visible_ansi())
+        self.output_tap.subscribe_with_snapshot(|| {
+            let mut snapshot = snapshot_mode_seed(self.input_state());
+            snapshot.push_str(&self.visible_ansi());
+            snapshot
+        })
     }
 
     pub fn extract_selection(&self, selection: &crate::selection::Selection) -> Option<String> {
@@ -2887,9 +2895,56 @@ impl PaneRuntime {
     }
 }
 
+/// ANSI prefix that brings a fresh terminal into the pane's current screen
+/// and cursor-key modes, for seeding raw-tail pane-stream snapshots.
+///
+/// Only modes whose desync corrupts a raw-tail attach are seeded: the
+/// alternate screen (so a later `?1049l` from the pane app balances a
+/// matching `?1049h`) and DECCKM application cursor keys (so the attach
+/// host encodes arrow keys the way the pane app expects). Mouse, paste,
+/// and focus reporting modes are deliberately not seeded — the attach
+/// client owns those on the host terminal for its own input routing.
+/// Anything richer (scroll margins, full mode replay) needs the local
+/// terminal replica and arrives with it.
+fn snapshot_mode_seed(input_state: Option<InputState>) -> String {
+    let Some(state) = input_state else {
+        return String::new();
+    };
+    let mut seed = String::new();
+    if state.alternate_screen {
+        seed.push_str("\x1b[?1049h");
+    }
+    if state.application_cursor {
+        seed.push_str("\x1b[?1h");
+    }
+    seed
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn snapshot_mode_seed_replays_screen_and_cursor_key_modes_only() {
+        assert_eq!(snapshot_mode_seed(None), "");
+
+        let mut state = InputState {
+            alternate_screen: false,
+            application_cursor: false,
+            bracketed_paste: true,
+            focus_reporting: true,
+            mouse_protocol_mode: crate::input::MouseProtocolMode::ButtonMotion,
+            mouse_protocol_encoding: crate::input::MouseProtocolEncoding::Sgr,
+            mouse_alternate_scroll: true,
+            modify_other_keys: true,
+        };
+        // Host-owned input modes (mouse, paste, focus) are never seeded.
+        assert_eq!(snapshot_mode_seed(Some(state)), "");
+
+        state.alternate_screen = true;
+        state.application_cursor = true;
+        assert_eq!(snapshot_mode_seed(Some(state)), "\x1b[?1049h\x1b[?1h");
+    }
 
     #[tokio::test]
     async fn cwd_returns_accepted_report_without_rechecking_filesystem() {

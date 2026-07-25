@@ -1,4 +1,5 @@
 mod id;
+pub(crate) mod pane_scroll;
 mod runtime;
 mod runtime_registry;
 pub mod state;

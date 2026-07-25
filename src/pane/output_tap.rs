@@ -155,10 +155,29 @@ impl PaneOutputSubscription {
 // session claims it after the response arrives. Cancelling the slot makes a
 // late fulfillment drop the subscription instead of leaking it.
 
-static PENDING_STREAM_SUBSCRIPTIONS: OnceLock<Mutex<HashMap<u32, Option<PaneOutputSubscription>>>> =
+/// What the app thread hands back for one opened pane stream: the live
+/// output subscription plus, for write-mode streams, the pane write grant the
+/// session holds for as long as the stream is open.
+pub(crate) struct PaneStreamAttachment {
+    pub(crate) subscription: PaneOutputSubscription,
+    pub(crate) write_grant: Option<crate::pane::write_grant::WriteGrant>,
+}
+
+impl PaneStreamAttachment {
+    /// Read-mode attachment: output tail only.
+    #[cfg(test)]
+    pub(crate) fn read_only(subscription: PaneOutputSubscription) -> Self {
+        Self {
+            subscription,
+            write_grant: None,
+        }
+    }
+}
+
+static PENDING_STREAM_SUBSCRIPTIONS: OnceLock<Mutex<HashMap<u32, Option<PaneStreamAttachment>>>> =
     OnceLock::new();
 
-fn pending_streams() -> &'static Mutex<HashMap<u32, Option<PaneOutputSubscription>>> {
+fn pending_streams() -> &'static Mutex<HashMap<u32, Option<PaneStreamAttachment>>> {
     PENDING_STREAM_SUBSCRIPTIONS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -167,21 +186,22 @@ pub(crate) fn register_pending_stream(stream_id: u32) {
     lock_ignoring_poison(pending_streams()).insert(stream_id, None);
 }
 
-/// Fulfills a registered slot with a live subscription. Returns false (and
-/// drops the subscription) when the slot was cancelled or never registered.
-pub(crate) fn fulfill_pending_stream(stream_id: u32, subscription: PaneOutputSubscription) -> bool {
+/// Fulfills a registered slot with a live attachment. Returns false (and
+/// drops the attachment, releasing any write grant it carries) when the slot
+/// was cancelled or never registered.
+pub(crate) fn fulfill_pending_stream(stream_id: u32, attachment: PaneStreamAttachment) -> bool {
     let mut pending = lock_ignoring_poison(pending_streams());
     match pending.get_mut(&stream_id) {
         Some(slot) => {
-            *slot = Some(subscription);
+            *slot = Some(attachment);
             true
         }
         None => false,
     }
 }
 
-/// Claims a fulfilled subscription, removing the slot.
-pub(crate) fn claim_pending_stream(stream_id: u32) -> Option<PaneOutputSubscription> {
+/// Claims a fulfilled attachment, removing the slot.
+pub(crate) fn claim_pending_stream(stream_id: u32) -> Option<PaneStreamAttachment> {
     lock_ignoring_poison(pending_streams()).remove(&stream_id)?
 }
 
@@ -301,23 +321,32 @@ mod tests {
 
         // Fulfill without registration is rejected.
         let (orphan, ()) = tap.subscribe_with_snapshot(|| ());
-        assert!(!fulfill_pending_stream(u32::MAX, orphan));
+        assert!(!fulfill_pending_stream(
+            u32::MAX,
+            PaneStreamAttachment::read_only(orphan)
+        ));
         assert!(claim_pending_stream(u32::MAX).is_none());
 
         // Normal flow: register, fulfill, claim.
         register_pending_stream(u32::MAX - 1);
         let (subscription, ()) = tap.subscribe_with_snapshot(|| ());
-        assert!(fulfill_pending_stream(u32::MAX - 1, subscription));
+        assert!(fulfill_pending_stream(
+            u32::MAX - 1,
+            PaneStreamAttachment::read_only(subscription)
+        ));
         let claimed = claim_pending_stream(u32::MAX - 1).expect("fulfilled slot");
         tap.publish_with(b"z", || ());
-        assert_eq!(claimed.drain().bytes, b"z");
+        assert_eq!(claimed.subscription.drain().bytes, b"z");
         assert!(claim_pending_stream(u32::MAX - 1).is_none());
 
         // Cancelled slot rejects late fulfillment.
         register_pending_stream(u32::MAX - 2);
         cancel_pending_stream(u32::MAX - 2);
         let (late, ()) = tap.subscribe_with_snapshot(|| ());
-        assert!(!fulfill_pending_stream(u32::MAX - 2, late));
+        assert!(!fulfill_pending_stream(
+            u32::MAX - 2,
+            PaneStreamAttachment::read_only(late)
+        ));
 
         // Registered but unfulfilled slot claims as empty.
         register_pending_stream(u32::MAX - 3);

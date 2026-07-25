@@ -86,6 +86,13 @@ pub const STREAM_OPEN_METHOD: &str = "stream.open";
 /// Control-plane method closing an open pane output stream.
 pub const STREAM_CLOSE_METHOD: &str = "stream.close";
 
+/// Control-plane method resizing the pane behind a write-mode stream.
+pub const STREAM_RESIZE_METHOD: &str = "stream.resize";
+
+/// Control-plane method scrolling the pane behind a write-mode stream with
+/// the pane's own wheel and page-key routing rules.
+pub const STREAM_SCROLL_METHOD: &str = "stream.scroll";
+
 /// Control-plane method writing raw bytes to a pane PTY.
 pub const PANE_SEND_BYTES_METHOD: &str = "pane.send_bytes";
 
@@ -103,6 +110,14 @@ pub const WINDOW_TITLE_CHANGED_EVENT: &str = "window_title.changed";
 /// Event name sent when the server closes an open stream, for example when
 /// the pane behind it goes away.
 pub const STREAM_CLOSED_EVENT: &str = "stream.closed";
+
+/// Event name sent on a write-mode stream whose write grant another client
+/// took over.
+pub const STREAM_REVOKED_EVENT: &str = "stream.revoked";
+
+/// Error code answering a `stream.open` that asked for write mode without
+/// takeover while another live stream holds the pane's write grant.
+pub const PANE_WRITE_LOCKED_ERROR: &str = "pane_write_locked";
 
 // ---------------------------------------------------------------------------
 // Frame codec
@@ -339,11 +354,92 @@ impl NegotiatedSession {
 // Pane-stream control vocabulary
 // ---------------------------------------------------------------------------
 
+/// Access mode of a pane stream. Read streams are unlimited per pane; a
+/// single write stream at a time holds the pane's write grant.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StreamMode {
+    /// Output tail only; no write grant, no pane geometry ownership.
+    #[default]
+    Read,
+    /// Output tail plus the pane write grant: input, resize, and scroll.
+    Write,
+}
+
+impl StreamMode {
+    pub fn is_write(self) -> bool {
+        matches!(self, StreamMode::Write)
+    }
+}
+
 /// Parameters of the `stream.open` control request.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StreamOpenParams {
-    /// Public pane id whose output tail the stream should carry.
+    /// Pane target the stream should carry: a public pane id, a terminal id,
+    /// or an agent name.
     pub pane_id: String,
+    /// Requested access mode. Defaults to read.
+    #[serde(default)]
+    pub mode: StreamMode,
+    /// Whether a write-mode open may revoke a live write grant.
+    #[serde(default)]
+    pub takeover: bool,
+    /// Client viewport width applied to the pane while the write grant is
+    /// held.
+    #[serde(default)]
+    pub cols: Option<u16>,
+    /// Client viewport height applied to the pane while the write grant is
+    /// held.
+    #[serde(default)]
+    pub rows: Option<u16>,
+}
+
+/// Scroll direction of a `stream.scroll` request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StreamScrollDirection {
+    Up,
+    Down,
+}
+
+/// What produced a `stream.scroll` request. The pane routes wheel and page
+/// keys differently depending on the program running in it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StreamScrollSource {
+    #[default]
+    Wheel,
+    PageKey,
+}
+
+/// Parameters of the `stream.resize` control request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StreamResizeParams {
+    /// Server-allocated id of the write-mode stream.
+    pub stream_id: u32,
+    pub cols: u16,
+    pub rows: u16,
+    #[serde(default)]
+    pub cell_width_px: u32,
+    #[serde(default)]
+    pub cell_height_px: u32,
+}
+
+/// Parameters of the `stream.scroll` control request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StreamScrollParams {
+    /// Server-allocated id of the write-mode stream.
+    pub stream_id: u32,
+    pub direction: StreamScrollDirection,
+    pub lines: u16,
+    #[serde(default)]
+    pub source: StreamScrollSource,
+    #[serde(default)]
+    pub column: Option<u16>,
+    #[serde(default)]
+    pub row: Option<u16>,
+    #[serde(default)]
+    pub modifiers: u8,
 }
 
 /// Parameters of the `stream.close` control request.
@@ -475,7 +571,7 @@ pub(crate) fn negotiate_capabilities(client: &[String], server: &[&str]) -> Vec<
 // ---------------------------------------------------------------------------
 
 /// Capability flags a framed client advertises during `session.hello`.
-pub const CLIENT_CAPABILITIES: &[&str] = &[];
+pub const CLIENT_CAPABILITIES: &[&str] = &[CAPABILITY_PANE_STREAM];
 
 /// Builds the opening `session.hello` control request for this build's
 /// version window and client capabilities.
@@ -497,6 +593,162 @@ pub fn ping_request(id: &str) -> serde_json::Value {
         "id": id,
         "method": PING_METHOD,
         "params": {},
+    })
+}
+
+/// Builds a `stream.open` control request.
+pub fn stream_open_request(
+    id: &str,
+    pane_id: &str,
+    mode: StreamMode,
+    takeover: bool,
+    cols: Option<u16>,
+    rows: Option<u16>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "id": id,
+        "method": STREAM_OPEN_METHOD,
+        "params": StreamOpenParams {
+            pane_id: pane_id.to_owned(),
+            mode,
+            takeover,
+            cols,
+            rows,
+        },
+    })
+}
+
+/// Builds a `stream.close` control request.
+pub fn stream_close_request(id: &str, stream_id: u32) -> serde_json::Value {
+    serde_json::json!({
+        "id": id,
+        "method": STREAM_CLOSE_METHOD,
+        "params": StreamCloseParams { stream_id },
+    })
+}
+
+/// Builds a `stream.resize` control request.
+pub fn stream_resize_request(
+    id: &str,
+    stream_id: u32,
+    cols: u16,
+    rows: u16,
+    cell_width_px: u32,
+    cell_height_px: u32,
+) -> serde_json::Value {
+    serde_json::json!({
+        "id": id,
+        "method": STREAM_RESIZE_METHOD,
+        "params": StreamResizeParams {
+            stream_id,
+            cols,
+            rows,
+            cell_width_px,
+            cell_height_px,
+        },
+    })
+}
+
+/// Builds a `stream.scroll` control request.
+pub fn stream_scroll_request(id: &str, params: StreamScrollParams) -> serde_json::Value {
+    serde_json::json!({
+        "id": id,
+        "method": STREAM_SCROLL_METHOD,
+        "params": params,
+    })
+}
+
+/// Builds a `pane.send_bytes` control request carrying raw pane input.
+pub fn pane_send_bytes_request(id: &str, pane_id: &str, data: &[u8]) -> serde_json::Value {
+    use base64::Engine as _;
+    serde_json::json!({
+        "id": id,
+        "method": PANE_SEND_BYTES_METHOD,
+        "params": PaneSendBytesControlParams {
+            pane_id: pane_id.to_owned(),
+            data_base64: base64::engine::general_purpose::STANDARD.encode(data),
+        },
+    })
+}
+
+/// A control-plane error answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ControlError {
+    pub code: String,
+    pub message: String,
+    pub data: Option<serde_json::Value>,
+}
+
+/// Extracts the error body of a control response, if it carries one.
+pub fn control_error(response: &serde_json::Value) -> Option<ControlError> {
+    let error = response.get("error")?;
+    Some(ControlError {
+        code: error
+            .get("code")
+            .and_then(|value| value.as_str())
+            .unwrap_or("unknown_error")
+            .to_string(),
+        message: error
+            .get("message")
+            .and_then(|value| value.as_str())
+            .unwrap_or("unknown error")
+            .to_string(),
+        data: error.get("data").cloned(),
+    })
+}
+
+/// The server's answer to a successful `stream.open`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamOpened {
+    /// Public pane id the server resolved the target to.
+    pub pane_id: String,
+    pub stream_id: u32,
+    /// Pane output byte sequence the snapshot was captured at.
+    pub sequence: u64,
+    /// ANSI snapshot of the pane screen at the subscription point.
+    pub snapshot: String,
+    pub history_cursor: String,
+}
+
+/// Parses a `stream.open` response into the opened stream, or the server's
+/// structured rejection.
+pub fn parse_stream_opened(
+    response: &serde_json::Value,
+) -> Result<StreamOpened, Option<ControlError>> {
+    if let Some(error) = control_error(response) {
+        return Err(Some(error));
+    }
+    let stream = response
+        .get("result")
+        .filter(|result| {
+            result.get("type").and_then(|value| value.as_str()) == Some("pane_stream_opened")
+        })
+        .and_then(|result| result.get("stream"))
+        .ok_or(None)?;
+    Ok(StreamOpened {
+        pane_id: stream
+            .get("pane_id")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default()
+            .to_string(),
+        stream_id: stream
+            .get("stream_id")
+            .and_then(|value| value.as_u64())
+            .ok_or(None)? as u32,
+        sequence: stream
+            .get("sequence")
+            .and_then(|value| value.as_u64())
+            .unwrap_or_default(),
+        snapshot: stream
+            .get("snapshot")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default()
+            .to_string(),
+        history_cursor: stream
+            .get("history_cursor")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default()
+            .to_string(),
     })
 }
 
@@ -988,6 +1240,139 @@ mod tests {
             "result": {"type": "session.welcome"},
         }))
         .is_err());
+    }
+
+    #[test]
+    fn stream_open_params_default_to_a_read_stream() {
+        let params: StreamOpenParams =
+            serde_json::from_value(serde_json::json!({"pane_id": "p_1"})).unwrap();
+        assert_eq!(params.mode, StreamMode::Read);
+        assert!(!params.mode.is_write());
+        assert!(!params.takeover);
+        assert_eq!(params.cols, None);
+        assert_eq!(params.rows, None);
+
+        let write: StreamOpenParams = serde_json::from_value(serde_json::json!({
+            "pane_id": "p_1",
+            "mode": "write",
+            "takeover": true,
+            "cols": 100,
+            "rows": 30,
+        }))
+        .unwrap();
+        assert!(write.mode.is_write());
+        assert!(write.takeover);
+        assert_eq!(write.cols, Some(100));
+        assert_eq!(write.rows, Some(30));
+    }
+
+    #[test]
+    fn stream_requests_decode_with_the_server_side_params_types() {
+        let open = stream_open_request("o1", "term_a", StreamMode::Write, true, Some(80), Some(24));
+        assert_eq!(open["method"], STREAM_OPEN_METHOD);
+        let params: StreamOpenParams = serde_json::from_value(open["params"].clone()).unwrap();
+        assert_eq!(params.pane_id, "term_a");
+        assert!(params.mode.is_write());
+        assert!(params.takeover);
+
+        let close = stream_close_request("c1", 7);
+        assert_eq!(close["method"], STREAM_CLOSE_METHOD);
+        let params: StreamCloseParams = serde_json::from_value(close["params"].clone()).unwrap();
+        assert_eq!(params.stream_id, 7);
+
+        let resize = stream_resize_request("r1", 7, 100, 30, 8, 16);
+        assert_eq!(resize["method"], STREAM_RESIZE_METHOD);
+        let params: StreamResizeParams = serde_json::from_value(resize["params"].clone()).unwrap();
+        assert_eq!((params.cols, params.rows), (100, 30));
+        assert_eq!((params.cell_width_px, params.cell_height_px), (8, 16));
+
+        let scroll = stream_scroll_request(
+            "s1",
+            StreamScrollParams {
+                stream_id: 7,
+                direction: StreamScrollDirection::Up,
+                lines: 3,
+                source: StreamScrollSource::PageKey,
+                column: Some(4),
+                row: Some(5),
+                modifiers: 2,
+            },
+        );
+        assert_eq!(scroll["method"], STREAM_SCROLL_METHOD);
+        let params: StreamScrollParams = serde_json::from_value(scroll["params"].clone()).unwrap();
+        assert_eq!(params.direction, StreamScrollDirection::Up);
+        assert_eq!(params.source, StreamScrollSource::PageKey);
+        assert_eq!(params.lines, 3);
+
+        let input = pane_send_bytes_request("i1", "p_1", b"hi");
+        assert_eq!(input["method"], PANE_SEND_BYTES_METHOD);
+        let params: PaneSendBytesControlParams =
+            serde_json::from_value(input["params"].clone()).unwrap();
+        assert_eq!(params.data_base64, "aGk=");
+    }
+
+    #[test]
+    fn parse_stream_opened_reads_the_server_result_shape() {
+        let opened = parse_stream_opened(&serde_json::json!({
+            "id": "o1",
+            "result": {
+                "type": "pane_stream_opened",
+                "stream": {
+                    "pane_id": "p_1_1",
+                    "workspace_id": "ws_1",
+                    "stream_id": 12,
+                    "sequence": 40,
+                    "snapshot": "screen",
+                    "history_cursor": "cursor",
+                },
+            },
+        }))
+        .unwrap();
+        assert_eq!(
+            opened,
+            StreamOpened {
+                pane_id: "p_1_1".to_string(),
+                stream_id: 12,
+                sequence: 40,
+                snapshot: "screen".to_string(),
+                history_cursor: "cursor".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_stream_opened_surfaces_a_refused_write_grant() {
+        let error = parse_stream_opened(&serde_json::json!({
+            "id": "o1",
+            "error": {
+                "code": PANE_WRITE_LOCKED_ERROR,
+                "message": "pane p_1_1 already has a writable stream (stream 3); retry with takeover",
+            },
+        }))
+        .unwrap_err()
+        .expect("structured error");
+        assert_eq!(error.code, PANE_WRITE_LOCKED_ERROR);
+        assert!(error.message.contains("retry with takeover"));
+
+        // A non-stream answer is a protocol problem, not a server rejection.
+        assert!(parse_stream_opened(&serde_json::json!({
+            "id": "o1",
+            "result": {"type": "pong"},
+        }))
+        .unwrap_err()
+        .is_none());
+    }
+
+    #[test]
+    fn client_capabilities_request_pane_streams() {
+        let hello = session_hello_request("h1");
+        let params: SessionHelloParams = serde_json::from_value(hello["params"].clone()).unwrap();
+        assert!(params
+            .capabilities
+            .iter()
+            .any(|capability| capability == CAPABILITY_PANE_STREAM));
+        let session = negotiate_session_hello(&params).unwrap();
+        assert!(session.has_capability(CAPABILITY_PANE_STREAM));
     }
 
     #[test]

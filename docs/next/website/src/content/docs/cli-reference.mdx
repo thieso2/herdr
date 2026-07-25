@@ -334,6 +334,14 @@ terminal, or agent target. It prints newline-delimited JSON `terminal.frame`
 records with base64-encoded ANSI bytes, then a `terminal.closed` record when
 the server closes the stream. Multiple observers can watch the same terminal
 without taking input, resize, scroll, or takeover authority.
+
+Attach and terminal sessions stream the pane's own output: the first
+`terminal.frame` record carries `full: true` with a snapshot of the current
+screen, and later records carry the raw output that followed it. Writable
+attach is exclusive per pane. A second writer without `--takeover` is refused
+with a `pane_write_locked` error instead of losing its connection, and
+`--takeover` revokes the previous writer, which detaches with
+`terminal attach taken over`.
 `terminal title clear` restores Herdr's default outer terminal window title.
 
 ## Output waits

@@ -33,15 +33,18 @@ use crate::ipc::{
 use crate::pane::output_tap::{
     cancel_pending_stream, claim_pending_stream, register_pending_stream, PaneOutputSubscription,
 };
+use crate::pane::write_grant::WriteGrant;
 use crate::protocol::framed::{
-    decode_frame_header, negotiate_session_hello, write_frame, Frame, FrameType, FramedCodecError,
-    HelloError, HelloRemedy, NegotiatedSession, PanePasteImageControlParams,
-    PaneSendBytesControlParams, SessionHelloParams, StreamCloseParams, StreamOpenParams,
-    CAPABILITY_NOTIFICATION, CAPABILITY_PANE_STREAM, CAPABILITY_PASTE_IMAGE,
+    decode_frame_header, negotiate_session_hello, parse_stream_opened, write_frame, Frame,
+    FrameType, FramedCodecError, HelloError, HelloRemedy, NegotiatedSession,
+    PanePasteImageControlParams, PaneSendBytesControlParams, SessionHelloParams, StreamCloseParams,
+    StreamOpenParams, StreamResizeParams, StreamScrollDirection, StreamScrollParams,
+    StreamScrollSource, CAPABILITY_NOTIFICATION, CAPABILITY_PANE_STREAM, CAPABILITY_PASTE_IMAGE,
     CAPABILITY_WINDOW_TITLE, CONTROL_STREAM_ID, FRAMED_PROTOCOL_MIN_SUPPORTED,
     FRAMED_PROTOCOL_VERSION, FRAME_HEADER_BYTES, NOTIFICATION_POSTED_EVENT,
     PANE_PASTE_IMAGE_METHOD, PANE_SEND_BYTES_METHOD, PING_METHOD, SESSION_HELLO_METHOD,
-    STREAM_CLOSED_EVENT, STREAM_CLOSE_METHOD, STREAM_OPEN_METHOD, WINDOW_TITLE_CHANGED_EVENT,
+    STREAM_CLOSED_EVENT, STREAM_CLOSE_METHOD, STREAM_OPEN_METHOD, STREAM_RESIZE_METHOD,
+    STREAM_REVOKED_EVENT, STREAM_SCROLL_METHOD, WINDOW_TITLE_CHANGED_EVENT,
 };
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -57,9 +60,13 @@ const STREAM_POLL_INTERVAL: Duration = Duration::from_millis(2);
 /// into the 32-bit wire id space; allocation fails once the wire space is
 /// exhausted instead of reusing earlier ids. Never yields
 /// `CONTROL_STREAM_ID` (the counter starts at 1).
+///
+/// The legacy terminal-attach path draws from this same allocator when it
+/// bridges onto the pane write-grant table, so grant holder ids never
+/// collide across the two attach paths.
 static NEXT_STREAM_ID: AtomicU64 = AtomicU64::new(1);
 
-fn allocate_stream_id() -> Option<u32> {
+pub(crate) fn allocate_stream_id() -> Option<u32> {
     u32::try_from(NEXT_STREAM_ID.fetch_add(1, Ordering::Relaxed)).ok()
 }
 
@@ -72,6 +79,17 @@ struct ControlRequest {
     method: String,
     #[serde(default)]
     params: serde_json::Value,
+}
+
+/// One open pane stream on this session.
+struct OpenStream {
+    /// Live output tail.
+    subscription: PaneOutputSubscription,
+    /// Public pane id the server resolved the open target to.
+    pane_id: String,
+    /// Write grant held for as long as a write-mode stream is open. Dropping
+    /// it releases the pane for the next writer.
+    write_grant: Option<WriteGrant>,
 }
 
 enum SessionEnd {
@@ -128,33 +146,71 @@ pub(super) fn serve(
         "framed session negotiated"
     );
 
-    // Open pane output streams, keyed by server-allocated stream id. Dropping
-    // a subscription detaches it from the pane tap.
-    let mut streams: HashMap<u32, PaneOutputSubscription> = HashMap::new();
+    // Open pane streams, keyed by server-allocated stream id. Dropping an
+    // entry detaches it from the pane tap and releases any write grant.
+    let mut streams: HashMap<u32, OpenStream> = HashMap::new();
+    let end = run_negotiated_session(
+        &mut stream,
+        &mut reader,
+        &session,
+        &mut streams,
+        api_tx,
+        event_hub,
+        running,
+    );
+
+    // Every stream the session still owns goes away with the connection —
+    // on clean session ends and on io-error exits alike, so no exit path can
+    // leak the pane geometry lock a write grant owned.
+    for (stream_id, open) in streams.drain() {
+        release_write_stream(api_tx, stream_id, open);
+    }
+
+    match end? {
+        SessionEnd::PeerClosed => debug!("framed session closed by client"),
+        SessionEnd::ServerStopped => debug!("framed session closed on server stop"),
+        SessionEnd::ProtocolError => debug!("framed session closed after protocol error"),
+        SessionEnd::Overloaded => debug!("framed session closed after output overload"),
+    }
+    Ok(())
+}
+
+/// Negotiated session loop: control-plane requests, output pumping, and
+/// event broadcasts until disconnect. Streams opened along the way stay in
+/// `streams`, which the caller releases on every exit path, including `?`
+/// io-error propagation out of this loop.
+fn run_negotiated_session(
+    stream: &mut LocalStream,
+    reader: &mut FrameReader,
+    session: &NegotiatedSession,
+    streams: &mut HashMap<u32, OpenStream>,
+    api_tx: &ApiRequestSender,
+    event_hub: &EventHub,
+    running: &Arc<AtomicBool>,
+) -> io::Result<SessionEnd> {
     // Events published before the handshake are history, not session traffic.
     let mut event_cursor = event_hub.current_sequence();
 
-    // Negotiated session loop: control-plane requests, output pumping, and
-    // event broadcasts until disconnect.
-    let end = loop {
-        match reader.poll_frame(&mut stream)? {
-            PollFrame::Closed => break SessionEnd::PeerClosed,
+    loop {
+        match reader.poll_frame(stream)? {
+            PollFrame::Closed => return Ok(SessionEnd::PeerClosed),
             PollFrame::Pending => {
                 if !running.load(Ordering::Relaxed) {
-                    break SessionEnd::ServerStopped;
+                    return Ok(SessionEnd::ServerStopped);
                 }
                 match pump_session_output(
-                    &mut stream,
-                    &session,
-                    &mut streams,
+                    stream,
+                    session,
+                    streams,
+                    api_tx,
                     event_hub,
                     &mut event_cursor,
                 )? {
                     PumpOutcome::Continue => {}
-                    PumpOutcome::PeerClosed => break SessionEnd::PeerClosed,
+                    PumpOutcome::PeerClosed => return Ok(SessionEnd::PeerClosed),
                     PumpOutcome::Overloaded(stream_id) => {
                         let _ = write_control_allow_disconnect(
-                            &mut stream,
+                            stream,
                             &error_response(
                                 "",
                                 "stream_overloaded",
@@ -165,7 +221,7 @@ pub(super) fn serve(
                                 Some(serde_json::json!({ "stream_id": stream_id })),
                             ),
                         )?;
-                        break SessionEnd::Overloaded;
+                        return Ok(SessionEnd::Overloaded);
                     }
                 }
                 std::thread::sleep(if streams.is_empty() {
@@ -180,7 +236,7 @@ pub(super) fn serve(
                     // input is a control-plane method. A client DATA frame
                     // indicates a desynchronized client.
                     let sent = write_control_allow_disconnect(
-                        &mut stream,
+                        stream,
                         &error_response(
                             "",
                             "unknown_stream",
@@ -193,27 +249,18 @@ pub(super) fn serve(
                         ),
                     )?;
                     if !sent {
-                        break SessionEnd::PeerClosed;
+                        return Ok(SessionEnd::PeerClosed);
                     }
-                    break SessionEnd::ProtocolError;
+                    return Ok(SessionEnd::ProtocolError);
                 }
                 FrameType::Control => {
-                    if !handle_control_request(&mut stream, &session, &frame, api_tx, &mut streams)?
-                    {
-                        break SessionEnd::PeerClosed;
+                    if !handle_control_request(stream, session, &frame, api_tx, streams)? {
+                        return Ok(SessionEnd::PeerClosed);
                     }
                 }
             },
         }
-    };
-
-    match end {
-        SessionEnd::PeerClosed => debug!("framed session closed by client"),
-        SessionEnd::ServerStopped => debug!("framed session closed on server stop"),
-        SessionEnd::ProtocolError => debug!("framed session closed after protocol error"),
-        SessionEnd::Overloaded => debug!("framed session closed after output overload"),
     }
-    Ok(())
 }
 
 /// Drains open stream subscriptions into DATA frames and broadcasts
@@ -221,13 +268,15 @@ pub(super) fn serve(
 fn pump_session_output(
     stream: &mut LocalStream,
     session: &NegotiatedSession,
-    streams: &mut HashMap<u32, PaneOutputSubscription>,
+    streams: &mut HashMap<u32, OpenStream>,
+    api_tx: &ApiRequestSender,
     event_hub: &EventHub,
     event_cursor: &mut u64,
 ) -> io::Result<PumpOutcome> {
     let mut closed_streams = Vec::new();
-    for (&stream_id, subscription) in streams.iter() {
-        let drain = subscription.drain();
+    let mut revoked_streams = Vec::new();
+    for (&stream_id, open) in streams.iter() {
+        let drain = open.subscription.drain();
         if drain.overloaded {
             return Ok(PumpOutcome::Overloaded(stream_id));
         }
@@ -238,15 +287,40 @@ fn pump_session_output(
         }
         if drain.closed {
             closed_streams.push(stream_id);
+        } else if open
+            .write_grant
+            .as_ref()
+            .is_some_and(WriteGrant::is_revoked)
+        {
+            revoked_streams.push(stream_id);
         }
     }
     for stream_id in closed_streams {
-        streams.remove(&stream_id);
+        if let Some(open) = streams.remove(&stream_id) {
+            release_write_stream(api_tx, stream_id, open);
+        }
         let sent = write_control_allow_disconnect(
             stream,
             &serde_json::json!({
                 "event": STREAM_CLOSED_EVENT,
                 "data": { "stream_id": stream_id, "reason": "pane_closed" },
+            }),
+        )?;
+        if !sent {
+            return Ok(PumpOutcome::PeerClosed);
+        }
+    }
+    // Another client took the pane's write grant over. Only this stream ends;
+    // the connection and its other streams stay up.
+    for stream_id in revoked_streams {
+        if let Some(open) = streams.remove(&stream_id) {
+            release_write_stream(api_tx, stream_id, open);
+        }
+        let sent = write_control_allow_disconnect(
+            stream,
+            &serde_json::json!({
+                "event": STREAM_REVOKED_EVENT,
+                "data": { "stream_id": stream_id, "reason": "taken_over" },
             }),
         )?;
         if !sent {
@@ -407,7 +481,7 @@ fn handle_control_request(
     session: &NegotiatedSession,
     frame: &Frame,
     api_tx: &ApiRequestSender,
-    streams: &mut HashMap<u32, PaneOutputSubscription>,
+    streams: &mut HashMap<u32, OpenStream>,
 ) -> io::Result<bool> {
     let request = match serde_json::from_slice::<ControlRequest>(&frame.payload) {
         Ok(request) => request,
@@ -437,7 +511,9 @@ fn handle_control_request(
             }),
         ),
         STREAM_OPEN_METHOD => handle_stream_open(stream, session, request, api_tx, streams),
-        STREAM_CLOSE_METHOD => handle_stream_close(stream, session, request, streams),
+        STREAM_CLOSE_METHOD => handle_stream_close(stream, session, request, api_tx, streams),
+        STREAM_RESIZE_METHOD => handle_stream_resize(stream, session, request, api_tx, streams),
+        STREAM_SCROLL_METHOD => handle_stream_scroll(stream, session, request, api_tx, streams),
         PANE_SEND_BYTES_METHOD => {
             if let Some(rejection) = capability_rejection(session, CAPABILITY_PANE_STREAM, &request)
             {
@@ -539,7 +615,7 @@ fn handle_stream_open(
     session: &NegotiatedSession,
     request: ControlRequest,
     api_tx: &ApiRequestSender,
-    streams: &mut HashMap<u32, PaneOutputSubscription>,
+    streams: &mut HashMap<u32, OpenStream>,
 ) -> io::Result<bool> {
     if let Some(rejection) = capability_rejection(session, CAPABILITY_PANE_STREAM, &request) {
         return write_control_allow_disconnect(stream, &rejection);
@@ -572,6 +648,7 @@ fn handle_stream_open(
         );
     };
     register_pending_stream(stream_id);
+    let target = params.pane_id.clone();
     let response = dispatch_to_app_with_timeout(
         crate::api::schema::Request {
             id: request.id.clone(),
@@ -579,6 +656,10 @@ fn handle_stream_open(
                 crate::api::schema::PaneStreamOpenParams {
                     pane_id: params.pane_id,
                     stream_id,
+                    write: params.mode.is_write(),
+                    takeover: params.takeover,
+                    cols: params.cols,
+                    rows: params.rows,
                 },
             ),
         },
@@ -586,13 +667,45 @@ fn handle_stream_open(
         Some(APP_RESPONSE_TIMEOUT),
     );
     if api_response_outcome(&response) != "ok" {
-        cancel_pending_stream(stream_id);
+        // A non-ok outcome can be a dispatch timeout the app handler lost the
+        // race against: it may already have attached the stream and inserted
+        // the pane geometry lock. Claiming and releasing like a normal close
+        // (addressed by the original open target, which the close path also
+        // resolves) keeps the lock from leaking; only an unfulfilled slot is
+        // plainly cancelled.
+        match claim_pending_stream(stream_id) {
+            Some(attachment) => release_write_stream(
+                api_tx,
+                stream_id,
+                OpenStream {
+                    subscription: attachment.subscription,
+                    pane_id: target,
+                    write_grant: attachment.write_grant,
+                },
+            ),
+            None => cancel_pending_stream(stream_id),
+        }
         return write_control_raw_allow_disconnect(stream, &response);
     }
 
+    // The app resolved the open target (pane id, terminal id, or agent name)
+    // to a public pane id; later stream methods address the pane by it.
+    let pane_id = serde_json::from_str::<serde_json::Value>(&response)
+        .ok()
+        .and_then(|value| parse_stream_opened(&value).ok())
+        .map(|opened| opened.pane_id)
+        .unwrap_or_default();
+
     match claim_pending_stream(stream_id) {
-        Some(subscription) => {
-            streams.insert(stream_id, subscription);
+        Some(attachment) => {
+            streams.insert(
+                stream_id,
+                OpenStream {
+                    subscription: attachment.subscription,
+                    pane_id,
+                    write_grant: attachment.write_grant,
+                },
+            );
             write_control_raw_allow_disconnect(stream, &response)
         }
         None => {
@@ -616,7 +729,8 @@ fn handle_stream_close(
     stream: &mut LocalStream,
     session: &NegotiatedSession,
     request: ControlRequest,
-    streams: &mut HashMap<u32, PaneOutputSubscription>,
+    api_tx: &ApiRequestSender,
+    streams: &mut HashMap<u32, OpenStream>,
 ) -> io::Result<bool> {
     if let Some(rejection) = capability_rejection(session, CAPABILITY_PANE_STREAM, &request) {
         return write_control_allow_disconnect(stream, &rejection);
@@ -636,16 +750,19 @@ fn handle_stream_close(
         }
     };
 
-    if streams.remove(&params.stream_id).is_none() {
-        return write_control_allow_disconnect(
-            stream,
-            &error_response(
-                &request.id,
-                "unknown_stream",
-                &format!("no open stream with id {}", params.stream_id),
-                None,
-            ),
-        );
+    match streams.remove(&params.stream_id) {
+        Some(open) => release_write_stream(api_tx, params.stream_id, open),
+        None => {
+            return write_control_allow_disconnect(
+                stream,
+                &error_response(
+                    &request.id,
+                    "unknown_stream",
+                    &format!("no open stream with id {}", params.stream_id),
+                    None,
+                ),
+            );
+        }
     }
 
     write_control_allow_disconnect(
@@ -658,6 +775,194 @@ fn handle_stream_close(
             },
         }),
     )
+}
+
+/// Resizes the pane behind a write-mode stream. Read streams do not own pane
+/// geometry and are rejected.
+fn handle_stream_resize(
+    stream: &mut LocalStream,
+    session: &NegotiatedSession,
+    request: ControlRequest,
+    api_tx: &ApiRequestSender,
+    streams: &mut HashMap<u32, OpenStream>,
+) -> io::Result<bool> {
+    if let Some(rejection) = capability_rejection(session, CAPABILITY_PANE_STREAM, &request) {
+        return write_control_allow_disconnect(stream, &rejection);
+    }
+    let params = match serde_json::from_value::<StreamResizeParams>(request.params) {
+        Ok(params) => params,
+        Err(err) => {
+            return write_control_allow_disconnect(
+                stream,
+                &error_response(
+                    &request.id,
+                    "invalid_params",
+                    &format!("invalid {STREAM_RESIZE_METHOD} params: {err}"),
+                    None,
+                ),
+            );
+        }
+    };
+    let pane_id = match write_stream_pane_id(streams, params.stream_id) {
+        Ok(pane_id) => pane_id,
+        Err(rejection) => {
+            return write_control_allow_disconnect(
+                stream,
+                &rejection.into_response(&request.id, params.stream_id),
+            );
+        }
+    };
+
+    let response = dispatch_to_app_with_timeout(
+        crate::api::schema::Request {
+            id: request.id,
+            method: crate::api::schema::Method::PaneStreamResize(
+                crate::api::schema::PaneStreamResizeParams {
+                    pane_id,
+                    stream_id: params.stream_id,
+                    cols: params.cols,
+                    rows: params.rows,
+                    cell_width_px: params.cell_width_px,
+                    cell_height_px: params.cell_height_px,
+                },
+            ),
+        },
+        api_tx,
+        Some(APP_RESPONSE_TIMEOUT),
+    );
+    write_control_raw_allow_disconnect(stream, &response)
+}
+
+/// Scrolls the pane behind a write-mode stream using the pane's own wheel and
+/// page-key routing.
+fn handle_stream_scroll(
+    stream: &mut LocalStream,
+    session: &NegotiatedSession,
+    request: ControlRequest,
+    api_tx: &ApiRequestSender,
+    streams: &mut HashMap<u32, OpenStream>,
+) -> io::Result<bool> {
+    if let Some(rejection) = capability_rejection(session, CAPABILITY_PANE_STREAM, &request) {
+        return write_control_allow_disconnect(stream, &rejection);
+    }
+    let params = match serde_json::from_value::<StreamScrollParams>(request.params) {
+        Ok(params) => params,
+        Err(err) => {
+            return write_control_allow_disconnect(
+                stream,
+                &error_response(
+                    &request.id,
+                    "invalid_params",
+                    &format!("invalid {STREAM_SCROLL_METHOD} params: {err}"),
+                    None,
+                ),
+            );
+        }
+    };
+    let pane_id = match write_stream_pane_id(streams, params.stream_id) {
+        Ok(pane_id) => pane_id,
+        Err(rejection) => {
+            return write_control_allow_disconnect(
+                stream,
+                &rejection.into_response(&request.id, params.stream_id),
+            );
+        }
+    };
+
+    let response = dispatch_to_app_with_timeout(
+        crate::api::schema::Request {
+            id: request.id,
+            method: crate::api::schema::Method::PaneStreamScroll(
+                crate::api::schema::PaneStreamScrollParams {
+                    pane_id,
+                    stream_id: params.stream_id,
+                    direction: match params.direction {
+                        StreamScrollDirection::Up => {
+                            crate::api::schema::PaneStreamScrollDirection::Up
+                        }
+                        StreamScrollDirection::Down => {
+                            crate::api::schema::PaneStreamScrollDirection::Down
+                        }
+                    },
+                    lines: params.lines,
+                    source: match params.source {
+                        StreamScrollSource::Wheel => {
+                            crate::api::schema::PaneStreamScrollSource::Wheel
+                        }
+                        StreamScrollSource::PageKey => {
+                            crate::api::schema::PaneStreamScrollSource::PageKey
+                        }
+                    },
+                    column: params.column,
+                    row: params.row,
+                    modifiers: params.modifiers,
+                },
+            ),
+        },
+        api_tx,
+        Some(APP_RESPONSE_TIMEOUT),
+    );
+    write_control_raw_allow_disconnect(stream, &response)
+}
+
+/// Why a stream method addressed to a stream id cannot proceed.
+enum StreamMethodRejection {
+    UnknownStream,
+    NotWritable,
+}
+
+impl StreamMethodRejection {
+    fn into_response(self, id: &str, stream_id: u32) -> serde_json::Value {
+        match self {
+            StreamMethodRejection::UnknownStream => error_response(
+                id,
+                "unknown_stream",
+                &format!("no open stream with id {stream_id}"),
+                None,
+            ),
+            StreamMethodRejection::NotWritable => error_response(
+                id,
+                "stream_not_write_holder",
+                &format!("stream {stream_id} was not opened in write mode"),
+                None,
+            ),
+        }
+    }
+}
+
+fn write_stream_pane_id(
+    streams: &HashMap<u32, OpenStream>,
+    stream_id: u32,
+) -> Result<String, StreamMethodRejection> {
+    let open = streams
+        .get(&stream_id)
+        .ok_or(StreamMethodRejection::UnknownStream)?;
+    if open.write_grant.is_none() {
+        return Err(StreamMethodRejection::NotWritable);
+    }
+    Ok(open.pane_id.clone())
+}
+
+/// Drops a stream and, when it held the pane write grant, tells the app to
+/// release the pane state that grant owned.
+fn release_write_stream(api_tx: &ApiRequestSender, stream_id: u32, open: OpenStream) {
+    let held_write_grant = open.write_grant.is_some();
+    let pane_id = open.pane_id.clone();
+    // Dropping the grant first frees the pane for the next writer.
+    drop(open);
+    if !held_write_grant || pane_id.is_empty() {
+        return;
+    }
+    let _ = dispatch_to_app_with_timeout(
+        crate::api::schema::Request {
+            id: format!("framed:stream.close:{stream_id}"),
+            method: crate::api::schema::Method::PaneStreamClose(
+                crate::api::schema::PaneStreamCloseParams { pane_id, stream_id },
+            ),
+        },
+        api_tx,
+        Some(APP_RESPONSE_TIMEOUT),
+    );
 }
 
 /// Builds the rejection response for a method whose gating capability was not
@@ -867,11 +1172,49 @@ mod tests {
                 let _ = requests.send(msg.request.method.clone());
                 let response = match msg.request.method {
                     Method::PaneStreamOpen(params) => {
+                        // Mirrors the real handler: the write grant is taken
+                        // before the subscription attaches, and a refused
+                        // grant answers with the structured error.
+                        let write_grant = if params.write {
+                            match crate::pane::write_grant::acquire_write_grant(
+                                &params.pane_id,
+                                params.stream_id,
+                                params.takeover,
+                            ) {
+                                Ok(grant) => Some(grant),
+                                Err(conflict) => {
+                                    msg.respond_to
+                                        .send(
+                                            serde_json::json!({
+                                                "id": msg.request.id,
+                                                "error": {
+                                                    "code": crate::protocol::framed::PANE_WRITE_LOCKED_ERROR,
+                                                    "message": format!(
+                                                        "pane {} already has a writable stream (stream {})",
+                                                        params.pane_id, conflict.holder_stream_id
+                                                    ),
+                                                },
+                                            })
+                                            .to_string(),
+                                        )
+                                        .unwrap();
+                                    continue;
+                                }
+                            }
+                        } else {
+                            None
+                        };
                         let tap = tap.upgrade().expect("tap must be alive during stream.open");
                         let (subscription, snapshot) =
                             tap.subscribe_with_snapshot(|| "SNAPSHOT".to_owned());
                         let sequence = subscription.sequence();
-                        assert!(fulfill_pending_stream(params.stream_id, subscription));
+                        assert!(fulfill_pending_stream(
+                            params.stream_id,
+                            crate::pane::output_tap::PaneStreamAttachment {
+                                subscription,
+                                write_grant,
+                            }
+                        ));
                         serde_json::to_string(&SuccessResponse {
                             id: msg.request.id,
                             result: ResponseResult::PaneStreamOpened {
@@ -887,13 +1230,15 @@ mod tests {
                         })
                         .unwrap()
                     }
-                    Method::PaneSendBytes(_) | Method::PanePasteImage(_) => {
-                        serde_json::to_string(&SuccessResponse {
-                            id: msg.request.id,
-                            result: ResponseResult::Ok {},
-                        })
-                        .unwrap()
-                    }
+                    Method::PaneSendBytes(_)
+                    | Method::PanePasteImage(_)
+                    | Method::PaneStreamClose(_)
+                    | Method::PaneStreamResize(_)
+                    | Method::PaneStreamScroll(_) => serde_json::to_string(&SuccessResponse {
+                        id: msg.request.id,
+                        result: ResponseResult::Ok {},
+                    })
+                    .unwrap(),
                     other => panic!("unexpected request: {other:?}"),
                 };
                 msg.respond_to.send(response).unwrap();
@@ -1469,6 +1814,161 @@ mod tests {
             serde_json::json!({"id": "p1", "method": "ping", "params": {}}),
         );
         assert_eq!(read_control(&mut client)["result"]["type"], "pong");
+
+        finish(client, done_rx, thread, path);
+        drop(api_tx);
+        responder.join().unwrap();
+    }
+
+    #[test]
+    fn framed_write_stream_grant_is_refused_then_taken_over_across_connections() {
+        let tap = Arc::new(PaneOutputTap::default());
+        let (request_tx, _request_rx) = mpsc::channel();
+        let (api_tx, responder) = spawn_pane_stream_responder(Arc::downgrade(&tap), request_tx);
+
+        let (mut holder, holder_server, holder_path) = local_stream_pair("grant-holder");
+        let (holder_done, holder_thread) =
+            spawn_connection_with(holder_server, api_tx.clone(), EventHub::default());
+        let (mut rival, rival_server, rival_path) = local_stream_pair("grant-rival");
+        let (rival_done, rival_thread) =
+            spawn_connection_with(rival_server, api_tx.clone(), EventHub::default());
+
+        hello(&mut holder, "h20", &["pane-stream"]);
+        hello(&mut rival, "h21", &["pane-stream"]);
+
+        send_control(
+            &mut holder,
+            serde_json::json!({
+                "id": "w1",
+                "method": "stream.open",
+                "params": {"pane_id": "pane_write", "mode": "write", "cols": 80, "rows": 24},
+            }),
+        );
+        let opened = read_control(&mut holder);
+        let stream_id = opened["result"]["stream"]["stream_id"].as_u64().unwrap() as u32;
+
+        // Without takeover the rival is refused and stays connected.
+        send_control(
+            &mut rival,
+            serde_json::json!({
+                "id": "w2",
+                "method": "stream.open",
+                "params": {"pane_id": "pane_write", "mode": "write"},
+            }),
+        );
+        let refused = read_control(&mut rival);
+        assert_eq!(
+            refused["error"]["code"],
+            crate::protocol::framed::PANE_WRITE_LOCKED_ERROR
+        );
+        send_control(
+            &mut rival,
+            serde_json::json!({"id": "p1", "method": "ping", "params": {}}),
+        );
+        assert_eq!(read_control(&mut rival)["result"]["type"], "pong");
+
+        // With takeover the rival wins and the holder is revoked on its own
+        // stream, keeping its connection.
+        send_control(
+            &mut rival,
+            serde_json::json!({
+                "id": "w3",
+                "method": "stream.open",
+                "params": {"pane_id": "pane_write", "mode": "write", "takeover": true},
+            }),
+        );
+        let taken = read_control(&mut rival);
+        assert_eq!(taken["result"]["type"], "pane_stream_opened");
+
+        let revoked = read_control(&mut holder);
+        assert_eq!(revoked["event"], "stream.revoked");
+        assert_eq!(revoked["data"]["stream_id"], stream_id);
+        assert_eq!(revoked["data"]["reason"], "taken_over");
+        send_control(
+            &mut holder,
+            serde_json::json!({"id": "p2", "method": "ping", "params": {}}),
+        );
+        assert_eq!(read_control(&mut holder)["result"]["type"], "pong");
+
+        finish(holder, holder_done, holder_thread, holder_path);
+        finish(rival, rival_done, rival_thread, rival_path);
+        drop(api_tx);
+        responder.join().unwrap();
+    }
+
+    #[test]
+    fn framed_stream_resize_and_scroll_require_a_write_stream() {
+        let tap = Arc::new(PaneOutputTap::default());
+        let (request_tx, _request_rx) = mpsc::channel();
+        let (api_tx, responder) = spawn_pane_stream_responder(Arc::downgrade(&tap), request_tx);
+
+        let (mut client, server, path) = local_stream_pair("stream-methods");
+        let (done_rx, thread) = spawn_connection_with(server, api_tx.clone(), EventHub::default());
+        hello(&mut client, "h22", &["pane-stream"]);
+
+        send_control(
+            &mut client,
+            serde_json::json!({
+                "id": "r1",
+                "method": "stream.open",
+                "params": {"pane_id": "pane_read", "mode": "read"},
+            }),
+        );
+        let opened = read_control(&mut client);
+        let read_stream_id = opened["result"]["stream"]["stream_id"].as_u64().unwrap();
+
+        send_control(
+            &mut client,
+            serde_json::json!({
+                "id": "rs1",
+                "method": "stream.resize",
+                "params": {"stream_id": read_stream_id, "cols": 100, "rows": 30},
+            }),
+        );
+        assert_eq!(
+            read_control(&mut client)["error"]["code"],
+            "stream_not_write_holder"
+        );
+
+        send_control(
+            &mut client,
+            serde_json::json!({
+                "id": "sc1",
+                "method": "stream.scroll",
+                "params": {"stream_id": 987_654, "direction": "up", "lines": 1},
+            }),
+        );
+        assert_eq!(read_control(&mut client)["error"]["code"], "unknown_stream");
+
+        send_control(
+            &mut client,
+            serde_json::json!({
+                "id": "w1",
+                "method": "stream.open",
+                "params": {"pane_id": "pane_methods", "mode": "write", "cols": 80, "rows": 24},
+            }),
+        );
+        let opened = read_control(&mut client);
+        let write_stream_id = opened["result"]["stream"]["stream_id"].as_u64().unwrap();
+
+        send_control(
+            &mut client,
+            serde_json::json!({
+                "id": "rs2",
+                "method": "stream.resize",
+                "params": {"stream_id": write_stream_id, "cols": 100, "rows": 30},
+            }),
+        );
+        assert_eq!(read_control(&mut client)["result"]["type"], "ok");
+        send_control(
+            &mut client,
+            serde_json::json!({
+                "id": "sc2",
+                "method": "stream.scroll",
+                "params": {"stream_id": write_stream_id, "direction": "down", "lines": 2},
+            }),
+        );
+        assert_eq!(read_control(&mut client)["result"]["type"], "ok");
 
         finish(client, done_rx, thread, path);
         drop(api_tx);

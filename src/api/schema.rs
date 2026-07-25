@@ -200,6 +200,15 @@ pub enum Method {
     PaneStreamOpen(PaneStreamOpenParams),
     #[serde(skip)]
     #[schemars(skip)]
+    PaneStreamClose(PaneStreamCloseParams),
+    #[serde(skip)]
+    #[schemars(skip)]
+    PaneStreamResize(PaneStreamResizeParams),
+    #[serde(skip)]
+    #[schemars(skip)]
+    PaneStreamScroll(PaneStreamScrollParams),
+    #[serde(skip)]
+    #[schemars(skip)]
     PaneSendBytes(PaneSendBytesParams),
     #[serde(skip)]
     #[schemars(skip)]

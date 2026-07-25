@@ -10,9 +10,10 @@ use crate::api::schema::{
     PaneReadParams, PaneReadResult, PaneReleaseAgentParams, PaneRenameParams,
     PaneReportAgentParams, PaneReportAgentSessionParams, PaneReportMetadataParams,
     PaneResizeParams, PaneResizeReason, PaneResizeResult, PaneSendBytesParams, PaneSendInputParams,
-    PaneSendKeysParams, PaneSendTextParams, PaneSplitParams, PaneStreamOpenInfo,
-    PaneStreamOpenParams, PaneSwapParams, PaneSwapReason, PaneSwapResult, PaneTarget, PaneZoomMode,
-    PaneZoomParams, PaneZoomReason, PaneZoomResult, ResponseResult,
+    PaneSendKeysParams, PaneSendTextParams, PaneSplitParams, PaneStreamCloseParams,
+    PaneStreamOpenInfo, PaneStreamOpenParams, PaneStreamResizeParams, PaneStreamScrollParams,
+    PaneSwapParams, PaneSwapReason, PaneSwapResult, PaneTarget, PaneZoomMode, PaneZoomParams,
+    PaneZoomReason, PaneZoomResult, ResponseResult,
 };
 use crate::app::actions::{PaneZoomCommand, PaneZoomNoopReason};
 use crate::app::App;
@@ -1518,29 +1519,107 @@ impl App {
         encode_success(id, ResponseResult::Ok {})
     }
 
+    /// Resolves a framed pane-stream target: a public pane id, a terminal id,
+    /// or an agent name, the same target vocabulary direct attach accepts.
+    fn resolve_stream_target(&self, target: &str) -> Option<(usize, crate::layout::PaneId)> {
+        if let Some(resolved) = self.parse_pane_id(target) {
+            return Some(resolved);
+        }
+        let resolved = self.resolve_terminal_target(target).ok()?;
+        Some((resolved.ws_idx, resolved.pane_id))
+    }
+
+    fn terminal_id_for_pane(
+        &self,
+        ws_idx: usize,
+        pane_id: crate::layout::PaneId,
+    ) -> Option<crate::terminal::TerminalId> {
+        self.state
+            .workspaces
+            .get(ws_idx)?
+            .terminal_id(pane_id)
+            .cloned()
+    }
+
     pub(super) fn handle_pane_stream_open(
         &mut self,
         id: String,
         params: PaneStreamOpenParams,
     ) -> String {
-        let Some((ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
+        let Some((ws_idx, pane_id)) = self.resolve_stream_target(&params.pane_id) else {
             return pane_not_found(id, &params.pane_id);
         };
         let Some(public_pane_id) = self.public_pane_id(ws_idx, pane_id) else {
             return pane_not_found(id, &params.pane_id);
         };
+
+        // The write grant is the single-writer authority that replaced the
+        // client-keyed attach owner map. Acquire it before subscribing so a
+        // refused open leaves no stream behind.
+        let write_grant = if params.write {
+            match crate::pane::write_grant::acquire_write_grant(
+                &public_pane_id,
+                params.stream_id,
+                params.takeover,
+            ) {
+                Ok(grant) => Some(grant),
+                Err(conflict) => {
+                    return encode_error(
+                        id,
+                        crate::protocol::framed::PANE_WRITE_LOCKED_ERROR,
+                        format!(
+                            "pane {public_pane_id} already has a writable stream (stream {}); \
+                             retry with takeover",
+                            conflict.holder_stream_id
+                        ),
+                    );
+                }
+            }
+        } else {
+            None
+        };
+
+        let terminal_id = self.terminal_id_for_pane(ws_idx, pane_id);
+        // A write stream owns the pane geometry, so a pane whose agent is
+        // still paused from a restore resumes at the client's viewport.
+        if let (true, Some(terminal_id), Some(cols), Some(rows)) =
+            (params.write, terminal_id.as_ref(), params.cols, params.rows)
+        {
+            self.start_pending_agent_resume_for_terminal(terminal_id, rows, cols, true);
+        }
+
         let Some((runtime, workspace_id)) = self.lookup_runtime(ws_idx, pane_id) else {
             return pane_not_found(id, &params.pane_id);
         };
         let (subscription, snapshot) = runtime.subscribe_output_with_snapshot();
         let sequence = subscription.sequence();
-        if !crate::pane::output_tap::fulfill_pending_stream(params.stream_id, subscription) {
+        if !crate::pane::output_tap::fulfill_pending_stream(
+            params.stream_id,
+            crate::pane::output_tap::PaneStreamAttachment {
+                subscription,
+                write_grant,
+            },
+        ) {
             return encode_error(
                 id,
                 "stream_cancelled",
                 "pane stream request was cancelled before the subscription attached",
             );
         }
+
+        if params.write {
+            if let Some(terminal_id) = terminal_id {
+                // While a write stream holds the pane, the TUI layout must not
+                // resize it; the stream's declared viewport wins.
+                self.state.direct_attach_resize_locks.insert(terminal_id);
+            }
+            if let (Some(cols), Some(rows)) = (params.cols, params.rows) {
+                if let Some(runtime) = self.lookup_runtime_sender(ws_idx, pane_id) {
+                    runtime.resize(rows, cols, 0, 0);
+                }
+            }
+        }
+
         let history_cursor =
             crate::protocol::framed::encode_history_cursor(&public_pane_id, sequence);
 
@@ -1557,6 +1636,114 @@ impl App {
                 },
             },
         )
+    }
+
+    /// Releases the pane state a write stream owned. The write grant itself is
+    /// released by dropping the session-side handle; this clears the geometry
+    /// lock so the TUI layout owns the pane size again.
+    pub(super) fn handle_pane_stream_close(
+        &mut self,
+        id: String,
+        params: PaneStreamCloseParams,
+    ) -> String {
+        let Some((ws_idx, pane_id)) = self.resolve_stream_target(&params.pane_id) else {
+            return encode_success(id, ResponseResult::Ok {});
+        };
+        // Another stream may already have taken the grant over; only the
+        // current holder (or an unheld pane) releases the geometry lock.
+        let public_pane_id = self.public_pane_id(ws_idx, pane_id);
+        let held_by_other = public_pane_id
+            .as_deref()
+            .and_then(crate::pane::write_grant::write_grant_holder)
+            .is_some_and(|holder| holder != params.stream_id);
+        if !held_by_other {
+            if let Some(terminal_id) = self.terminal_id_for_pane(ws_idx, pane_id) {
+                self.state.direct_attach_resize_locks.remove(&terminal_id);
+            }
+        }
+        encode_success(id, ResponseResult::Ok {})
+    }
+
+    pub(super) fn handle_pane_stream_resize(
+        &mut self,
+        id: String,
+        params: PaneStreamResizeParams,
+    ) -> String {
+        if params.cols == 0 || params.rows == 0 {
+            return encode_error(
+                id,
+                "invalid_params",
+                "stream.resize cols and rows must be greater than 0",
+            );
+        }
+        let Some((ws_idx, pane_id, _)) =
+            self.resolve_write_stream(&params.pane_id, params.stream_id)
+        else {
+            return stream_not_write_holder(id, &params.pane_id, params.stream_id);
+        };
+        let Some(runtime) = self.lookup_runtime_sender(ws_idx, pane_id) else {
+            return pane_not_found(id, &params.pane_id);
+        };
+        runtime.resize(
+            params.rows,
+            params.cols,
+            params.cell_width_px,
+            params.cell_height_px,
+        );
+        encode_success(id, ResponseResult::Ok {})
+    }
+
+    pub(super) fn handle_pane_stream_scroll(
+        &mut self,
+        id: String,
+        params: PaneStreamScrollParams,
+    ) -> String {
+        let Some((ws_idx, pane_id, _)) =
+            self.resolve_write_stream(&params.pane_id, params.stream_id)
+        else {
+            return stream_not_write_holder(id, &params.pane_id, params.stream_id);
+        };
+        let Some(runtime) = self.lookup_runtime_sender(ws_idx, pane_id) else {
+            return pane_not_found(id, &params.pane_id);
+        };
+        let request = crate::terminal::pane_scroll::PaneScrollRequest {
+            direction: match params.direction {
+                crate::api::schema::PaneStreamScrollDirection::Up => {
+                    crate::terminal::pane_scroll::PaneScrollDirection::Up
+                }
+                crate::api::schema::PaneStreamScrollDirection::Down => {
+                    crate::terminal::pane_scroll::PaneScrollDirection::Down
+                }
+            },
+            source: match params.source {
+                crate::api::schema::PaneStreamScrollSource::Wheel => {
+                    crate::terminal::pane_scroll::PaneScrollSource::Wheel
+                }
+                crate::api::schema::PaneStreamScrollSource::PageKey => {
+                    crate::terminal::pane_scroll::PaneScrollSource::PageKey
+                }
+            },
+            lines: params.lines,
+            column: params.column,
+            row: params.row,
+            modifiers: params.modifiers,
+        };
+        match crate::terminal::pane_scroll::apply_pane_scroll(runtime, request) {
+            Ok(()) => encode_success(id, ResponseResult::Ok {}),
+            Err(err) => encode_error(id, "pane_scroll_failed", err),
+        }
+    }
+
+    /// Resolves a pane target and verifies `stream_id` holds its write grant.
+    fn resolve_write_stream(
+        &self,
+        target: &str,
+        stream_id: u32,
+    ) -> Option<(usize, crate::layout::PaneId, String)> {
+        let (ws_idx, pane_id) = self.resolve_stream_target(target)?;
+        let public_pane_id = self.public_pane_id(ws_idx, pane_id)?;
+        (crate::pane::write_grant::write_grant_holder(&public_pane_id) == Some(stream_id))
+            .then_some((ws_idx, pane_id, public_pane_id))
     }
 
     pub(super) fn handle_pane_send_bytes(
@@ -1773,6 +1960,14 @@ fn normalize_state_labels(
 
 fn pane_not_found(id: String, pane_id: &str) -> String {
     encode_error(id, "pane_not_found", format!("pane {pane_id} not found"))
+}
+
+fn stream_not_write_holder(id: String, pane_id: &str, stream_id: u32) -> String {
+    encode_error(
+        id,
+        "stream_not_write_holder",
+        format!("stream {stream_id} does not hold the write grant for pane {pane_id}"),
+    )
 }
 
 impl App {
@@ -2140,6 +2335,10 @@ mod tests {
             PaneStreamOpenParams {
                 pane_id: public_pane_id.clone(),
                 stream_id: STREAM_ID,
+                write: false,
+                takeover: false,
+                cols: None,
+                rows: None,
             },
         );
         let success: SuccessResponse = serde_json::from_str(&response).unwrap();
@@ -2158,14 +2357,220 @@ mod tests {
         );
 
         // The handler deposited the live subscription for the session thread.
-        let subscription =
+        let attachment =
             crate::pane::output_tap::claim_pending_stream(STREAM_ID).expect("subscription");
+        let subscription = attachment.subscription;
         let runtime = app
             .state
             .runtime_for_pane_in_workspace(&app.terminal_runtimes, 0, pane_id)
             .expect("runtime");
         runtime.test_process_pty_bytes(b"tail bytes");
         assert_eq!(subscription.drain().bytes, b"tail bytes");
+    }
+
+    #[tokio::test]
+    async fn api_pane_stream_open_in_write_mode_takes_the_grant_and_locks_pane_geometry() {
+        let (mut app, public_pane_id, pane_id) = app_with_scrollback_runtime();
+        let terminal_id = app.state.workspaces[0]
+            .terminal_id(pane_id)
+            .expect("terminal id")
+            .clone();
+        const STREAM_ID: u32 = 4_100_000_001;
+        crate::pane::output_tap::register_pending_stream(STREAM_ID);
+
+        let response = app.handle_pane_stream_open(
+            "req".into(),
+            PaneStreamOpenParams {
+                pane_id: public_pane_id.clone(),
+                stream_id: STREAM_ID,
+                write: true,
+                takeover: false,
+                cols: Some(100),
+                rows: Some(30),
+            },
+        );
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert!(matches!(
+            success.result,
+            ResponseResult::PaneStreamOpened { .. }
+        ));
+        assert_eq!(
+            crate::pane::write_grant::write_grant_holder(&public_pane_id),
+            Some(STREAM_ID)
+        );
+        assert!(
+            app.state.direct_attach_resize_locks.contains(&terminal_id),
+            "a write stream owns the pane geometry"
+        );
+
+        // A second writer without takeover is refused and changes nothing.
+        const RIVAL_ID: u32 = 4_100_000_002;
+        crate::pane::output_tap::register_pending_stream(RIVAL_ID);
+        let refused = app.handle_pane_stream_open(
+            "req2".into(),
+            PaneStreamOpenParams {
+                pane_id: public_pane_id.clone(),
+                stream_id: RIVAL_ID,
+                write: true,
+                takeover: false,
+                cols: Some(100),
+                rows: Some(30),
+            },
+        );
+        let error: ErrorResponse = serde_json::from_str(&refused).unwrap();
+        assert_eq!(
+            error.error.code,
+            crate::protocol::framed::PANE_WRITE_LOCKED_ERROR
+        );
+        assert!(error.error.message.contains(&STREAM_ID.to_string()));
+        assert_eq!(
+            crate::pane::write_grant::write_grant_holder(&public_pane_id),
+            Some(STREAM_ID)
+        );
+        crate::pane::output_tap::cancel_pending_stream(RIVAL_ID);
+
+        // A read stream never contends for the grant.
+        const READER_ID: u32 = 4_100_000_003;
+        crate::pane::output_tap::register_pending_stream(READER_ID);
+        let read_response = app.handle_pane_stream_open(
+            "req3".into(),
+            PaneStreamOpenParams {
+                pane_id: public_pane_id.clone(),
+                stream_id: READER_ID,
+                write: false,
+                takeover: false,
+                cols: None,
+                rows: None,
+            },
+        );
+        let success: SuccessResponse = serde_json::from_str(&read_response).unwrap();
+        assert!(matches!(
+            success.result,
+            ResponseResult::PaneStreamOpened { .. }
+        ));
+        assert_eq!(
+            crate::pane::write_grant::write_grant_holder(&public_pane_id),
+            Some(STREAM_ID)
+        );
+
+        // Closing the write stream hands pane geometry back to the layout.
+        let writer = crate::pane::output_tap::claim_pending_stream(STREAM_ID).expect("attachment");
+        drop(writer);
+        let closed = app.handle_pane_stream_close(
+            "req4".into(),
+            PaneStreamCloseParams {
+                pane_id: public_pane_id.clone(),
+                stream_id: STREAM_ID,
+            },
+        );
+        let success: SuccessResponse = serde_json::from_str(&closed).unwrap();
+        assert!(matches!(success.result, ResponseResult::Ok {}));
+        assert!(!app.state.direct_attach_resize_locks.contains(&terminal_id));
+        assert_eq!(
+            crate::pane::write_grant::write_grant_holder(&public_pane_id),
+            None
+        );
+        let _ = crate::pane::output_tap::claim_pending_stream(READER_ID);
+    }
+
+    #[tokio::test]
+    async fn api_pane_stream_resize_and_scroll_require_the_write_grant() {
+        let (mut app, public_pane_id, _pane_id) = app_with_scrollback_runtime();
+        const STREAM_ID: u32 = 4_200_000_001;
+        crate::pane::output_tap::register_pending_stream(STREAM_ID);
+        let response = app.handle_pane_stream_open(
+            "open".into(),
+            PaneStreamOpenParams {
+                pane_id: public_pane_id.clone(),
+                stream_id: STREAM_ID,
+                write: true,
+                takeover: false,
+                cols: Some(80),
+                rows: Some(24),
+            },
+        );
+        assert!(serde_json::from_str::<SuccessResponse>(&response).is_ok());
+
+        let resized = app.handle_pane_stream_resize(
+            "resize".into(),
+            PaneStreamResizeParams {
+                pane_id: public_pane_id.clone(),
+                stream_id: STREAM_ID,
+                cols: 100,
+                rows: 30,
+                cell_width_px: 0,
+                cell_height_px: 0,
+            },
+        );
+        let success: SuccessResponse = serde_json::from_str(&resized).unwrap();
+        assert!(matches!(success.result, ResponseResult::Ok {}));
+
+        let scrolled = app.handle_pane_stream_scroll(
+            "scroll".into(),
+            PaneStreamScrollParams {
+                pane_id: public_pane_id.clone(),
+                stream_id: STREAM_ID,
+                direction: crate::api::schema::PaneStreamScrollDirection::Up,
+                lines: 2,
+                source: crate::api::schema::PaneStreamScrollSource::Wheel,
+                column: None,
+                row: None,
+                modifiers: 0,
+            },
+        );
+        let success: SuccessResponse = serde_json::from_str(&scrolled).unwrap();
+        assert!(matches!(success.result, ResponseResult::Ok {}));
+
+        // A stream that does not hold the grant owns neither geometry nor
+        // scroll.
+        let rejected = app.handle_pane_stream_resize(
+            "resize2".into(),
+            PaneStreamResizeParams {
+                pane_id: public_pane_id.clone(),
+                stream_id: STREAM_ID + 1,
+                cols: 10,
+                rows: 10,
+                cell_width_px: 0,
+                cell_height_px: 0,
+            },
+        );
+        let error: ErrorResponse = serde_json::from_str(&rejected).unwrap();
+        assert_eq!(error.error.code, "stream_not_write_holder");
+
+        let rejected = app.handle_pane_stream_scroll(
+            "scroll2".into(),
+            PaneStreamScrollParams {
+                pane_id: public_pane_id.clone(),
+                stream_id: STREAM_ID + 1,
+                direction: crate::api::schema::PaneStreamScrollDirection::Down,
+                lines: 1,
+                source: crate::api::schema::PaneStreamScrollSource::PageKey,
+                column: None,
+                row: None,
+                modifiers: 0,
+            },
+        );
+        let error: ErrorResponse = serde_json::from_str(&rejected).unwrap();
+        assert_eq!(error.error.code, "stream_not_write_holder");
+
+        // Zero geometry is refused outright.
+        let invalid = app.handle_pane_stream_resize(
+            "resize3".into(),
+            PaneStreamResizeParams {
+                pane_id: public_pane_id.clone(),
+                stream_id: STREAM_ID,
+                cols: 0,
+                rows: 30,
+                cell_width_px: 0,
+                cell_height_px: 0,
+            },
+        );
+        let error: ErrorResponse = serde_json::from_str(&invalid).unwrap();
+        assert_eq!(error.error.code, "invalid_params");
+
+        let attachment =
+            crate::pane::output_tap::claim_pending_stream(STREAM_ID).expect("attachment");
+        drop(attachment);
     }
 
     #[tokio::test]
@@ -2178,6 +2583,10 @@ mod tests {
             PaneStreamOpenParams {
                 pane_id: public_pane_id,
                 stream_id: 4_000_000_002,
+                write: false,
+                takeover: false,
+                cols: None,
+                rows: None,
             },
         );
         let error: ErrorResponse = serde_json::from_str(&response).unwrap();
@@ -2188,6 +2597,10 @@ mod tests {
             PaneStreamOpenParams {
                 pane_id: "p_99".into(),
                 stream_id: 4_000_000_003,
+                write: false,
+                takeover: false,
+                cols: None,
+                rows: None,
             },
         );
         let error: ErrorResponse = serde_json::from_str(&response).unwrap();

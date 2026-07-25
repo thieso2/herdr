@@ -170,9 +170,7 @@ impl PaneContent for TerminalRuntime {
         &self,
         needs_data: &mut dyn FnMut(crate::ghostty::KittyImageDescriptor) -> bool,
     ) -> Vec<crate::ghostty::KittyImagePlacement> {
-        TerminalRuntime::kitty_image_placements_with_data_filter(self, |descriptor| {
-            needs_data(descriptor)
-        })
+        TerminalRuntime::kitty_image_placements_with_data_filter(self, needs_data)
     }
 }
 
@@ -274,7 +272,7 @@ impl PaneContent for std::cell::RefCell<super::replica::PaneReplica> {
     ) -> Vec<crate::ghostty::KittyImagePlacement> {
         self.borrow()
             .terminal()
-            .kitty_image_placements_with_data_filter(|descriptor| needs_data(descriptor))
+            .kitty_image_placements_with_data_filter(needs_data)
             .unwrap_or_default()
     }
 }

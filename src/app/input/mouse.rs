@@ -1745,7 +1745,8 @@ impl AppState {
         offset_from_bottom: usize,
     ) {
         for ws_idx in 0..self.workspaces.len() {
-            let Some(content) = self.content_for_pane_in_workspace(terminal_runtimes, ws_idx, pane_id)
+            let Some(content) =
+                self.content_for_pane_in_workspace(terminal_runtimes, ws_idx, pane_id)
             else {
                 continue;
             };

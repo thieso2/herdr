@@ -2095,7 +2095,8 @@ pub(crate) fn plain_terminal_word_motion_target(
         let buffer = RetainedTextBuffer::new_words(cols, rows, u32::try_from(start_row).ok()?);
         let target = buffer.word_motion(u32::try_from(row).ok()?, col, motion);
         let needs_more_history = motion == TerminalWordMotion::PreviousStart
-            && target.is_some_and(|target| starts_in_continuation && target.row == start_row as u32);
+            && target
+                .is_some_and(|target| starts_in_continuation && target.row == start_row as u32);
         let needs_more_future = motion == TerminalWordMotion::NextEnd
             && ends_in_continuation
             && target.is_some_and(|target| buffer.point_is_final_atom(target));

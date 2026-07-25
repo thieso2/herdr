@@ -386,8 +386,7 @@ pub(crate) fn apply_client_config(app: &mut AppState, config: &crate::config::Co
 /// Serves the mirror's pane replicas through the [`PaneContentSource`] seam
 /// so the shared render path draws them exactly like live runtimes.
 pub(crate) struct MirrorPaneSource<'a> {
-    by_terminal:
-        HashMap<TerminalId, &'a std::cell::RefCell<crate::terminal::replica::PaneReplica>>,
+    by_terminal: HashMap<TerminalId, &'a std::cell::RefCell<crate::terminal::replica::PaneReplica>>,
 }
 
 impl<'a> MirrorPaneSource<'a> {

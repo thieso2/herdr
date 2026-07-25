@@ -1400,6 +1400,9 @@ impl AppState {
 
 /// Public-id resolution the pure client provides when interpreting modal
 /// state into control-plane methods.
+// The pure-client run path is unix-only (the flag is ignored on
+// Windows), so its modal interpretation compiles out of Windows builds.
+#[cfg(unix)]
 pub(crate) struct PureModalIds<'a> {
     /// Public pane id behind a composed local pane id.
     pub(crate) pane_public: &'a dyn Fn(crate::layout::PaneId) -> Option<String>,
@@ -1409,6 +1412,9 @@ pub(crate) struct PureModalIds<'a> {
 
 /// Handles one key in a pure-client modal mode. Mutates the modal state
 /// exactly like the legacy handlers and returns the methods to dispatch.
+// The pure-client run path is unix-only (the flag is ignored on
+// Windows), so its modal interpretation compiles out of Windows builds.
+#[cfg(unix)]
 pub(crate) fn pure_client_modal_key(
     state: &mut AppState,
     key: KeyEvent,
@@ -1462,6 +1468,9 @@ pub(crate) fn pure_client_modal_key(
 }
 
 /// Handles a modal mouse action in the pure client.
+// The pure-client run path is unix-only (the flag is ignored on
+// Windows), so its modal interpretation compiles out of Windows builds.
+#[cfg(unix)]
 pub(crate) fn pure_client_modal_mouse(
     state: &mut AppState,
     action: super::mouse::MouseAction,
@@ -1477,6 +1486,9 @@ pub(crate) fn pure_client_modal_mouse(
     }
 }
 
+// The pure-client run path is unix-only (the flag is ignored on
+// Windows), so its modal interpretation compiles out of Windows builds.
+#[cfg(unix)]
 fn pure_rename_action(
     state: &mut AppState,
     action: ModalAction,
@@ -1500,6 +1512,9 @@ fn pure_rename_action(
 /// Mirror of `save_rename_modal_via_api` returning the methods to send.
 /// The workspace-create-with-cwd path is absent: the pure client never sets
 /// `pending_workspace_create_cwd` (worktree dialogs stay unsupported).
+// The pure-client run path is unix-only (the flag is ignored on
+// Windows), so its modal interpretation compiles out of Windows builds.
+#[cfg(unix)]
 fn pure_save_rename_modal(
     state: &mut AppState,
     ids: &PureModalIds<'_>,
@@ -1580,6 +1595,9 @@ fn pure_save_rename_modal(
 }
 
 /// Mirror of `confirm_close_accept_via_api`: closes the selected workspace.
+// The pure-client run path is unix-only (the flag is ignored on
+// Windows), so its modal interpretation compiles out of Windows builds.
+#[cfg(unix)]
 fn pure_confirm_close_accept(state: &mut AppState) -> Vec<crate::api::schema::Method> {
     let mut methods = Vec::new();
     if let Some(workspace) = state.workspaces.get(state.selected) {
@@ -1600,6 +1618,9 @@ fn pure_confirm_close_accept(state: &mut AppState) -> Vec<crate::api::schema::Me
 /// Mirror of `apply_context_menu_action_via_api` for the item subset the
 /// pure client supports. Worktree operations and plugin items stay
 /// unsupported under the flag and close the menu as no-ops.
+// The pure-client run path is unix-only (the flag is ignored on
+// Windows), so its modal interpretation compiles out of Windows builds.
+#[cfg(unix)]
 fn pure_context_menu_action(
     state: &mut AppState,
     menu: crate::app::state::ContextMenuState,
@@ -1713,7 +1734,11 @@ fn pure_context_menu_action(
             leave_modal(state);
         }
         (kind, item) => {
-            tracing::debug!(?kind, ?item, "context menu item unsupported in the pure client");
+            tracing::debug!(
+                ?kind,
+                ?item,
+                "context menu item unsupported in the pure client"
+            );
             leave_modal(state);
         }
     }
@@ -1723,6 +1748,9 @@ fn pure_context_menu_action(
 /// Locally focuses a (workspace, tab) position so a modal opened right after
 /// prefills against the clicked target, and returns the focus methods that
 /// make the server converge on the same focus.
+// The pure-client run path is unix-only (the flag is ignored on
+// Windows), so its modal interpretation compiles out of Windows builds.
+#[cfg(unix)]
 fn pure_focus_tab(
     state: &mut AppState,
     ws_idx: usize,

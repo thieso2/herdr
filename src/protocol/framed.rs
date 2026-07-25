@@ -879,6 +879,8 @@ pub fn pane_send_bytes_request(id: &str, pane_id: &str, data: &[u8]) -> serde_js
 }
 
 /// Builds a `pane.paste_image` control request.
+// Consumed by the unix-only pure-client run path.
+#[cfg_attr(windows, allow(dead_code))]
 pub fn pane_paste_image_request(
     id: &str,
     pane_id: &str,

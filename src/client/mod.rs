@@ -1572,8 +1572,9 @@ fn reload_local_client_config(
 
 /// Applies a `notification.posted` event with this client's local policy:
 /// the sound config decides whether sounds play, and toast kinds route to
-/// the terminal or system notifier. Shared by the legacy client (wire
-/// `Notify` messages) and the pure client (framed notification events).
+/// the terminal or system notifier. Consumed by the unix-only pure client;
+/// the legacy client applies the same policy through `handle_notify`.
+#[cfg(unix)]
 pub(crate) fn apply_notification_event(
     kind: crate::api::schema::events::NotificationEventKind,
     message: &str,

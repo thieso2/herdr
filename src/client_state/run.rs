@@ -72,7 +72,10 @@ pub(crate) fn pure_client_enabled(config: &crate::config::Config) -> bool {
     match std::env::var("HERDR_PURE_CLIENT") {
         Ok(value) if value == "1" => true,
         Ok(value) if value == "0" => false,
-        _ => config.experimental.pure_client.unwrap_or(PURE_CLIENT_DEFAULT),
+        _ => config
+            .experimental
+            .pure_client
+            .unwrap_or(PURE_CLIENT_DEFAULT),
     }
 }
 
@@ -1293,11 +1296,14 @@ fn try_paste_image(
     let Some(pane_id) = focused_public_pane(mirrors, ids, app) else {
         return false;
     };
-    let negotiated_paste_image = mirrors.local().connection.negotiated().is_some_and(
-        |negotiated| {
-            negotiated.has_capability(crate::protocol::framed::CAPABILITY_PASTE_IMAGE)
-        },
-    );
+    let negotiated_paste_image =
+        mirrors
+            .local()
+            .connection
+            .negotiated()
+            .is_some_and(|negotiated| {
+                negotiated.has_capability(crate::protocol::framed::CAPABILITY_PASTE_IMAGE)
+            });
     if !negotiated_paste_image {
         return false;
     }
@@ -1603,7 +1609,10 @@ mod tests {
             "unset by default so the release default applies"
         );
         assert_eq!(pure_client_enabled(&config), PURE_CLIENT_DEFAULT);
-        assert!(!PURE_CLIENT_DEFAULT, "default stays legacy until the flip");
+        assert!(
+            !pure_client_enabled(&config),
+            "release-gated: the default stays legacy until the documented flip"
+        );
 
         // An explicit user setting always wins over the release default —
         // in both directions, so opt-ins and opt-outs survive the flip.

@@ -593,9 +593,8 @@ mod tests {
         let methods = {
             let ws_ids: Vec<String> = app.workspaces.iter().map(|ws| ws.id.clone()).collect();
             let catalog = &mirrors.local().catalog;
-            let pane_public = |pane_id: crate::layout::PaneId| {
-                ids.public_pane_id(pane_id).map(str::to_owned)
-            };
+            let pane_public =
+                |pane_id: crate::layout::PaneId| ids.public_pane_id(pane_id).map(str::to_owned);
             let tab_public = |ws_idx: usize, tab_idx: usize| {
                 composed_tab_public_id(catalog, ws_ids.get(ws_idx)?, tab_idx)
             };

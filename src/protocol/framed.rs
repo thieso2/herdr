@@ -64,6 +64,10 @@ pub const CAPABILITY_WINDOW_TITLE: &str = "window-title";
 /// Capability gating the `pane.paste_image` method.
 pub const CAPABILITY_PASTE_IMAGE: &str = "paste-image";
 
+/// Capability gating the `session.snapshot` control method and `catalog.event`
+/// broadcasts of the session catalog event stream.
+pub const CAPABILITY_CATALOG: &str = "catalog";
+
 /// Capability flags this server advertises during `session.hello`.
 /// Capabilities are additive feature flags; the negotiated set is the
 /// intersection with the client's flags.
@@ -72,10 +76,16 @@ pub const SERVER_CAPABILITIES: &[&str] = &[
     CAPABILITY_NOTIFICATION,
     CAPABILITY_WINDOW_TITLE,
     CAPABILITY_PASTE_IMAGE,
+    CAPABILITY_CATALOG,
 ];
 
 /// Control-plane method opening a framed session.
 pub const SESSION_HELLO_METHOD: &str = "session.hello";
+
+/// Control-plane method returning the full session catalog snapshot plus the
+/// event sequence anchor it is current through. Requires the `catalog`
+/// capability.
+pub const SESSION_SNAPSHOT_METHOD: &str = "session.snapshot";
 
 /// Control-plane heartbeat method.
 pub const PING_METHOD: &str = "ping";
@@ -141,6 +151,11 @@ pub const STREAM_CLOSED_EVENT: &str = "stream.closed";
 /// Event name sent on a write-mode stream whose write grant another client
 /// took over.
 pub const STREAM_REVOKED_EVENT: &str = "stream.revoked";
+
+/// Event frame carrying one session catalog event envelope. Sent only on
+/// sessions that negotiated the `catalog` capability; `data` is the JSON API
+/// event envelope and `seq` its hub sequence.
+pub const CATALOG_EVENT: &str = "catalog.event";
 
 /// Error code answering a `stream.open` that asked for write mode without
 /// takeover while another live stream holds the pane's write grant.
@@ -700,6 +715,61 @@ pub fn session_hello_request(id: &str) -> serde_json::Value {
     })
 }
 
+/// Builds a `session.hello` control request advertising an explicit
+/// capability set, for clients that negotiate more than the default
+/// pane-stream vocabulary.
+// Consumed by the pure-client run path wired in a later stage of #20.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn session_hello_request_with_capabilities(
+    id: &str,
+    capabilities: &[&str],
+) -> serde_json::Value {
+    serde_json::json!({
+        "id": id,
+        "method": SESSION_HELLO_METHOD,
+        "params": {
+            "protocol": FRAMED_PROTOCOL_VERSION,
+            "min_protocol": FRAMED_PROTOCOL_MIN_SUPPORTED,
+            "capabilities": capabilities,
+        },
+    })
+}
+
+/// Builds a `session.snapshot` control request.
+// Consumed by the pure-client run path wired in a later stage of #20.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn session_snapshot_request(id: &str) -> serde_json::Value {
+    serde_json::json!({
+        "id": id,
+        "method": SESSION_SNAPSHOT_METHOD,
+        "params": {},
+    })
+}
+
+/// Parses a `session.snapshot` control response into the snapshot value and
+/// the event sequence anchor the snapshot is current through.
+// Consumed by the pure-client run path wired in a later stage of #20.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn parse_session_snapshot(
+    response: &serde_json::Value,
+) -> Result<(serde_json::Value, u64), String> {
+    if let Some(error) = control_error(response) {
+        return Err(format!("session.snapshot rejected: {}", error.message));
+    }
+    let result = response
+        .get("result")
+        .ok_or_else(|| "session.snapshot response carries no result".to_string())?;
+    let sequence = result
+        .get("sequence")
+        .and_then(|value| value.as_u64())
+        .ok_or_else(|| "session.snapshot result carries no sequence anchor".to_string())?;
+    let snapshot = result
+        .get("snapshot")
+        .cloned()
+        .ok_or_else(|| "session.snapshot result carries no snapshot".to_string())?;
+    Ok((snapshot, sequence))
+}
+
 /// Builds a heartbeat `ping` control request.
 pub fn ping_request(id: &str) -> serde_json::Value {
     serde_json::json!({
@@ -1023,6 +1093,24 @@ pub fn parse_pong(response: &serde_json::Value) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_hello_with_capabilities_and_snapshot_requests_carry_the_vocabulary() {
+        let hello = session_hello_request_with_capabilities(
+            "h1",
+            &[CAPABILITY_PANE_STREAM, CAPABILITY_CATALOG],
+        );
+        assert_eq!(hello["method"], SESSION_HELLO_METHOD);
+        assert_eq!(hello["params"]["protocol"], FRAMED_PROTOCOL_VERSION);
+        assert_eq!(
+            hello["params"]["capabilities"],
+            serde_json::json!(["pane-stream", "catalog"])
+        );
+
+        let snapshot = session_snapshot_request("s1");
+        assert_eq!(snapshot["method"], SESSION_SNAPSHOT_METHOD);
+        assert_eq!(snapshot["id"], "s1");
+    }
     use std::io::Cursor;
 
     // ---- Header codec ----

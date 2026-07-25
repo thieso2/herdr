@@ -42,14 +42,14 @@ use crate::protocol::framed::{
     HistoryCursor, NegotiatedSession, PanePasteImageControlParams, PaneSendBytesControlParams,
     SessionHelloParams, StreamCloseParams, StreamHistoryParams, StreamOpenParams,
     StreamResizeParams, StreamScrollDirection, StreamScrollParams, StreamScrollSource,
-    CAPABILITY_NOTIFICATION, CAPABILITY_PANE_STREAM, CAPABILITY_PASTE_IMAGE,
-    CAPABILITY_WINDOW_TITLE, CONTROL_STREAM_ID, FRAMED_PROTOCOL_MIN_SUPPORTED,
+    CAPABILITY_CATALOG, CAPABILITY_NOTIFICATION, CAPABILITY_PANE_STREAM, CAPABILITY_PASTE_IMAGE,
+    CAPABILITY_WINDOW_TITLE, CATALOG_EVENT, CONTROL_STREAM_ID, FRAMED_PROTOCOL_MIN_SUPPORTED,
     FRAMED_PROTOCOL_VERSION, FRAME_HEADER_BYTES, HISTORY_FETCH_MAX_BYTES,
     HISTORY_PAGE_DEFAULT_BYTES, HISTORY_PAGE_MIN_BYTES, HISTORY_PAGE_SERVED_MAX_BYTES,
     MAX_FRAME_PAYLOAD, NOTIFICATION_POSTED_EVENT, PANE_PASTE_IMAGE_METHOD, PANE_SEND_BYTES_METHOD,
-    PING_METHOD, SESSION_HELLO_METHOD, STREAM_CLOSED_EVENT, STREAM_CLOSE_METHOD,
-    STREAM_HISTORY_METHOD, STREAM_OPEN_METHOD, STREAM_RESIZE_METHOD, STREAM_REVOKED_EVENT,
-    STREAM_SCROLL_METHOD, WINDOW_TITLE_CHANGED_EVENT,
+    PING_METHOD, SESSION_HELLO_METHOD, SESSION_SNAPSHOT_METHOD, STREAM_CLOSED_EVENT,
+    STREAM_CLOSE_METHOD, STREAM_HISTORY_METHOD, STREAM_OPEN_METHOD, STREAM_RESIZE_METHOD,
+    STREAM_REVOKED_EVENT, STREAM_SCROLL_METHOD, WINDOW_TITLE_CHANGED_EVENT,
 };
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -247,7 +247,8 @@ fn run_negotiated_session(
                     return Ok(SessionEnd::ProtocolError);
                 }
                 FrameType::Control => {
-                    if !handle_control_request(stream, session, &frame, api_tx, streams)? {
+                    if !handle_control_request(stream, session, &frame, api_tx, event_hub, streams)?
+                    {
                         return Ok(SessionEnd::PeerClosed);
                     }
                     // Drain stream output after every control frame too, so a
@@ -369,26 +370,37 @@ fn pump_session_output(
 
     let wants_notifications = session.has_capability(CAPABILITY_NOTIFICATION);
     let wants_window_title = session.has_capability(CAPABILITY_WINDOW_TITLE);
-    if wants_notifications || wants_window_title {
+    let wants_catalog = session.has_capability(CAPABILITY_CATALOG);
+    if wants_notifications || wants_window_title || wants_catalog {
         for (sequence, envelope) in event_hub.events_after(*event_cursor) {
             *event_cursor = sequence;
-            let event_name = match envelope.event {
+            let payload = match envelope.event {
                 crate::api::schema::EventKind::NotificationPosted if wants_notifications => {
-                    NOTIFICATION_POSTED_EVENT
+                    serde_json::json!({
+                        "event": NOTIFICATION_POSTED_EVENT,
+                        "seq": sequence,
+                        "data": envelope.data,
+                    })
                 }
                 crate::api::schema::EventKind::WindowTitleChanged if wants_window_title => {
-                    WINDOW_TITLE_CHANGED_EVENT
+                    serde_json::json!({
+                        "event": WINDOW_TITLE_CHANGED_EVENT,
+                        "seq": sequence,
+                        "data": envelope.data,
+                    })
                 }
+                // Notification and window-title facts flow only through their
+                // dedicated capability-gated events, never as catalog events.
+                crate::api::schema::EventKind::NotificationPosted
+                | crate::api::schema::EventKind::WindowTitleChanged => continue,
+                _ if wants_catalog => serde_json::json!({
+                    "event": CATALOG_EVENT,
+                    "seq": sequence,
+                    "data": envelope,
+                }),
                 _ => continue,
             };
-            let sent = write_control_allow_disconnect(
-                stream,
-                &serde_json::json!({
-                    "event": event_name,
-                    "seq": sequence,
-                    "data": envelope.data,
-                }),
-            )?;
+            let sent = write_control_allow_disconnect(stream, &payload)?;
             if !sent {
                 return Ok(PumpOutcome::PeerClosed);
             }
@@ -520,6 +532,7 @@ fn handle_control_request(
     session: &NegotiatedSession,
     frame: &Frame,
     api_tx: &ApiRequestSender,
+    event_hub: &EventHub,
     streams: &mut HashMap<u32, OpenStream>,
 ) -> io::Result<bool> {
     let request = match serde_json::from_slice::<ControlRequest>(&frame.payload) {
@@ -627,6 +640,9 @@ fn handle_control_request(
             );
             write_control_raw_allow_disconnect(stream, &response)
         }
+        SESSION_SNAPSHOT_METHOD => {
+            handle_session_snapshot(stream, session, request, api_tx, event_hub)
+        }
         SESSION_HELLO_METHOD => write_control_allow_disconnect(
             stream,
             &error_response(
@@ -646,6 +662,45 @@ fn handle_control_request(
             ),
         ),
     }
+}
+
+/// Answers `session.snapshot`: the full catalog snapshot from the app thread
+/// plus the event sequence anchor it is current through.
+///
+/// The anchor is read *before* the snapshot is built, so an event racing the
+/// snapshot is replayed to the client rather than lost; catalog event
+/// application is upsert-shaped, so the replay converges.
+fn handle_session_snapshot(
+    stream: &mut LocalStream,
+    session: &NegotiatedSession,
+    request: ControlRequest,
+    api_tx: &ApiRequestSender,
+    event_hub: &EventHub,
+) -> io::Result<bool> {
+    if let Some(rejection) = capability_rejection(session, CAPABILITY_CATALOG, &request) {
+        return write_control_allow_disconnect(stream, &rejection);
+    }
+    let sequence = event_hub.current_sequence();
+    let response = dispatch_to_app_with_timeout(
+        crate::api::schema::Request {
+            id: request.id.clone(),
+            method: crate::api::schema::Method::SessionSnapshot(
+                crate::api::schema::EmptyParams::default(),
+            ),
+        },
+        api_tx,
+        Some(APP_RESPONSE_TIMEOUT),
+    );
+    let anchored = match serde_json::from_str::<serde_json::Value>(&response) {
+        Ok(mut value) => {
+            if let Some(result) = value.get_mut("result").and_then(|r| r.as_object_mut()) {
+                result.insert("sequence".to_owned(), serde_json::json!(sequence));
+            }
+            value.to_string()
+        }
+        Err(_) => response,
+    };
+    write_control_raw_allow_disconnect(stream, &anchored)
 }
 
 /// Opens a pane output stream: allocates the stream id, registers the pending
@@ -1956,6 +2011,135 @@ mod tests {
             serde_json::json!({"id": "p1", "method": "ping", "params": {}}),
         );
         assert_eq!(read_control(&mut client)["result"]["type"], "pong");
+
+        finish(client, done_rx, thread, path);
+    }
+
+    #[test]
+    fn framed_session_snapshot_requires_the_catalog_capability() {
+        let (mut client, server, path) = local_stream_pair("snapshot-gated");
+        let (done_rx, thread) = spawn_connection(server);
+
+        hello(&mut client, "h20", &["pane-stream"]);
+        send_control(
+            &mut client,
+            serde_json::json!({"id": "sn1", "method": "session.snapshot", "params": {}}),
+        );
+        let error = read_control(&mut client);
+        assert_eq!(error["error"]["code"], "capability_not_negotiated");
+        assert_eq!(error["error"]["data"]["capability"], "catalog");
+
+        finish(client, done_rx, thread, path);
+    }
+
+    #[test]
+    fn framed_session_snapshot_returns_snapshot_with_sequence_anchor() {
+        let event_hub = EventHub::default();
+        event_hub.push(crate::api::schema::EventEnvelope {
+            event: crate::api::schema::EventKind::PaneClosed,
+            data: crate::api::schema::EventData::PaneClosed {
+                pane_id: "p_0".into(),
+                workspace_id: "ws_0".into(),
+            },
+        });
+        let anchor = event_hub.current_sequence();
+
+        let (api_tx, mut api_rx) = tokio::sync::mpsc::unbounded_channel::<ApiRequestMessage>();
+        let responder = std::thread::spawn(move || {
+            while let Some(msg) = api_rx.blocking_recv() {
+                let Method::SessionSnapshot(_) = msg.request.method else {
+                    panic!("unexpected method {:?}", msg.request.method);
+                };
+                let snapshot = crate::api::schema::SessionSnapshot {
+                    version: "test".into(),
+                    protocol: 3,
+                    focused_workspace_id: Some("ws_1".into()),
+                    focused_tab_id: None,
+                    focused_pane_id: None,
+                    workspaces: Vec::new(),
+                    tabs: Vec::new(),
+                    panes: Vec::new(),
+                    layouts: Vec::new(),
+                    agents: Vec::new(),
+                };
+                let response = serde_json::to_string(&SuccessResponse {
+                    id: msg.request.id,
+                    result: ResponseResult::SessionSnapshot {
+                        snapshot: Box::new(snapshot),
+                    },
+                })
+                .unwrap();
+                msg.respond_to.send(response).unwrap();
+            }
+        });
+
+        let (mut client, server, path) = local_stream_pair("snapshot");
+        let (done_rx, thread) = spawn_connection_with(server, api_tx.clone(), event_hub.clone());
+
+        hello(&mut client, "h21", &["catalog"]);
+        send_control(
+            &mut client,
+            serde_json::json!({"id": "sn2", "method": "session.snapshot", "params": {}}),
+        );
+        let response = read_control(&mut client);
+        assert_eq!(response["id"], "sn2");
+        assert_eq!(response["result"]["type"], "session_snapshot");
+        assert_eq!(response["result"]["sequence"], anchor);
+        assert_eq!(response["result"]["snapshot"]["version"], "test");
+
+        // The client-side parser reads the same shape.
+        let (snapshot, sequence) =
+            crate::protocol::framed::parse_session_snapshot(&response).unwrap();
+        assert_eq!(sequence, anchor);
+        assert_eq!(snapshot["focused_workspace_id"], "ws_1");
+
+        finish(client, done_rx, thread, path);
+        drop(api_tx);
+        responder.join().unwrap();
+    }
+
+    #[test]
+    fn framed_catalog_events_broadcast_when_negotiated() {
+        let event_hub = EventHub::default();
+        let (mut client, server, path) = local_stream_pair("catalog-events");
+        let (api_tx, _api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (done_rx, thread) = spawn_connection_with(server, api_tx, event_hub.clone());
+
+        hello(&mut client, "h22", &["catalog"]);
+
+        event_hub.push(crate::api::schema::EventEnvelope {
+            event: crate::api::schema::EventKind::PaneClosed,
+            data: crate::api::schema::EventData::PaneClosed {
+                pane_id: "p_1".into(),
+                workspace_id: "ws_1".into(),
+            },
+        });
+        let event = read_control(&mut client);
+        assert_eq!(event["event"], "catalog.event");
+        assert!(event["seq"].as_u64().unwrap() > 0);
+        assert_eq!(event["data"]["event"], "pane_closed");
+        assert_eq!(event["data"]["data"]["pane_id"], "p_1");
+
+        // Notification facts never masquerade as catalog events; without the
+        // notification capability this event is skipped entirely.
+        event_hub.push(crate::api::schema::EventEnvelope {
+            event: crate::api::schema::EventKind::NotificationPosted,
+            data: crate::api::schema::EventData::NotificationPosted {
+                kind: crate::api::schema::NotificationEventKind::Toast,
+                message: "not a catalog fact".into(),
+                body: None,
+            },
+        });
+        event_hub.push(crate::api::schema::EventEnvelope {
+            event: crate::api::schema::EventKind::WorkspaceFocused,
+            data: crate::api::schema::EventData::WorkspaceFocused {
+                workspace_id: "ws_2".into(),
+            },
+        });
+        let event = read_control(&mut client);
+        assert_eq!(event["event"], "catalog.event");
+        assert_eq!(event["data"]["event"], "workspace_focused");
+        assert_eq!(event["data"]["data"]["workspace_id"], "ws_2");
 
         finish(client, done_rx, thread, path);
     }

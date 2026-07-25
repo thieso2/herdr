@@ -135,29 +135,11 @@ pub(crate) fn poll_local_stream_read(
     stream: &mut LocalStream,
     buf: &mut [u8],
 ) -> io::Result<LocalStreamRead> {
-    #[cfg(unix)]
-    {
-        match stream.read(buf) {
-            Ok(0) => Ok(LocalStreamRead::Closed),
-            Ok(_) => Ok(LocalStreamRead::Data),
-            Err(err) if err.kind() == io::ErrorKind::WouldBlock => Ok(LocalStreamRead::Pending),
-            Err(err) => Err(err),
-        }
-    }
-
-    #[cfg(windows)]
-    {
-        match windows_named_pipe_available(stream)? {
-            None => Ok(LocalStreamRead::Closed),
-            Some(0) => Ok(LocalStreamRead::Pending),
-            Some(_) => match stream.read(buf) {
-                Ok(0) => Ok(LocalStreamRead::Closed),
-                Ok(_) => Ok(LocalStreamRead::Data),
-                Err(err) if is_connection_closed_error(&err) => Ok(LocalStreamRead::Closed),
-                Err(err) => Err(err),
-            },
-        }
-    }
+    Ok(match poll_local_stream_read_len(stream, buf)? {
+        LocalStreamReadLen::Data(_) => LocalStreamRead::Data,
+        LocalStreamReadLen::Pending => LocalStreamRead::Pending,
+        LocalStreamReadLen::Closed => LocalStreamRead::Closed,
+    })
 }
 
 /// Like `poll_local_stream_read`, but reports how many bytes were read so

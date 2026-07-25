@@ -17,18 +17,21 @@ use crate::api::schema::{
 use crate::app::AppState;
 use crate::input::TerminalKey;
 
+use super::chrome::GlobalChrome;
 use super::compose::ComposeIds;
-use super::run::SessionLink;
+use super::run::Links;
 use super::RemoteMirrors;
 
 /// Resolves a prefix-mode key against the configured keybinds into a
-/// control-plane method (or a local chrome mutation) and dispatches it.
+/// control-plane method (or a local chrome mutation) and dispatches it to
+/// the owning remote's session.
 pub(super) fn dispatch_prefix_intent(
     key: TerminalKey,
-    link: &mut SessionLink,
+    links: &mut Links,
     mirrors: &mut RemoteMirrors,
     ids: &mut ComposeIds,
     app: &mut AppState,
+    chrome: &mut GlobalChrome,
 ) {
     // Local chrome first: the sidebar belongs to this client.
     if app.keybinds.toggle_sidebar.matches_prefix_key(key) {
@@ -36,10 +39,13 @@ pub(super) fn dispatch_prefix_intent(
         return;
     }
 
-    let Some((_remote, method)) = prefix_intent_method(key, mirrors, ids, app) else {
+    let Some((remote, method)) = prefix_intent_method(key, mirrors, ids, app) else {
         return;
     };
-    super::run::send_api_request(link, method);
+    // Acting on a remote's content moves the client focus to that remote
+    // (it wins the window title and the composed focus).
+    chrome.selection.focused_remote = remote;
+    super::run::send_api_request(links, remote, method);
 }
 
 /// The owning remote and JSON API method a prefix-mode key maps to, if any.
@@ -225,10 +231,11 @@ pub(super) fn prefix_intent_method(
 /// into a control-plane method and dispatches it.
 pub(super) fn dispatch_mouse_intent(
     mouse: MouseEvent,
-    link: &mut SessionLink,
+    links: &mut Links,
     mirrors: &mut RemoteMirrors,
     ids: &mut ComposeIds,
     app: &mut AppState,
+    chrome: &mut GlobalChrome,
 ) {
     // Hit testing runs on the composed state with no live runtimes: chrome
     // actions resolve exactly, pane-content interactions (selection drags)
@@ -247,10 +254,12 @@ pub(super) fn dispatch_mouse_intent(
         app.mode = mode_before;
         app.context_menu = None;
     }
-    let Some((_remote, method)) = mouse_intent_method(action, mirrors, ids, app) else {
+    let Some((remote, method)) = mouse_intent_method(action, mirrors, ids, app) else {
         return;
     };
-    super::run::send_api_request(link, method);
+    // Clicking into a remote's content moves the client focus there.
+    chrome.selection.focused_remote = remote;
+    super::run::send_api_request(links, remote, method);
 }
 
 /// The owning remote and JSON API method a resolved chrome mouse action
@@ -444,14 +453,22 @@ mod tests {
         crate::ui::compute_view(&mut app, ratatui::layout::Rect::new(0, 0, 106, 20));
         let inner = app.view.pane_infos.first().expect("pane info").inner_rect;
 
-        let mut link = super::super::run::SessionLink::Incompatible;
+        let mut links = super::super::run::Links::new();
+        let mut chrome = super::super::chrome::GlobalChrome::new();
         let mouse = MouseEvent {
             kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Right),
             column: inner.x + 1,
             row: inner.y + 1,
             modifiers: KeyModifiers::empty(),
         };
-        dispatch_mouse_intent(mouse, &mut link, &mut mirrors, &mut ids, &mut app);
+        dispatch_mouse_intent(
+            mouse,
+            &mut links,
+            &mut mirrors,
+            &mut ids,
+            &mut app,
+            &mut chrome,
+        );
 
         assert_eq!(
             app.mode,

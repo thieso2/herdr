@@ -39,7 +39,7 @@ fn scoped_id(remote_index: usize, id: &str) -> String {
 
 /// The composed-view terminal id of a remote pane's terminal.
 pub(crate) fn composed_terminal_id(remote_index: usize, terminal_id: &str) -> TerminalId {
-    TerminalId::from_server(&scoped_id(remote_index, terminal_id))
+    TerminalId::from_server(scoped_id(remote_index, terminal_id))
 }
 
 /// Stable id allocations across compositions, so pane identity (selection,
@@ -236,8 +236,11 @@ fn apply_composition(
 ///
 /// Catalog-derived fields (workspaces, terminals, focus) are rebuilt from
 /// scratch; chrome fields the user owns (mode, scroll positions, sidebar
-/// state) are preserved or applied from `chrome`. The single-mirror path:
-/// no chips, no attribution — exactly today's sidebar.
+/// state) are preserved or applied from `chrome`. The single-mirror seam:
+/// no chips, no attribution — exactly today's sidebar. The run loop
+/// composes over descriptors via [`compose_fleet_into`]; this seam anchors
+/// the byte-identical single-remote characterization.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn compose_into(
     mirror: &RemoteMirror,
     chrome: &GlobalChrome,
@@ -559,6 +562,9 @@ pub(crate) struct MirrorPaneSource<'a> {
 }
 
 impl<'a> MirrorPaneSource<'a> {
+    // Single-mirror seam mirroring `compose_into`; production uses
+    // `for_view` over the in-view descriptor set.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn new(mirror: &'a RemoteMirror) -> Self {
         let mut source = Self {
             by_terminal: HashMap::new(),

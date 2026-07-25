@@ -197,7 +197,164 @@ fn render_chip(app: &AppState, chip: &RemoteChipState, rect: Rect, frame: &mut F
     frame.render_widget(Paragraph::new(Line::from(spans)), rect);
 }
 
+// ---------------------------------------------------------------------
+// Add/edit-remote dialog: the same modal grammar as the worktree dialogs.
+// ---------------------------------------------------------------------
+
+// The dialog and hit-test helpers are consumed only by the unix-only
+// pure-client run path (#20/#23); the strip renderer itself is shared.
+#[cfg_attr(windows, allow(dead_code))]
+const REMOTE_EDIT_POPUP_WIDTH: u16 = 52;
+#[cfg_attr(windows, allow(dead_code))]
+const REMOTE_EDIT_POPUP_HEIGHT: u16 = 14;
+
+/// Inner rect of the add/edit-remote dialog, for render and hit-testing.
+// Consumed only by the unix-only pure-client run path (#20/#23).
+#[cfg_attr(windows, allow(dead_code))]
+pub(crate) fn remote_edit_inner_rect(area: Rect) -> Option<Rect> {
+    super::widgets::centered_popup_rect(area, REMOTE_EDIT_POPUP_WIDTH, REMOTE_EDIT_POPUP_HEIGHT)
+        .map(|popup| {
+            Rect::new(
+                popup.x + 1,
+                popup.y + 1,
+                popup.width.saturating_sub(2),
+                popup.height.saturating_sub(2),
+            )
+        })
+}
+
+/// (save, cancel) button rects inside the dialog.
+// Consumed only by the unix-only pure-client run path (#20/#23).
+#[cfg_attr(windows, allow(dead_code))]
+pub(crate) fn remote_edit_button_rects(inner: Rect) -> (Rect, Rect) {
+    let rects = super::widgets::action_button_row_rects(
+        inner,
+        &[
+            super::widgets::ActionButtonSpec {
+                hint: Some("↵"),
+                label: "save",
+            },
+            super::widgets::ActionButtonSpec {
+                hint: Some("esc"),
+                label: "cancel",
+            },
+        ],
+        2,
+        inner.height.saturating_sub(1),
+    );
+    (rects[0], rects[1])
+}
+
+/// Draws the add/edit-remote dialog over the composed view.
+// Consumed only by the unix-only pure-client run path (#20/#23).
+#[cfg_attr(windows, allow(dead_code))]
+pub(crate) fn render_remote_edit_overlay(
+    app: &AppState,
+    dialog: &crate::client_state::remote_edit::RemoteEditState,
+    frame: &mut Frame,
+) {
+    use ratatui::layout::{Constraint, Layout};
+    use ratatui::widgets::{Clear, Wrap};
+
+    let area = frame.area();
+    super::dim_background(frame, area);
+    let Some(inner) = super::widgets::render_modal_shell(
+        frame,
+        area,
+        REMOTE_EDIT_POPUP_WIDTH,
+        REMOTE_EDIT_POPUP_HEIGHT,
+        &app.palette,
+    ) else {
+        return;
+    };
+    if inner.height < 10 {
+        return;
+    }
+    let p = &app.palette;
+    let rows = Layout::vertical([
+        Constraint::Length(1), // header
+        Constraint::Length(1), // name label
+        Constraint::Length(1), // name input
+        Constraint::Length(1), // target label
+        Constraint::Length(1), // target input
+        Constraint::Length(1), // session label
+        Constraint::Length(1), // session input
+        Constraint::Length(1), // error / hint
+        Constraint::Min(0),
+    ])
+    .areas::<9>(inner);
+
+    let title = if dialog.is_edit() {
+        "edit remote"
+    } else {
+        "add remote"
+    };
+    super::widgets::render_modal_header(frame, rows[0], title, p);
+
+    let fields = [
+        ("name", &dialog.name, rows[1], rows[2]),
+        ("ssh target", &dialog.target, rows[3], rows[4]),
+        ("session", &dialog.session, rows[5], rows[6]),
+    ];
+    for (field_idx, (label, value, label_rect, input_rect)) in fields.into_iter().enumerate() {
+        frame.render_widget(
+            Paragraph::new(format!(" {label}")).style(Style::default().fg(p.overlay0)),
+            label_rect,
+        );
+        let focused = dialog.focused_field == field_idx;
+        let cursor = if focused { "█" } else { "" };
+        frame.render_widget(Clear, input_rect);
+        frame.render_widget(
+            Paragraph::new(format!(" {value}{cursor}")).style(
+                Style::default()
+                    .fg(if focused { p.text } else { p.subtext0 })
+                    .bg(p.surface0),
+            ),
+            input_rect,
+        );
+    }
+
+    if let Some(error) = &dialog.error {
+        frame.render_widget(
+            Paragraph::new(format!(" {error}"))
+                .style(Style::default().fg(p.red))
+                .wrap(Wrap { trim: false }),
+            rows[7],
+        );
+    } else if dialog.is_edit() {
+        frame.render_widget(
+            Paragraph::new(" ctrl-d removes this remote")
+                .style(Style::default().fg(p.overlay0).add_modifier(Modifier::DIM)),
+            rows[7],
+        );
+    }
+
+    let (save_rect, cancel_rect) = remote_edit_button_rects(inner);
+    super::widgets::render_action_button(
+        frame,
+        save_rect,
+        Some("↵"),
+        "save",
+        Style::default()
+            .fg(super::widgets::panel_contrast_fg(p))
+            .bg(p.accent)
+            .add_modifier(Modifier::BOLD),
+    );
+    super::widgets::render_action_button(
+        frame,
+        cancel_rect,
+        Some("esc"),
+        "cancel",
+        Style::default()
+            .fg(p.text)
+            .bg(p.surface0)
+            .add_modifier(Modifier::BOLD),
+    );
+}
+
 /// The chip index under a point, if any.
+// Consumed only by the unix-only pure-client run path (#20/#23).
+#[cfg_attr(windows, allow(dead_code))]
 pub(crate) fn remote_chip_at(app: &AppState, column: u16, row: u16) -> Option<usize> {
     app.view.remote_chip_hit_areas.iter().position(|rect| {
         rect.width > 0 && rect.contains(ratatui::layout::Position::new(column, row))

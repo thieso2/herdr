@@ -1,16 +1,18 @@
 //! Pure-client run loop: the TUI as a framed-protocol client of the local
-//! server (remote #0).
+//! server (remote #0) plus one framed session per enabled fleet remote.
 //!
 //! Enabled by `[experimental] pure_client` (or `HERDR_PURE_CLIENT=1`). The
-//! loop owns a [`super::RemoteMirror`]: it negotiates a framed session with
-//! the `catalog` capability, resyncs the session catalog from
-//! `session.snapshot`, applies `catalog.event` frames, opens pane streams
-//! for the visible tab into [`crate::terminal::replica::PaneReplica`]s, and
-//! renders by composing mirror plus chrome through the shared
-//! `compute_view` + `render` pair. Input is interpreted client-side: keys
-//! encode against the replica's terminal modes and travel as
-//! `pane.send_bytes`, geometry changes travel as `stream.resize`, and
-//! scrollback stays fully local against the replica.
+//! loop owns the keyed [`super::RemoteMirrors`]: per remote it negotiates a
+//! framed session with the `catalog` capability (local over the API socket,
+//! fleet remotes over an SSH stdio bridge child), resyncs the session
+//! catalog from `session.snapshot`, applies `catalog.event` frames, opens
+//! pane streams for the visible tab into
+//! [`crate::terminal::replica::PaneReplica`]s, and renders by composing the
+//! in-view mirrors plus chrome through the shared `compute_view` + `render`
+//! pair. Input is interpreted client-side and dispatched to the remote
+//! owning the focused space or pane; chip clicks mutate view membership
+//! only — connections are never touched by selection. Notifications arrive
+//! from every remote; the focused remote wins the window title.
 
 #![cfg(unix)]
 
@@ -25,7 +27,10 @@ use interprocess::local_socket::traits::Stream as _;
 use interprocess::TryClone as _;
 use tracing::{debug, info, warn};
 
+use std::collections::BTreeMap;
+
 use crate::app::{AppState, Mode};
+use crate::fleet::bridge_child::BridgeChild;
 use crate::ipc::LocalStream;
 use crate::protocol::framed::{
     control_error, pane_send_bytes_request, parse_session_snapshot, parse_session_welcome,
@@ -39,8 +44,9 @@ use crate::protocol::framed::{
 use crate::terminal::TerminalId;
 
 use super::chrome::GlobalChrome;
-use super::compose::{apply_client_config, compose_into, ComposeIds, MirrorPaneSource};
-use super::{RemoteMirrors, SessionCatalog};
+use super::compose::{apply_client_config, compose_fleet_into, ComposeIds, MirrorPaneSource};
+use super::fleet_view::{remote_descriptors, RemoteDescriptor};
+use super::{RemoteMirrors, SessionCatalog, LOCAL_REMOTE_INDEX};
 
 /// How long the pure client waits for the `session.hello` answer.
 const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
@@ -60,12 +66,37 @@ pub(crate) fn pure_client_enabled(config: &crate::config::Config) -> bool {
     }
 }
 
-/// Events the pure-client loop multiplexes.
+/// Double-click window for the remote chips, matching the sidebar's.
+const CHIP_DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(350);
+/// How long a chip status flash (refused toggle) stays visible.
+const STATUS_FLASH_TTL: Duration = Duration::from_millis(2500);
+
+/// Events the pure-client loop multiplexes, tagged with the remote they
+/// belong to.
 enum LoopEvent {
     Stdin(Vec<u8>),
     Resize(u16, u16),
-    Frame(Frame),
-    Disconnected,
+    Frame(usize, Frame),
+    Disconnected(usize),
+    /// A fleet remote's connect thread finished its handshake. The
+    /// generation drops results from threads whose link was reconciled
+    /// away (or replaced) while they were connecting.
+    Established(usize, u64, Box<RemoteEstablished>),
+}
+
+/// Outcome of a fleet remote's connect-plus-handshake thread. On success
+/// the thread keeps running as the session's frame reader; the writer half
+/// and the child guard travel here to the loop.
+enum RemoteEstablished {
+    Connected {
+        welcome: SessionWelcome,
+        writer: std::process::ChildStdin,
+        guard: BridgeChild,
+    },
+    Incompatible {
+        message: String,
+    },
+    Failed(String),
 }
 
 /// In-flight control requests awaiting their response frame.
@@ -77,9 +108,12 @@ enum Pending {
     Api,
 }
 
-/// One connected framed session.
+/// One connected framed session (local socket or SSH bridge child stdio).
 pub(super) struct Session {
-    stream: LocalStream,
+    writer: Box<dyn io::Write + Send>,
+    /// Keeps the SSH bridge child alive for the session's lifetime; dropped
+    /// with the session, which kills the child and unblocks its reader.
+    _guard: Option<BridgeChild>,
     next_request_id: u64,
     pending: HashMap<String, Pending>,
     /// Last size sent per stream id, to keep stream.resize idempotent.
@@ -101,7 +135,7 @@ impl Session {
         let payload = serde_json::to_vec(value)
             .map_err(|err| io::Error::other(format!("failed to encode control frame: {err}")))?;
         write_frame(
-            &mut self.stream,
+            &mut self.writer,
             FrameType::Control,
             CONTROL_STREAM_ID,
             &payload,
@@ -113,16 +147,73 @@ impl Session {
     }
 }
 
-/// Outcome of one connect attempt.
+/// Per-remote connection links, keyed like the mirrors.
+pub(super) type Links = BTreeMap<usize, Link>;
+
+/// The live session for a remote, when its link is up.
+fn session_for(links: &mut Links, remote: usize) -> Option<&mut Session> {
+    match links.get_mut(&remote) {
+        Some(Link::Up(session)) => Some(session),
+        _ => None,
+    }
+}
+
+/// Capabilities every pure-client session asks for.
+const SESSION_CAPABILITIES: &[&str] = &[
+    CAPABILITY_PANE_STREAM,
+    CAPABILITY_CATALOG,
+    crate::protocol::framed::CAPABILITY_NOTIFICATION,
+    crate::protocol::framed::CAPABILITY_WINDOW_TITLE,
+];
+
+/// Outcome of one local connect attempt.
 enum ConnectOutcome {
-    Connected {
-        session: Session,
-        welcome: SessionWelcome,
-    },
-    Incompatible {
-        message: String,
-    },
+    Connected(Box<ConnectedLocal>),
+    Incompatible { message: String },
     Failed(String),
+}
+
+/// The connected-variant payload, boxed to keep the outcome enum small.
+struct ConnectedLocal {
+    session: Session,
+    reader: LocalStream,
+    welcome: SessionWelcome,
+}
+
+/// Interprets a `session.hello` answer. `Err(None)` means malformed.
+fn interpret_hello_answer(
+    response: &serde_json::Value,
+) -> Result<SessionWelcome, Result<String, String>> {
+    if let Some(error) = control_error(response) {
+        if error.code == "protocol_out_of_window" {
+            // Err(Ok(_)) = incompatible with this message.
+            return Err(Ok(error.message));
+        }
+        return Err(Err(format!("session.hello rejected: {}", error.message)));
+    }
+    match parse_session_welcome(response) {
+        Ok(welcome) => {
+            if !welcome.capabilities.iter().any(|c| c == CAPABILITY_CATALOG) {
+                return Err(Ok(format!(
+                    "server {} does not offer the catalog capability; upgrade that herdr server",
+                    welcome.server_version
+                )));
+            }
+            Ok(welcome)
+        }
+        Err(err) => Err(Err(err)),
+    }
+}
+
+fn fresh_session(writer: Box<dyn io::Write + Send>, guard: Option<BridgeChild>) -> Session {
+    Session {
+        writer,
+        _guard: guard,
+        next_request_id: 1,
+        pending: HashMap::new(),
+        sent_sizes: HashMap::new(),
+        read_only: HashSet::new(),
+    }
 }
 
 /// Connects to the local API socket and negotiates a catalog session.
@@ -140,29 +231,17 @@ fn connect() -> ConnectOutcome {
         return ConnectOutcome::Failed(format!("framed handshake failed: {err}"));
     }
 
-    let mut session = Session {
-        stream,
-        next_request_id: 1,
-        pending: HashMap::new(),
-        sent_sizes: HashMap::new(),
-        read_only: HashSet::new(),
+    let hello = session_hello_request_with_capabilities("pure:hello:0", SESSION_CAPABILITIES);
+    let payload = match serde_json::to_vec(&hello) {
+        Ok(payload) => payload,
+        Err(err) => return ConnectOutcome::Failed(format!("hello encode failed: {err}")),
     };
-    let id = session.request_id("hello");
-    let hello = session_hello_request_with_capabilities(
-        &id,
-        &[
-            CAPABILITY_PANE_STREAM,
-            CAPABILITY_CATALOG,
-            crate::protocol::framed::CAPABILITY_NOTIFICATION,
-            crate::protocol::framed::CAPABILITY_WINDOW_TITLE,
-        ],
-    );
-    if let Err(err) = session.send_control(&hello) {
+    if let Err(err) = write_frame(&mut stream, FrameType::Control, CONTROL_STREAM_ID, &payload) {
         return ConnectOutcome::Failed(format!("session.hello send failed: {err}"));
     }
-    let _ = session.stream.set_recv_timeout(Some(HELLO_TIMEOUT));
+    let _ = stream.set_recv_timeout(Some(HELLO_TIMEOUT));
     let response = loop {
-        match read_frame(&mut session.stream) {
+        match read_frame(&mut stream) {
             Ok(frame) if frame.frame_type == FrameType::Control => {
                 match serde_json::from_slice::<serde_json::Value>(&frame.payload) {
                     Ok(value) => break value,
@@ -175,34 +254,139 @@ fn connect() -> ConnectOutcome {
             Err(err) => return ConnectOutcome::Failed(format!("session.hello failed: {err}")),
         }
     };
-    let _ = session.stream.set_recv_timeout(None);
+    let _ = stream.set_recv_timeout(None);
 
-    if let Some(error) = control_error(&response) {
-        if error.code == "protocol_out_of_window" {
-            return ConnectOutcome::Incompatible {
-                message: error.message,
-            };
-        }
-        return ConnectOutcome::Failed(format!("session.hello rejected: {}", error.message));
-    }
-    match parse_session_welcome(&response) {
+    match interpret_hello_answer(&response) {
         Ok(welcome) => {
-            if !welcome.capabilities.iter().any(|c| c == CAPABILITY_CATALOG) {
-                return ConnectOutcome::Incompatible {
-                    message: format!(
-                        "server {} does not offer the catalog capability; upgrade this herdr server",
-                        welcome.server_version
-                    ),
-                };
-            }
             info!(
                 protocol = welcome.protocol,
                 server_version = %welcome.server_version,
                 "pure client negotiated framed catalog session"
             );
-            ConnectOutcome::Connected { session, welcome }
+            let reader = match stream.try_clone() {
+                Ok(reader) => reader,
+                Err(err) => return ConnectOutcome::Failed(format!("socket clone failed: {err}")),
+            };
+            ConnectOutcome::Connected(Box::new(ConnectedLocal {
+                session: fresh_session(Box::new(stream), None),
+                reader,
+                welcome,
+            }))
         }
-        Err(err) => ConnectOutcome::Failed(err),
+        Err(Ok(message)) => ConnectOutcome::Incompatible { message },
+        Err(Err(err)) => ConnectOutcome::Failed(err),
+    }
+}
+
+/// Connect-plus-handshake for one fleet remote, run on its own thread: the
+/// SSH bridge child's stdio carries the framed protocol directly. On
+/// success the same thread becomes the session's frame reader, so the child
+/// stdout never crosses threads.
+fn remote_connect_and_read(
+    descriptor: RemoteDescriptor,
+    generation: u64,
+    event_tx: mpsc::SyncSender<LoopEvent>,
+    should_quit: Arc<AtomicBool>,
+) {
+    let remote = descriptor.index;
+    let Some(target) = descriptor.target.as_deref() else {
+        return;
+    };
+    let established = (|| {
+        let (child, mut stdout, mut stdin) = BridgeChild::spawn(target, &descriptor.session)
+            .map_err(|err| format!("ssh bridge spawn failed: {err}"))?;
+        stdin
+            .write_all(&FRAMED_MAGIC)
+            .and_then(|()| stdin.flush())
+            .map_err(|err| format!("framed handshake failed: {err}"))?;
+        let hello = session_hello_request_with_capabilities("pure:hello:0", SESSION_CAPABILITIES);
+        let payload =
+            serde_json::to_vec(&hello).map_err(|err| format!("hello encode failed: {err}"))?;
+        write_frame(&mut stdin, FrameType::Control, CONTROL_STREAM_ID, &payload)
+            .map_err(|err| format!("session.hello send failed: {err}"))?;
+        let response = loop {
+            let frame = read_frame(&mut stdout).map_err(|err| {
+                let tail = child
+                    .stderr_tail()
+                    .lock()
+                    .map(|tail| tail.trim().replace('\n', "; "))
+                    .unwrap_or_default();
+                if tail.is_empty() {
+                    format!("session.hello failed: {err}")
+                } else {
+                    format!("session.hello failed: {err} (ssh: {tail})")
+                }
+            })?;
+            if frame.frame_type == FrameType::Control {
+                break serde_json::from_slice::<serde_json::Value>(&frame.payload)
+                    .map_err(|err| format!("invalid hello answer: {err}"))?;
+            }
+        };
+        Ok((child, stdout, stdin, response))
+    })();
+
+    let (child, stdout, stdin, response) = match established {
+        Ok(parts) => parts,
+        Err(message) => {
+            let _ = event_tx.send(LoopEvent::Established(
+                remote,
+                generation,
+                Box::new(RemoteEstablished::Failed(message)),
+            ));
+            return;
+        }
+    };
+    match interpret_hello_answer(&response) {
+        Ok(welcome) => {
+            if event_tx
+                .send(LoopEvent::Established(
+                    remote,
+                    generation,
+                    Box::new(RemoteEstablished::Connected {
+                        welcome,
+                        writer: stdin,
+                        guard: child,
+                    }),
+                ))
+                .is_err()
+            {
+                return;
+            }
+        }
+        Err(Ok(message)) => {
+            let _ = event_tx.send(LoopEvent::Established(
+                remote,
+                generation,
+                Box::new(RemoteEstablished::Incompatible { message }),
+            ));
+            return;
+        }
+        Err(Err(message)) => {
+            let _ = event_tx.send(LoopEvent::Established(
+                remote,
+                generation,
+                Box::new(RemoteEstablished::Failed(message)),
+            ));
+            return;
+        }
+    }
+
+    // Reader phase: pump frames until the transport dies. Dropping the
+    // session on the loop side kills the child, which ends this read.
+    let mut stdout = stdout;
+    while !should_quit.load(Ordering::Acquire) {
+        match read_frame(&mut stdout) {
+            Ok(frame) => {
+                if event_tx.send(LoopEvent::Frame(remote, frame)).is_err() {
+                    return;
+                }
+            }
+            Err(err) => {
+                debug!(remote, err = %err, "fleet remote session read ended");
+                let _ = event_tx.send(LoopEvent::Disconnected(remote));
+                return;
+            }
+        }
     }
 }
 
@@ -213,6 +397,15 @@ pub(crate) fn run_pure_client(config: &crate::config::Config) -> io::Result<()> 
     info!("running pure client of the local server (remote #0)");
 
     let mut mirrors = RemoteMirrors::with_local();
+    // The fleet config defines the remotes; every enabled remote gets a
+    // mirror and a connection regardless of view membership.
+    let mut descriptors = remote_descriptors(&crate::fleet::config::load());
+    for descriptor in descriptors.iter().skip(1) {
+        mirrors.insert(super::RemoteMirror::new(
+            descriptor.index,
+            descriptor.name.clone(),
+        ));
+    }
     let mut chrome = GlobalChrome::new();
     let mut ids = ComposeIds::new();
     let mut app = AppState::empty();
@@ -273,6 +466,7 @@ pub(crate) fn run_pure_client(config: &crate::config::Config) -> io::Result<()> 
     let result = run_loop(
         config,
         &mut terminal,
+        &mut descriptors,
         &mut mirrors,
         &mut chrome,
         &mut ids,
@@ -295,14 +489,74 @@ pub(crate) fn run_pure_client(config: &crate::config::Config) -> io::Result<()> 
 /// Connection state the loop threads through reconnects.
 pub(super) enum Link {
     Up(Session),
-    Down { retry_at: Instant },
+    /// A fleet remote's connect thread is in flight.
+    Pending {
+        generation: u64,
+    },
+    Down {
+        retry_at: Instant,
+    },
     Incompatible,
+}
+
+/// Transient interaction bookkeeping owned by the run loop: click timing
+/// and status flashes are neither server facts nor persistent chrome.
+#[derive(Default)]
+struct InteractionState {
+    /// Last chip click, for eager double-click (second click solos).
+    last_chip_click: Option<(usize, Instant)>,
+    /// Short-lived status message (for example a refused chip toggle).
+    status_flash: Option<(String, Instant)>,
+    /// Last window title written to the host terminal.
+    last_window_title: Option<String>,
+    /// Generation source for remote connect threads.
+    next_generation: u64,
+}
+
+/// Everything one input or frame event may touch. Bundled so the event
+/// handlers stay callable from both the blocking receive and the drain
+/// loop without repeating ten arguments.
+struct LoopCtx<'a> {
+    config: &'a crate::config::Config,
+    descriptors: &'a mut Vec<RemoteDescriptor>,
+    links: &'a mut Links,
+    mirrors: &'a mut RemoteMirrors,
+    chrome: &'a mut GlobalChrome,
+    ids: &'a mut ComposeIds,
+    app: &'a mut AppState,
+    ui: &'a mut InteractionState,
+    event_tx: &'a mpsc::SyncSender<LoopEvent>,
+    should_quit: &'a Arc<AtomicBool>,
+    scrollback_limit: usize,
+}
+
+impl LoopCtx<'_> {
+    fn handle_event(&mut self, event: LoopEvent, framer: &mut crate::raw_input::RawInputFramer) {
+        match event {
+            LoopEvent::Stdin(data) => {
+                for raw in framer.push(&data) {
+                    handle_raw_input(raw, self);
+                }
+            }
+            LoopEvent::Resize(cols, rows) => {
+                debug!(cols, rows, "host terminal resized");
+            }
+            LoopEvent::Frame(remote, frame) => handle_server_frame(remote, frame, self),
+            LoopEvent::Disconnected(remote) => {
+                drop_link(remote, self, "connection closed");
+            }
+            LoopEvent::Established(remote, generation, outcome) => {
+                handle_established(remote, generation, *outcome, self);
+            }
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)] // run-loop wiring: every argument is a distinct owned subsystem
 fn run_loop(
     config: &crate::config::Config,
     terminal: &mut ratatui::DefaultTerminal,
+    descriptors: &mut Vec<RemoteDescriptor>,
     mirrors: &mut RemoteMirrors,
     chrome: &mut GlobalChrome,
     ids: &mut ComposeIds,
@@ -311,36 +565,102 @@ fn run_loop(
     event_rx: &mpsc::Receiver<LoopEvent>,
     should_quit: &Arc<AtomicBool>,
 ) -> io::Result<()> {
-    let scrollback_limit = config.advanced.scrollback_limit_bytes;
     let mut framer = crate::raw_input::RawInputFramer::for_host_input();
-    let mut link = establish(mirrors, chrome, event_tx, should_quit);
+    let mut ui = InteractionState::default();
+    let mut links: Links = BTreeMap::new();
+    links.insert(
+        LOCAL_REMOTE_INDEX,
+        establish_local(mirrors, chrome, event_tx, should_quit),
+    );
+    for descriptor in descriptors.iter().skip(1) {
+        let link = establish_remote(descriptor, mirrors, &mut ui, event_tx, should_quit);
+        links.insert(descriptor.index, link);
+    }
+    let mut ctx = LoopCtx {
+        config,
+        descriptors,
+        links: &mut links,
+        mirrors,
+        chrome,
+        ids,
+        app,
+        ui: &mut ui,
+        event_tx,
+        should_quit,
+        scrollback_limit: config.advanced.scrollback_limit_bytes,
+    };
     let mut dirty = true;
 
     loop {
-        if should_quit.load(Ordering::Acquire) || app.should_quit {
+        if ctx.should_quit.load(Ordering::Acquire) || ctx.app.should_quit {
             return Ok(());
         }
 
-        // Reconnect with backoff whenever the link is down.
-        if let Link::Down { retry_at } = &link {
-            if mirrors.local().connection.may_retry() && Instant::now() >= *retry_at {
-                link = establish(mirrors, chrome, event_tx, should_quit);
-                dirty = true;
-            }
+        // Reconnect with backoff whenever a link is down. View membership
+        // never gates this: filtered-out remotes keep reconnecting.
+        let now = Instant::now();
+        let due: Vec<usize> = ctx
+            .links
+            .iter()
+            .filter_map(|(remote, link)| match link {
+                Link::Down { retry_at }
+                    if now >= *retry_at
+                        && ctx
+                            .mirrors
+                            .get(*remote)
+                            .is_some_and(|mirror| mirror.connection.may_retry()) =>
+                {
+                    Some(*remote)
+                }
+                _ => None,
+            })
+            .collect();
+        for remote in due {
+            let link = if remote == LOCAL_REMOTE_INDEX {
+                establish_local(ctx.mirrors, ctx.chrome, ctx.event_tx, ctx.should_quit)
+            } else if let Some(descriptor) = ctx
+                .descriptors
+                .iter()
+                .find(|descriptor| descriptor.index == remote)
+            {
+                establish_remote(
+                    descriptor,
+                    ctx.mirrors,
+                    ctx.ui,
+                    ctx.event_tx,
+                    ctx.should_quit,
+                )
+            } else {
+                continue;
+            };
+            ctx.links.insert(remote, link);
+            dirty = true;
         }
 
         if dirty {
-            compose_into(mirrors.local(), chrome, ids, app);
-            sync_mode(app);
+            compose_fleet_into(ctx.mirrors, ctx.descriptors, ctx.chrome, ctx.ids, ctx.app);
+            apply_status_flash(ctx.ui, ctx.app);
+            sync_mode(ctx.app);
+            let in_view: Vec<usize> = ctx
+                .chrome
+                .selection
+                .in_view(ctx.descriptors)
+                .iter()
+                .map(|descriptor| descriptor.index)
+                .collect();
             let mut resize_requests = Vec::new();
+            let dialog = ctx.chrome.remote_edit.clone();
             terminal.draw(|frame| {
-                let source = MirrorPaneSource::new(mirrors.local());
-                resize_requests = crate::ui::compute_view_with_content(app, &source, frame.area());
-                crate::ui::render_with_content(app, &source, frame);
+                let source = MirrorPaneSource::for_view(ctx.mirrors, &in_view);
+                resize_requests =
+                    crate::ui::compute_view_with_content(ctx.app, &source, frame.area());
+                crate::ui::render_with_content(ctx.app, &source, frame);
+                if let Some(dialog) = &dialog {
+                    crate::ui::render_remote_edit_overlay(ctx.app, dialog, frame);
+                }
             })?;
-            if let Link::Up(session) = &mut link {
-                sync_pane_streams(session, mirrors, &resize_requests, scrollback_limit);
-            }
+            sync_all_pane_streams(&mut ctx, &resize_requests);
+            apply_window_title(&mut ctx);
             dirty = false;
         }
 
@@ -349,50 +669,52 @@ fn run_loop(
             Err(mpsc::RecvTimeoutError::Timeout) => continue,
             Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
         };
-        match event {
-            LoopEvent::Stdin(data) => {
-                for raw in framer.push(&data) {
-                    handle_raw_input(raw, &mut link, mirrors, chrome, ids, app);
-                }
-                dirty = true;
-            }
-            LoopEvent::Resize(cols, rows) => {
-                debug!(cols, rows, "host terminal resized");
-                dirty = true;
-            }
-            LoopEvent::Frame(frame) => {
-                handle_server_frame(frame, &mut link, mirrors, chrome, scrollback_limit);
-                dirty = true;
-            }
-            LoopEvent::Disconnected => {
-                drop_link(&mut link, mirrors, chrome, "server connection closed");
-                dirty = true;
-            }
-        }
+        ctx.handle_event(event, &mut framer);
+        dirty = true;
 
         // Drain whatever queued behind the first event before redrawing.
         while let Ok(event) = event_rx.try_recv() {
-            match event {
-                LoopEvent::Stdin(data) => {
-                    for raw in framer.push(&data) {
-                        handle_raw_input(raw, &mut link, mirrors, chrome, ids, app);
-                    }
-                }
-                LoopEvent::Resize(_, _) => {}
-                LoopEvent::Frame(frame) => {
-                    handle_server_frame(frame, &mut link, mirrors, chrome, scrollback_limit)
-                }
-                LoopEvent::Disconnected => {
-                    drop_link(&mut link, mirrors, chrome, "server connection closed")
-                }
-            }
+            ctx.handle_event(event, &mut framer);
         }
     }
 }
 
-/// Attempts a connection and, on success, kicks off the catalog resync and
-/// the socket reader thread.
-fn establish(
+/// Surfaces a short-lived interaction flash (for example a refused chip
+/// toggle) as the toast of the freshly composed frame.
+fn apply_status_flash(ui: &mut InteractionState, app: &mut AppState) {
+    let Some((message, at)) = &ui.status_flash else {
+        return;
+    };
+    if at.elapsed() > STATUS_FLASH_TTL {
+        ui.status_flash = None;
+        return;
+    }
+    app.toast = Some(crate::app::state::ToastNotification {
+        kind: crate::app::state::ToastKind::NeedsAttention,
+        title: message.clone(),
+        context: "remotes".to_owned(),
+        position: None,
+        target: None,
+    });
+}
+
+/// The focused remote wins the window title; write it only on change.
+fn apply_window_title(ctx: &mut LoopCtx<'_>) {
+    let focused = ctx
+        .chrome
+        .selection
+        .effective_focused_remote(ctx.descriptors);
+    let desired = super::fleet_view::select_window_title(&ctx.chrome.window_titles, focused)
+        .map(str::to_owned);
+    if desired != ctx.ui.last_window_title {
+        crate::client::write_window_title(desired.as_deref());
+        ctx.ui.last_window_title = desired;
+    }
+}
+
+/// Attempts the local connection and, on success, kicks off the catalog
+/// resync and the socket reader thread.
+fn establish_local(
     mirrors: &mut RemoteMirrors,
     chrome: &mut GlobalChrome,
     event_tx: &mpsc::SyncSender<LoopEvent>,
@@ -402,10 +724,12 @@ fn establish(
     debug!(remote = mirror.remote_index, name = %mirror.name, "connecting");
     mirror.connection.connect_started();
     match connect() {
-        ConnectOutcome::Connected {
-            mut session,
-            welcome,
-        } => {
+        ConnectOutcome::Connected(connected) => {
+            let ConnectedLocal {
+                mut session,
+                reader,
+                welcome,
+            } = *connected;
             // The mirror holds what the server actually negotiated, not what
             // this client asked for: capability gates (pane streams) and any
             // protocol downgrade must reflect the welcome.
@@ -431,20 +755,9 @@ fn establish(
                 };
             }
 
-            let read_stream = match session.stream.try_clone() {
-                Ok(stream) => stream,
-                Err(err) => {
-                    mirror.connection_lost(format!("socket clone failed: {err}"));
-                    chrome.connection_status =
-                        Some("local server unreachable; retrying".to_owned());
-                    return Link::Down {
-                        retry_at: Instant::now() + Duration::from_secs(1),
-                    };
-                }
-            };
             let frame_tx = event_tx.clone();
             let reader_quit = Arc::clone(should_quit);
-            std::thread::spawn(move || socket_reader_loop(read_stream, frame_tx, &reader_quit));
+            std::thread::spawn(move || socket_reader_loop(reader, frame_tx, &reader_quit));
             Link::Up(session)
         }
         ConnectOutcome::Incompatible { message } => {
@@ -474,15 +787,134 @@ fn establish(
     }
 }
 
-fn drop_link(link: &mut Link, mirrors: &mut RemoteMirrors, chrome: &mut GlobalChrome, why: &str) {
-    if matches!(link, Link::Incompatible) {
+/// Starts a fleet remote's connect thread (SSH bridge child + handshake).
+/// The thread reports back through [`LoopEvent::Established`] and then
+/// serves as the session's frame reader.
+fn establish_remote(
+    descriptor: &RemoteDescriptor,
+    mirrors: &mut RemoteMirrors,
+    ui: &mut InteractionState,
+    event_tx: &mpsc::SyncSender<LoopEvent>,
+    should_quit: &Arc<AtomicBool>,
+) -> Link {
+    if let Some(mirror) = mirrors.get_mut(descriptor.index) {
+        mirror.connection.connect_started();
+    }
+    ui.next_generation += 1;
+    let generation = ui.next_generation;
+    debug!(remote = descriptor.index, name = %descriptor.name, "connecting via ssh bridge");
+    let descriptor = descriptor.clone();
+    let tx = event_tx.clone();
+    let quit = Arc::clone(should_quit);
+    std::thread::spawn(move || remote_connect_and_read(descriptor, generation, tx, quit));
+    Link::Pending { generation }
+}
+
+/// Applies a fleet remote connect thread's outcome to its link and mirror.
+fn handle_established(
+    remote: usize,
+    generation: u64,
+    outcome: RemoteEstablished,
+    ctx: &mut LoopCtx<'_>,
+) {
+    // Only the thread the current pending link belongs to may report;
+    // reconciled-away or superseded threads are dropped (their child guard
+    // dies with the outcome).
+    if !matches!(
+        ctx.links.get(&remote),
+        Some(Link::Pending { generation: pending }) if *pending == generation
+    ) {
+        debug!(remote, generation, "dropping stale remote connect outcome");
         return;
     }
-    mirrors.local_mut().connection_lost(why);
-    chrome.connection_status = Some(format!("{why}; reconnecting"));
-    *link = Link::Down {
-        retry_at: Instant::now() + Duration::from_millis(500),
+    let Some(mirror) = ctx.mirrors.get_mut(remote) else {
+        ctx.links.remove(&remote);
+        return;
     };
+    match outcome {
+        RemoteEstablished::Connected {
+            welcome,
+            writer,
+            guard,
+        } => {
+            info!(
+                remote,
+                name = %mirror.name,
+                protocol = welcome.protocol,
+                server_version = %welcome.server_version,
+                "fleet remote negotiated framed catalog session"
+            );
+            mirror
+                .connection
+                .connected(crate::protocol::framed::NegotiatedSession {
+                    protocol: welcome.protocol,
+                    capabilities: welcome.capabilities,
+                });
+            mirror.begin_resync();
+            let mut session = fresh_session(Box::new(writer), Some(guard));
+            let id = session.request_id("snapshot");
+            session.pending.insert(id.clone(), Pending::Snapshot);
+            if let Err(err) = session.send_control(&session_snapshot_request(&id)) {
+                drop(session);
+                mirror.connection_lost(format!("snapshot request failed: {err}"));
+                ctx.links.insert(
+                    remote,
+                    Link::Down {
+                        retry_at: Instant::now() + Duration::from_secs(1),
+                    },
+                );
+                return;
+            }
+            ctx.links.insert(remote, Link::Up(session));
+        }
+        RemoteEstablished::Incompatible { message } => {
+            warn!(remote, message = %message, "fleet remote protocol incompatible");
+            mirror
+                .connection
+                .incompatible(crate::protocol::framed::HelloRemedy::UpgradeClient, message);
+            ctx.links.insert(remote, Link::Incompatible);
+        }
+        RemoteEstablished::Failed(error) => {
+            let attempt = match mirror.connection {
+                super::ClientConnectionState::Connecting { attempt } => attempt,
+                _ => 1,
+            };
+            debug!(remote, error = %error, "fleet remote connect failed");
+            mirror.connection_lost(error);
+            let delay = crate::fleet::connection::backoff_delay(
+                attempt,
+                crate::fleet::connection::BackoffTuning::default(),
+                0.5,
+            );
+            ctx.links.insert(
+                remote,
+                Link::Down {
+                    retry_at: Instant::now() + delay,
+                },
+            );
+        }
+    }
+}
+
+/// Drops a remote's link after its transport died and schedules the retry.
+fn drop_link(remote: usize, ctx: &mut LoopCtx<'_>, why: &str) {
+    if matches!(ctx.links.get(&remote), Some(Link::Incompatible) | None) {
+        return;
+    }
+    let Some(mirror) = ctx.mirrors.get_mut(remote) else {
+        ctx.links.remove(&remote);
+        return;
+    };
+    mirror.connection_lost(why);
+    if remote == LOCAL_REMOTE_INDEX {
+        ctx.chrome.connection_status = Some(format!("{why}; reconnecting"));
+    }
+    ctx.links.insert(
+        remote,
+        Link::Down {
+            retry_at: Instant::now() + Duration::from_millis(500),
+        },
+    );
 }
 
 /// Keeps app.mode consistent with the composed catalog without clobbering
@@ -500,17 +932,11 @@ fn sync_mode(app: &mut AppState) {
 /// (no alternate screen, no app cursor, no mouse reporting), mirroring the
 /// legacy attach's local-scrollback routing. Returns false to forward the
 /// key to the pane instead.
-fn scroll_focused_replica_page(
-    code: crossterm::event::KeyCode,
-    link: &mut Link,
-    mirrors: &mut RemoteMirrors,
-    ids: &mut ComposeIds,
-    app: &mut AppState,
-) -> bool {
-    let Some((remote, public)) = focused_public_pane(mirrors, ids, app) else {
+fn scroll_focused_replica_page(code: crossterm::event::KeyCode, ctx: &mut LoopCtx<'_>) -> bool {
+    let Some((remote, public)) = focused_public_pane(ctx.mirrors, ctx.ids, ctx.app) else {
         return false;
     };
-    let Some(mirror) = mirrors.get_mut(remote) else {
+    let Some(mirror) = ctx.mirrors.get_mut(remote) else {
         return false;
     };
     let Some(stream_id) = mirror.stream_for_pane(&public) else {
@@ -534,7 +960,7 @@ fn scroll_focused_replica_page(
         rows
     };
     replica.scroll_delta(delta);
-    request_backfill_if_needed(link, stream_id, remote, mirrors);
+    request_backfill_if_needed(ctx.links, ctx.mirrors, remote, stream_id);
     true
 }
 
@@ -542,12 +968,12 @@ fn scroll_focused_replica_page(
 /// the top of loaded history. The response prepends through the replica's
 /// rebuild path.
 fn request_backfill_if_needed(
-    link: &mut Link,
-    stream_id: u32,
-    remote: usize,
+    links: &mut Links,
     mirrors: &mut RemoteMirrors,
+    remote: usize,
+    stream_id: u32,
 ) {
-    let Link::Up(session) = link else {
+    let Some(session) = session_for(links, remote) else {
         return;
     };
     let Some(replica) = mirrors
@@ -576,34 +1002,34 @@ fn socket_reader_loop(
     should_quit: &Arc<AtomicBool>,
 ) {
     if stream.set_nonblocking(false).is_err() {
-        let _ = event_tx.send(LoopEvent::Disconnected);
+        let _ = event_tx.send(LoopEvent::Disconnected(LOCAL_REMOTE_INDEX));
         return;
     }
     while !should_quit.load(Ordering::Acquire) {
         match read_frame(&mut stream) {
             Ok(frame) => {
-                if event_tx.send(LoopEvent::Frame(frame)).is_err() {
+                if event_tx
+                    .send(LoopEvent::Frame(LOCAL_REMOTE_INDEX, frame))
+                    .is_err()
+                {
                     return;
                 }
             }
             Err(err) => {
                 debug!(err = %err, "pure client session read ended");
-                let _ = event_tx.send(LoopEvent::Disconnected);
+                let _ = event_tx.send(LoopEvent::Disconnected(LOCAL_REMOTE_INDEX));
                 return;
             }
         }
     }
 }
 
-/// Applies one server frame to the mirror.
-fn handle_server_frame(
-    frame: Frame,
-    link: &mut Link,
-    mirrors: &mut RemoteMirrors,
-    chrome: &mut GlobalChrome,
-    scrollback_limit: usize,
-) {
-    let mirror = mirrors.local_mut();
+/// Applies one server frame to its remote's mirror.
+fn handle_server_frame(remote: usize, frame: Frame, ctx: &mut LoopCtx<'_>) {
+    let scrollback_limit = ctx.scrollback_limit;
+    let Some(mirror) = ctx.mirrors.get_mut(remote) else {
+        return;
+    };
     match frame.frame_type {
         FrameType::Data => {
             if let Some(replica) = mirror.replicas.get_mut(&frame.stream_id) {
@@ -631,13 +1057,68 @@ fn handle_server_frame(
                         // The server's bounded event buffer overflowed past
                         // our cursor: catalog events were lost, so only a
                         // fresh snapshot can repair the mirror.
-                        warn!("catalog events lost to server buffer overflow; resyncing");
-                        if let Link::Up(session) = link {
+                        warn!(
+                            remote,
+                            "catalog events lost to server buffer overflow; resyncing"
+                        );
+                        if let Some(session) = session_for(ctx.links, remote) {
                             let id = session.request_id("snapshot");
                             session.pending.insert(id.clone(), Pending::Snapshot);
                             if let Err(err) = session.send_control(&session_snapshot_request(&id)) {
                                 warn!(err = %err, "catalog resync snapshot request failed");
                                 session.pending.remove(&id);
+                            }
+                        }
+                    }
+                    crate::protocol::framed::NOTIFICATION_POSTED_EVENT => {
+                        // Notifications arrive from every remote; the
+                        // delivery policy is shared with the legacy client,
+                        // plus a remote label when a real fleet is
+                        // configured.
+                        let Some(data) = payload.get("data").cloned() else {
+                            return;
+                        };
+                        let Ok(crate::api::schema::events::EventData::NotificationPosted {
+                            kind,
+                            message,
+                            body,
+                        }) = serde_json::from_value(data)
+                        else {
+                            return;
+                        };
+                        let name = ctx
+                            .descriptors
+                            .iter()
+                            .find(|descriptor| descriptor.index == remote)
+                            .map(|descriptor| descriptor.name.as_str())
+                            .unwrap_or("remote");
+                        let message = super::fleet_view::labeled_notification_message(
+                            remote,
+                            name,
+                            ctx.descriptors.len(),
+                            &message,
+                        );
+                        crate::client::deliver_notification(
+                            kind,
+                            &message,
+                            body.as_deref(),
+                            &ctx.config.ui.sound,
+                        );
+                    }
+                    crate::protocol::framed::WINDOW_TITLE_CHANGED_EVENT => {
+                        // Every remote's title is retained; the focused
+                        // remote's wins the host terminal at draw time.
+                        let title = payload
+                            .get("data")
+                            .and_then(|data| data.get("title"))
+                            .and_then(|value| value.as_str())
+                            .map(str::to_owned);
+                        match title {
+                            Some(title) => {
+                                ctx.chrome.window_titles.insert(remote, title);
+                            }
+                            None => {
+                                ctx.chrome.window_titles.remove(&remote);
                             }
                         }
                     }
@@ -652,7 +1133,7 @@ fn handle_server_frame(
                                 debug!(pane = %pane_id, stream = stream_id, event, "pane stream ended");
                             }
                             mirror.stream_closed(stream_id);
-                            if let Link::Up(session) = link {
+                            if let Some(session) = session_for(ctx.links, remote) {
                                 session.sent_sizes.remove(&stream_id);
                                 session.read_only.remove(&stream_id);
                             }
@@ -666,7 +1147,7 @@ fn handle_server_frame(
             let Some(id) = payload.get("id").and_then(|value| value.as_str()) else {
                 return;
             };
-            let Link::Up(session) = link else {
+            let Some(session) = session_for(ctx.links, remote) else {
                 return;
             };
             match session.pending.remove(id) {
@@ -700,7 +1181,9 @@ fn handle_server_frame(
                                     session.sent_sizes.remove(&stream_id);
                                     session.read_only.remove(&stream_id);
                                 }
-                                chrome.connection_status = None;
+                                if remote == LOCAL_REMOTE_INDEX {
+                                    ctx.chrome.connection_status = None;
+                                }
                             }
                             Err(err) => warn!(err = %err, "session.snapshot did not deserialize"),
                         }
@@ -816,16 +1299,46 @@ fn handle_server_frame(
     }
 }
 
+/// Syncs pane streams on every connected remote: only the remote owning
+/// the composed active workspace has visible panes; every other remote's
+/// streams close. Selection filters the view, never the connections.
+fn sync_all_pane_streams(
+    ctx: &mut LoopCtx<'_>,
+    resize_requests: &[crate::terminal::PaneResizeRequest],
+) {
+    let owner = ctx
+        .app
+        .active
+        .and_then(|ws_idx| ctx.ids.workspace_owner(ws_idx))
+        .map(|(remote, public)| (remote, public.to_owned()));
+    let remotes: Vec<usize> = ctx.links.keys().copied().collect();
+    for remote in remotes {
+        let Some(session) = session_for(ctx.links, remote) else {
+            continue;
+        };
+        let Some(mirror) = ctx.mirrors.get_mut(remote) else {
+            continue;
+        };
+        let visible = match &owner {
+            Some((owner_remote, workspace_public)) if *owner_remote == remote => {
+                visible_panes_of_workspace(&mirror.catalog, workspace_public)
+            }
+            _ => Vec::new(),
+        };
+        sync_remote_pane_streams(session, mirror, remote, &visible, resize_requests);
+    }
+}
+
 /// Opens streams for visible panes that lack one, closes streams whose
 /// panes left visibility, and pushes stream.resize for panes whose planned
 /// geometry changed.
-fn sync_pane_streams(
+fn sync_remote_pane_streams(
     session: &mut Session,
-    mirrors: &mut RemoteMirrors,
+    mirror: &mut super::RemoteMirror,
+    remote: usize,
+    visible: &[String],
     resize_requests: &[crate::terminal::PaneResizeRequest],
-    _scrollback_limit: usize,
 ) {
-    let mirror = mirrors.local_mut();
     let has_pane_streams = mirror
         .connection
         .negotiated()
@@ -834,12 +1347,9 @@ fn sync_pane_streams(
         return;
     }
 
-    // Visible panes: every pane of the focused workspace's active tab.
-    let visible: Vec<String> = visible_panes(&mirror.catalog);
-
     // Streams for panes no longer visible are closed so resource use tracks
     // panes visible, not panes ever visited.
-    for (pane_id, stream_id) in hidden_pane_streams(mirror, &visible) {
+    for (pane_id, stream_id) in hidden_pane_streams(mirror, visible) {
         debug!(pane = %pane_id, stream = stream_id, "closing pane stream for hidden pane");
         let id = session.request_id("close");
         if let Err(err) = session.send_control(&stream_close_request(&id, stream_id)) {
@@ -850,7 +1360,7 @@ fn sync_pane_streams(
         session.read_only.remove(&stream_id);
     }
 
-    for pane_id in &visible {
+    for pane_id in visible {
         if mirror.stream_for_pane(pane_id).is_some() {
             continue;
         }
@@ -881,14 +1391,15 @@ fn sync_pane_streams(
         }
     }
 
-    // Geometry: translate planned pane resizes into stream.resize.
+    // Geometry: translate planned pane resizes into stream.resize. The
+    // planner speaks composed (remote-scoped) terminal ids.
     let by_terminal: HashMap<TerminalId, String> = mirror
         .catalog
         .panes
         .iter()
         .map(|pane| {
             (
-                TerminalId::from_server(&pane.terminal_id),
+                super::compose::composed_terminal_id(remote, &pane.terminal_id),
                 pane.pane_id.clone(),
             )
         })
@@ -935,16 +1446,8 @@ fn hidden_pane_streams(mirror: &super::RemoteMirror, visible: &[String]) -> Vec<
         .collect()
 }
 
-/// The panes of the focused workspace's active tab.
-fn visible_panes(catalog: &SessionCatalog) -> Vec<String> {
-    let Some(workspace_id) = catalog.focused_workspace_id.as_deref().or_else(|| {
-        catalog
-            .workspaces
-            .first()
-            .map(|workspace| workspace.workspace_id.as_str())
-    }) else {
-        return Vec::new();
-    };
+/// The panes of one workspace's active tab.
+fn visible_panes_of_workspace(catalog: &SessionCatalog, workspace_id: &str) -> Vec<String> {
     let Some(workspace) = catalog.workspace(workspace_id) else {
         return Vec::new();
     };
@@ -957,26 +1460,22 @@ fn visible_panes(catalog: &SessionCatalog) -> Vec<String> {
 }
 
 /// Interprets one host input event client-side.
-fn handle_raw_input(
-    raw: crate::raw_input::RawInputEvent,
-    link: &mut Link,
-    mirrors: &mut RemoteMirrors,
-    chrome: &mut GlobalChrome,
-    ids: &mut ComposeIds,
-    app: &mut AppState,
-) {
+fn handle_raw_input(raw: crate::raw_input::RawInputEvent, ctx: &mut LoopCtx<'_>) {
     match raw {
-        crate::raw_input::RawInputEvent::Key(key) => handle_key(key, link, mirrors, ids, app),
+        crate::raw_input::RawInputEvent::Key(key) => handle_key(key, ctx),
         crate::raw_input::RawInputEvent::Paste(text) => {
-            if app.mode == Mode::Terminal {
-                if let Some((_remote, pane_id, bytes)) = encode_paste(mirrors, ids, app, &text) {
-                    send_pane_bytes(link, &pane_id, &bytes);
+            if ctx.chrome.remote_edit.is_some() {
+                return;
+            }
+            if ctx.app.mode == Mode::Terminal {
+                if let Some((remote, pane_id, bytes)) =
+                    encode_paste(ctx.mirrors, ctx.ids, ctx.app, &text)
+                {
+                    send_pane_bytes(ctx.links, remote, &pane_id, &bytes);
                 }
             }
         }
-        crate::raw_input::RawInputEvent::Mouse(mouse) => {
-            handle_mouse(mouse, link, mirrors, ids, app, chrome)
-        }
+        crate::raw_input::RawInputEvent::Mouse(mouse) => handle_mouse(mouse, ctx),
         _ => {}
     }
 }
@@ -995,46 +1494,68 @@ fn focused_public_pane(
     Some((remote, public.to_owned()))
 }
 
-fn handle_key(
-    key: crate::input::TerminalKey,
-    link: &mut Link,
-    mirrors: &mut RemoteMirrors,
-    ids: &mut ComposeIds,
-    app: &mut AppState,
-) {
+fn handle_key(key: crate::input::TerminalKey, ctx: &mut LoopCtx<'_>) {
     use crossterm::event::KeyCode;
 
-    if key.kind == crossterm::event::KeyEventKind::Release {
-        forward_key(key, link, mirrors, ids, app);
+    // The add/edit-remote dialog captures the keyboard while open.
+    if ctx.chrome.remote_edit.is_some() {
+        if key.kind == crossterm::event::KeyEventKind::Release {
+            return;
+        }
+        let result = ctx
+            .chrome
+            .remote_edit
+            .as_mut()
+            .map(|dialog| super::remote_edit::remote_edit_apply_key(dialog, key));
+        match result {
+            Some(super::remote_edit::RemoteEditKeyResult::Submit) => submit_remote_edit(ctx),
+            Some(super::remote_edit::RemoteEditKeyResult::Remove) => remove_edited_remote(ctx),
+            Some(super::remote_edit::RemoteEditKeyResult::Cancel) => {
+                ctx.chrome.remote_edit = None;
+            }
+            _ => {}
+        }
         return;
     }
 
-    match app.mode {
+    if key.kind == crossterm::event::KeyEventKind::Release {
+        forward_key(key, ctx);
+        return;
+    }
+
+    match ctx.app.mode {
         Mode::Prefix => {
-            app.mode = Mode::Terminal;
+            ctx.app.mode = Mode::Terminal;
             match key.code {
                 KeyCode::Char('d') => {
-                    app.should_quit = true;
+                    ctx.app.should_quit = true;
                 }
                 KeyCode::Esc => {}
-                _ => super::intent::dispatch_prefix_intent(key, link, mirrors, ids, app),
+                _ => super::intent::dispatch_prefix_intent(
+                    key,
+                    ctx.links,
+                    ctx.mirrors,
+                    ctx.ids,
+                    ctx.app,
+                    ctx.chrome,
+                ),
             }
         }
         Mode::Terminal => {
-            if app.is_prefix_key(key) {
-                app.mode = Mode::Prefix;
+            if ctx.app.is_prefix_key(key) {
+                ctx.app.mode = Mode::Prefix;
                 return;
             }
             if matches!(key.code, KeyCode::PageUp | KeyCode::PageDown)
-                && scroll_focused_replica_page(key.code, link, mirrors, ids, app)
+                && scroll_focused_replica_page(key.code, ctx)
             {
                 return;
             }
-            forward_key(key, link, mirrors, ids, app);
+            forward_key(key, ctx);
         }
         Mode::Navigate => {
             if key.code == KeyCode::Char('q') {
-                app.should_quit = true;
+                ctx.app.should_quit = true;
             }
         }
         _ => {
@@ -1042,25 +1563,116 @@ fn handle_key(
             // folds back to the base modes instead of trapping the user (or
             // quitting the whole client from inside a dead modal).
             if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
-                app.context_menu = None;
-                app.mode = Mode::Navigate;
+                ctx.app.context_menu = None;
+                ctx.app.mode = Mode::Navigate;
             }
         }
     }
 }
 
-/// Encodes and forwards a key to the focused pane.
-fn forward_key(
-    key: crate::input::TerminalKey,
-    link: &mut Link,
-    mirrors: &mut RemoteMirrors,
-    ids: &mut ComposeIds,
-    app: &mut AppState,
-) {
-    let Some((remote, pane_id)) = focused_public_pane(mirrors, ids, app) else {
+/// Validates and saves the dialog's remote, then reconciles the running
+/// fleet against the freshly saved config.
+fn submit_remote_edit(ctx: &mut LoopCtx<'_>) {
+    let Some(dialog) = ctx.chrome.remote_edit.clone() else {
         return;
     };
-    let Some(mirror) = mirrors.get(remote) else {
+    let entry = match dialog.entry() {
+        Ok(entry) => entry,
+        Err(err) => {
+            if let Some(dialog) = ctx.chrome.remote_edit.as_mut() {
+                dialog.error = Some(err);
+            }
+            return;
+        }
+    };
+    let original = dialog.original_name.clone();
+    let result = crate::fleet::config::update(move |remotes| {
+        if let Some(original) = &original {
+            if *original != entry.name {
+                crate::fleet::config::remove_in(remotes, original);
+            }
+        }
+        crate::fleet::config::upsert_in(remotes, entry);
+    });
+    match result {
+        Ok(((), remotes)) => {
+            ctx.chrome.remote_edit = None;
+            reconcile_fleet(&remotes, ctx);
+        }
+        Err(err) => {
+            if let Some(dialog) = ctx.chrome.remote_edit.as_mut() {
+                dialog.error = Some(err.to_string());
+            }
+        }
+    }
+}
+
+/// Removes the remote the dialog is editing, then reconciles.
+fn remove_edited_remote(ctx: &mut LoopCtx<'_>) {
+    let Some(name) = ctx
+        .chrome
+        .remote_edit
+        .as_ref()
+        .and_then(|dialog| dialog.original_name.clone())
+    else {
+        return;
+    };
+    match crate::fleet::config::remove_remote(&name) {
+        Ok((_, remotes)) => {
+            ctx.chrome.remote_edit = None;
+            reconcile_fleet(&remotes, ctx);
+        }
+        Err(err) => {
+            if let Some(dialog) = ctx.chrome.remote_edit.as_mut() {
+                dialog.error = Some(err.to_string());
+            }
+        }
+    }
+}
+
+/// Diffs the freshly saved config against the running fleet: identity
+/// changes (or removals) tear the remote's link and mirror down, additions
+/// get a fresh mirror and a link the reconnect scan picks up immediately.
+fn reconcile_fleet(entries: &[crate::fleet::config::RemoteEntry], ctx: &mut LoopCtx<'_>) {
+    let new_descriptors = remote_descriptors(entries);
+    for old in ctx.descriptors.iter().skip(1) {
+        let unchanged = new_descriptors.get(old.index).is_some_and(|new| {
+            new.name == old.name && new.target == old.target && new.session == old.session
+        });
+        if !unchanged {
+            debug!(remote = old.index, name = %old.name, "tearing down reconfigured remote");
+            ctx.links.remove(&old.index);
+            ctx.mirrors.remove(old.index);
+            ctx.chrome.window_titles.remove(&old.index);
+        }
+    }
+    for new in new_descriptors.iter().skip(1) {
+        if ctx.mirrors.get(new.index).is_none() {
+            ctx.mirrors
+                .insert(super::RemoteMirror::new(new.index, new.name.clone()));
+        }
+        ctx.links.entry(new.index).or_insert(Link::Down {
+            retry_at: Instant::now(),
+        });
+    }
+    *ctx.descriptors = new_descriptors;
+    ctx.chrome.selection.retain(ctx.descriptors);
+    let valid: std::collections::BTreeSet<usize> = ctx
+        .descriptors
+        .iter()
+        .map(|descriptor| descriptor.index)
+        .collect();
+    ctx.chrome
+        .window_titles
+        .retain(|remote, _| valid.contains(remote));
+}
+
+/// Encodes and forwards a key to the focused pane on its owning remote.
+fn forward_key(key: crate::input::TerminalKey, ctx: &mut LoopCtx<'_>) {
+    let Some((remote, pane_id)) = focused_public_pane(ctx.mirrors, ctx.ids, ctx.app) else {
+        return;
+    };
+    let Some(mirror) = ctx.mirrors.get(remote) else {
         return;
     };
     let replica = mirror
@@ -1094,7 +1706,7 @@ fn forward_key(
         if application_cursor {
             let bytes = crate::input::encode_cursor_key(key.code, true);
             if !bytes.is_empty() {
-                send_pane_bytes(link, &pane_id, &bytes);
+                send_pane_bytes(ctx.links, remote, &pane_id, &bytes);
             }
             return;
         }
@@ -1103,7 +1715,7 @@ fn forward_key(
     if bytes.is_empty() {
         return;
     }
-    send_pane_bytes(link, &pane_id, &bytes);
+    send_pane_bytes(ctx.links, remote, &pane_id, &bytes);
 }
 
 fn encode_paste(
@@ -1131,8 +1743,8 @@ fn encode_paste(
     Some((remote, pane_id, bytes))
 }
 
-fn send_pane_bytes(link: &mut Link, pane_id: &str, bytes: &[u8]) {
-    let Link::Up(session) = link else {
+fn send_pane_bytes(links: &mut Links, remote: usize, pane_id: &str, bytes: &[u8]) {
+    let Some(session) = session_for(links, remote) else {
         return;
     };
     let id = session.request_id("input");
@@ -1145,17 +1757,36 @@ fn send_pane_bytes(link: &mut Link, pane_id: &str, bytes: &[u8]) {
 /// panes); buttons and drags inside reporting panes are encoded and
 /// forwarded; remaining clicks resolve against the computed view into
 /// focus intents.
-fn handle_mouse(
-    mouse: MouseEvent,
-    link: &mut Link,
-    mirrors: &mut RemoteMirrors,
-    ids: &mut ComposeIds,
-    app: &mut AppState,
-    _chrome: &mut GlobalChrome,
-) {
+fn handle_mouse(mouse: MouseEvent, ctx: &mut LoopCtx<'_>) {
+    // The add/edit-remote dialog swallows the mouse while open; only its
+    // buttons act.
+    if ctx.chrome.remote_edit.is_some() {
+        handle_dialog_click(mouse, ctx);
+        return;
+    }
+    // Chip strip first: chips and the add affordance are pure client
+    // chrome, hit-tested against the computed view.
+    if let MouseEventKind::Down(button) = mouse.kind {
+        if button == crossterm::event::MouseButton::Left
+            && ctx.app.view.remote_add_hit_area.width > 0
+            && ctx
+                .app
+                .view
+                .remote_add_hit_area
+                .contains(ratatui::layout::Position::new(mouse.column, mouse.row))
+        {
+            ctx.chrome.remote_edit = Some(super::remote_edit::RemoteEditState::add());
+            return;
+        }
+        if let Some(chip_idx) = crate::ui::remote_chip_at(ctx.app, mouse.column, mouse.row) {
+            handle_chip_click(chip_idx, button, ctx);
+            return;
+        }
+    }
     match mouse.kind {
         MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
-            let pane_hit = app
+            let pane_hit = ctx
+                .app
                 .view
                 .pane_infos
                 .iter()
@@ -1167,13 +1798,14 @@ fn handle_mouse(
             let Some((pane_id, inner_rect)) = pane_hit else {
                 return;
             };
-            let Some((remote, public)) = ids
+            let Some((remote, public)) = ctx
+                .ids
                 .public_pane_id(pane_id)
                 .map(|(remote, public)| (remote, public.to_owned()))
             else {
                 return;
             };
-            let Some(mirror) = mirrors.get_mut(remote) else {
+            let Some(mirror) = ctx.mirrors.get_mut(remote) else {
                 return;
             };
             let Some(stream_id) = mirror.stream_for_pane(&public) else {
@@ -1194,25 +1826,108 @@ fn handle_mouse(
                         mouse.modifiers,
                         state.mouse_protocol_encoding,
                     ) {
-                        send_pane_bytes(link, &public, &bytes);
+                        send_pane_bytes(ctx.links, remote, &public, &bytes);
                     }
                 }
                 return;
             }
-            let lines = app.mouse_scroll_lines as isize;
+            let lines = ctx.app.mouse_scroll_lines as isize;
             let delta = if mouse.kind == MouseEventKind::ScrollUp {
                 -lines
             } else {
                 lines
             };
             replica.scroll_delta(delta);
-            request_backfill_if_needed(link, stream_id, remote, mirrors);
+            request_backfill_if_needed(ctx.links, ctx.mirrors, remote, stream_id);
         }
         MouseEventKind::Down(_) | MouseEventKind::Up(_) | MouseEventKind::Drag(_)
-            if forward_reported_mouse_button(mouse, link, mirrors, ids, app) => {}
+            if forward_reported_mouse_button(mouse, ctx) => {}
         _ => {
-            super::intent::dispatch_mouse_intent(mouse, link, mirrors, ids, app);
+            super::intent::dispatch_mouse_intent(
+                mouse,
+                ctx.links,
+                ctx.mirrors,
+                ctx.ids,
+                ctx.app,
+                ctx.chrome,
+            );
         }
+    }
+}
+
+/// A left click toggles the chip's view membership; a second click within
+/// the double-click window solos it; a right click opens the edit dialog.
+/// Selection never touches connections: filtered-out remotes stay
+/// connected and syncing.
+fn handle_chip_click(
+    chip_idx: usize,
+    button: crossterm::event::MouseButton,
+    ctx: &mut LoopCtx<'_>,
+) {
+    let Some(descriptor) = ctx.descriptors.get(chip_idx).cloned() else {
+        return;
+    };
+    match button {
+        crossterm::event::MouseButton::Left => {
+            let now = Instant::now();
+            let double = ctx.ui.last_chip_click.take().is_some_and(|(previous, at)| {
+                previous == chip_idx
+                    && now.saturating_duration_since(at) <= CHIP_DOUBLE_CLICK_WINDOW
+            });
+            if double {
+                ctx.chrome.selection.solo(descriptor.index, ctx.descriptors);
+                return;
+            }
+            ctx.ui.last_chip_click = Some((chip_idx, now));
+            if let Err(refusal) = ctx
+                .chrome
+                .selection
+                .toggle(descriptor.index, ctx.descriptors)
+            {
+                ctx.ui.status_flash = Some((refusal.to_owned(), now));
+            }
+        }
+        crossterm::event::MouseButton::Right => {
+            // Edit the remote behind the chip; the implicit local runtime
+            // is not configurable.
+            if descriptor.index == LOCAL_REMOTE_INDEX {
+                return;
+            }
+            let Some(target) = descriptor.target.clone() else {
+                return;
+            };
+            ctx.chrome.remote_edit = Some(super::remote_edit::RemoteEditState::edit(
+                &crate::fleet::config::RemoteEntry {
+                    name: descriptor.name.clone(),
+                    target,
+                    session: descriptor.session.clone(),
+                    enabled: true,
+                },
+            ));
+        }
+        crossterm::event::MouseButton::Middle => {}
+    }
+}
+
+/// Routes a click inside the open add/edit-remote dialog to its buttons.
+fn handle_dialog_click(mouse: MouseEvent, ctx: &mut LoopCtx<'_>) {
+    if !matches!(
+        mouse.kind,
+        MouseEventKind::Down(crossterm::event::MouseButton::Left)
+    ) {
+        return;
+    }
+    let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+    let area = ratatui::layout::Rect::new(0, 0, cols, rows);
+    let Some(inner) = crate::ui::remote_edit_inner_rect(area) else {
+        return;
+    };
+    let (save, cancel) = crate::ui::remote_edit_button_rects(inner);
+    let position = ratatui::layout::Position::new(mouse.column, mouse.row);
+    if save.contains(position) {
+        submit_remote_edit(ctx);
+    } else if cancel.contains(position) {
+        ctx.chrome.remote_edit = None;
     }
 }
 
@@ -1220,13 +1935,8 @@ fn handle_mouse(
 /// pane bytes, focusing the pane first when it was not focused. Returns
 /// false when the event is not over a reporting pane, so it falls through to
 /// chrome intent dispatch.
-fn forward_reported_mouse_button(
-    mouse: MouseEvent,
-    link: &mut Link,
-    mirrors: &mut RemoteMirrors,
-    ids: &mut ComposeIds,
-    app: &mut AppState,
-) -> bool {
+fn forward_reported_mouse_button(mouse: MouseEvent, ctx: &mut LoopCtx<'_>) -> bool {
+    let app = &mut *ctx.app;
     if app.mode != Mode::Terminal {
         return false;
     }
@@ -1242,13 +1952,14 @@ fn forward_reported_mouse_button(
     let Some((pane_id, inner_rect)) = pane_hit else {
         return false;
     };
-    let Some((remote, public)) = ids
+    let Some((remote, public)) = ctx
+        .ids
         .public_pane_id(pane_id)
         .map(|(remote, public)| (remote, public.to_owned()))
     else {
         return false;
     };
-    let Some(mirror) = mirrors.get(remote) else {
+    let Some(mirror) = ctx.mirrors.get(remote) else {
         return false;
     };
     let Some(replica) = mirror
@@ -1281,22 +1992,27 @@ fn forward_reported_mouse_button(
             .and_then(|ws| ws.focused_pane_id());
         if focused != Some(pane_id) {
             send_api_request(
-                link,
+                ctx.links,
+                remote,
                 crate::api::schema::Method::PaneFocus(crate::api::schema::PaneTarget {
                     pane_id: public.clone(),
                 }),
             );
         }
     }
-    send_pane_bytes(link, &public, &bytes);
+    send_pane_bytes(ctx.links, remote, &public, &bytes);
     true
 }
 
-/// Sends a JSON API request over the framed control plane. Fire-and-forget:
-/// the response only surfaces errors, and the resulting catalog events
-/// update the mirror.
-pub(super) fn send_api_request(link: &mut Link, method: crate::api::schema::Method) {
-    let Link::Up(session) = link else {
+/// Sends a JSON API request to one remote's framed control plane.
+/// Fire-and-forget: the response only surfaces errors, and the resulting
+/// catalog events update that remote's mirror.
+pub(super) fn send_api_request(
+    links: &mut Links,
+    remote: usize,
+    method: crate::api::schema::Method,
+) {
+    let Some(session) = session_for(links, remote) else {
         return;
     };
     let id = session.request_id("api");
@@ -1318,8 +2034,6 @@ pub(super) fn send_api_request(link: &mut Link, method: crate::api::schema::Meth
     }
 }
 
-pub(super) use Link as SessionLink;
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1329,47 +2043,191 @@ mod tests {
         crate::input::TerminalKey::new(code, KeyModifiers::empty())
     }
 
-    #[tokio::test]
-    async fn residual_modal_modes_never_quit_on_q() {
-        let mut link = Link::Incompatible;
+    /// Builds a plain-data loop context (no sockets, no threads) and hands
+    /// it to the test body.
+    fn with_test_ctx(descriptors: Vec<RemoteDescriptor>, f: impl FnOnce(&mut LoopCtx<'_>)) {
+        let config = crate::config::Config::default();
+        let mut descriptors = descriptors;
+        let mut links: Links = BTreeMap::new();
         let mut mirrors = RemoteMirrors::with_local();
+        for descriptor in descriptors.iter().skip(1) {
+            mirrors.insert(super::super::RemoteMirror::new(
+                descriptor.index,
+                descriptor.name.clone(),
+            ));
+        }
+        let mut chrome = GlobalChrome::new();
         let mut ids = ComposeIds::new();
         let mut app = AppState::test_new();
+        app.keybinds = crate::config::Config::default().keybinds();
+        let mut ui = InteractionState::default();
+        let (event_tx, _event_rx) = mpsc::sync_channel::<LoopEvent>(64);
+        let should_quit = Arc::new(AtomicBool::new(false));
+        let mut ctx = LoopCtx {
+            config: &config,
+            descriptors: &mut descriptors,
+            links: &mut links,
+            mirrors: &mut mirrors,
+            chrome: &mut chrome,
+            ids: &mut ids,
+            app: &mut app,
+            ui: &mut ui,
+            event_tx: &event_tx,
+            should_quit: &should_quit,
+            scrollback_limit: 64 * 1024,
+        };
+        f(&mut ctx);
+    }
 
-        app.mode = Mode::ContextMenu;
-        handle_key(
-            key(KeyCode::Char('q')),
-            &mut link,
-            &mut mirrors,
-            &mut ids,
-            &mut app,
-        );
-        assert!(
-            !app.should_quit,
-            "q inside a dead modal must not quit the client"
-        );
-        assert_eq!(app.mode, Mode::Navigate);
+    fn three_descriptors() -> Vec<RemoteDescriptor> {
+        remote_descriptors(&[
+            crate::fleet::config::RemoteEntry {
+                name: "buildbox".into(),
+                target: "can@buildbox.example".into(),
+                session: "default".into(),
+                enabled: true,
+            },
+            crate::fleet::config::RemoteEntry {
+                name: "gpu-01".into(),
+                target: "can@gpu-01.example".into(),
+                session: "default".into(),
+                enabled: true,
+            },
+        ])
+    }
 
-        app.mode = Mode::ConfirmClose;
-        handle_key(
-            key(KeyCode::Esc),
-            &mut link,
-            &mut mirrors,
-            &mut ids,
-            &mut app,
-        );
-        assert!(!app.should_quit);
-        assert_eq!(app.mode, Mode::Navigate);
+    #[tokio::test]
+    async fn residual_modal_modes_never_quit_on_q() {
+        with_test_ctx(vec![RemoteDescriptor::local()], |ctx| {
+            ctx.app.mode = Mode::ContextMenu;
+            handle_key(key(KeyCode::Char('q')), ctx);
+            assert!(
+                !ctx.app.should_quit,
+                "q inside a dead modal must not quit the client"
+            );
+            assert_eq!(ctx.app.mode, Mode::Navigate);
 
-        // Navigate itself still quits on q.
-        handle_key(
-            key(KeyCode::Char('q')),
-            &mut link,
-            &mut mirrors,
-            &mut ids,
-            &mut app,
-        );
-        assert!(app.should_quit);
+            ctx.app.mode = Mode::ConfirmClose;
+            handle_key(key(KeyCode::Esc), ctx);
+            assert!(!ctx.app.should_quit);
+            assert_eq!(ctx.app.mode, Mode::Navigate);
+
+            // Navigate itself still quits on q.
+            handle_key(key(KeyCode::Char('q')), ctx);
+            assert!(ctx.app.should_quit);
+        });
+    }
+
+    #[tokio::test]
+    async fn chip_clicks_toggle_and_solo_without_touching_links() {
+        with_test_ctx(three_descriptors(), |ctx| {
+            // A click on chip 1 filters buildbox out of view.
+            handle_chip_click(1, crossterm::event::MouseButton::Left, ctx);
+            assert!(!ctx.chrome.selection.is_in_view(1));
+            assert!(
+                ctx.links.is_empty() && ctx.mirrors.get(1).is_some(),
+                "selection must not create, drop, or disconnect links"
+            );
+
+            // A second click within the window solos buildbox (eager
+            // double-click: the intermediate toggle is superseded).
+            handle_chip_click(1, crossterm::event::MouseButton::Left, ctx);
+            handle_chip_click(1, crossterm::event::MouseButton::Left, ctx);
+            assert!(ctx.chrome.selection.is_in_view(1));
+            assert!(!ctx.chrome.selection.is_in_view(0));
+            assert!(!ctx.chrome.selection.is_in_view(2));
+            assert_eq!(ctx.chrome.selection.focused_remote, 1);
+
+            // Filtering the last in-view remote is refused with a flash.
+            ctx.ui.last_chip_click = None;
+            handle_chip_click(1, crossterm::event::MouseButton::Left, ctx);
+            assert!(ctx.chrome.selection.is_in_view(1));
+            assert!(
+                ctx.ui
+                    .status_flash
+                    .as_ref()
+                    .is_some_and(|(message, _)| message.contains("stays in view")),
+                "refusal surfaces as a status flash"
+            );
+        });
+    }
+
+    #[tokio::test]
+    async fn right_click_opens_the_edit_dialog_for_fleet_remotes_only() {
+        with_test_ctx(three_descriptors(), |ctx| {
+            handle_chip_click(0, crossterm::event::MouseButton::Right, ctx);
+            assert!(
+                ctx.chrome.remote_edit.is_none(),
+                "the implicit local runtime is not configurable"
+            );
+
+            handle_chip_click(2, crossterm::event::MouseButton::Right, ctx);
+            let dialog = ctx.chrome.remote_edit.as_ref().expect("edit dialog");
+            assert_eq!(dialog.original_name.as_deref(), Some("gpu-01"));
+            assert_eq!(dialog.target, "can@gpu-01.example");
+
+            // While the dialog is open, keys go to it, not the session.
+            handle_key(key(KeyCode::Esc), ctx);
+            assert!(ctx.chrome.remote_edit.is_none());
+            assert!(!ctx.app.should_quit);
+        });
+    }
+
+    #[tokio::test]
+    async fn reconcile_replaces_identity_changes_and_drops_removed_remotes() {
+        with_test_ctx(three_descriptors(), |ctx| {
+            ctx.links.insert(1, Link::Incompatible);
+            ctx.links.insert(2, Link::Incompatible);
+            ctx.chrome.window_titles.insert(2, "gpu title".into());
+            ctx.chrome.selection.solo(2, ctx.descriptors);
+
+            // gpu-01 is removed; buildbox changes target (identity change).
+            let entries = vec![crate::fleet::config::RemoteEntry {
+                name: "buildbox".into(),
+                target: "can@buildbox2.example".into(),
+                session: "default".into(),
+                enabled: true,
+            }];
+            reconcile_fleet(&entries, ctx);
+
+            assert_eq!(ctx.descriptors.len(), 2);
+            assert!(ctx.mirrors.get(2).is_none(), "removed remote is gone");
+            assert!(!ctx.chrome.window_titles.contains_key(&2));
+            assert!(
+                matches!(ctx.links.get(&1), Some(Link::Down { .. })),
+                "identity change reconnects from scratch"
+            );
+            assert!(
+                ctx.chrome.selection.is_in_view(0) || ctx.chrome.selection.is_in_view(1),
+                "the view never ends up empty after a reconcile"
+            );
+        });
+    }
+
+    #[tokio::test]
+    async fn established_outcomes_from_stale_generations_are_dropped() {
+        with_test_ctx(three_descriptors(), |ctx| {
+            ctx.links.insert(1, Link::Pending { generation: 2 });
+            handle_established(1, 1, RemoteEstablished::Failed("stale thread".into()), ctx);
+            assert!(
+                matches!(ctx.links.get(&1), Some(Link::Pending { generation: 2 })),
+                "a superseded connect thread must not disturb the live link"
+            );
+
+            handle_established(
+                1,
+                2,
+                RemoteEstablished::Incompatible {
+                    message: "windows do not overlap".into(),
+                },
+                ctx,
+            );
+            assert!(matches!(ctx.links.get(&1), Some(Link::Incompatible)));
+            assert!(matches!(
+                ctx.mirrors.get(1).map(|mirror| &mirror.connection),
+                Some(super::super::ClientConnectionState::Incompatible { .. })
+            ));
+        });
     }
 
     #[test]

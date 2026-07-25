@@ -48,7 +48,11 @@ pub(crate) use self::release_notes::{
     RELEASE_NOTES_MODAL_SIZE,
 };
 use self::release_notes::{render_product_announcement_overlay, render_release_notes_overlay};
-pub(crate) use self::remote_chips::remote_chip_at;
+// Consumed only by the unix-only pure-client run path (#20/#23).
+#[cfg_attr(windows, allow(unused_imports))]
+pub(crate) use self::remote_chips::{
+    remote_chip_at, remote_edit_button_rects, remote_edit_inner_rect, render_remote_edit_overlay,
+};
 use self::remote_chips::{render_remote_chip_strip, split_sidebar_for_chip_strip};
 pub(crate) use self::scrollbar::{
     pane_scrollbar_rect, release_notes_scrollbar_rect, scrollbar_offset_from_drag_row,

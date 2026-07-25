@@ -25,6 +25,8 @@ pub(crate) struct GlobalChrome {
     /// Last window title pushed by each remote; the focused remote's title
     /// wins the host terminal.
     pub(crate) window_titles: std::collections::BTreeMap<usize, String>,
+    /// The add/edit-remote dialog, when open.
+    pub(crate) remote_edit: Option<super::remote_edit::RemoteEditState>,
 }
 
 impl GlobalChrome {

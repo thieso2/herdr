@@ -17,6 +17,7 @@ pub(crate) mod connection;
 pub(crate) mod fleet_view;
 #[cfg(unix)]
 pub(crate) mod intent;
+pub(crate) mod remote_edit;
 #[cfg(unix)]
 pub(crate) mod run;
 
@@ -268,6 +269,9 @@ impl RemoteMirrors {
         Self { mirrors }
     }
 
+    // Production reads mirrors through `get`; the direct local accessors
+    // serve the single-mirror seam and its tests.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn local(&self) -> &RemoteMirror {
         self.mirrors
             .get(&LOCAL_REMOTE_INDEX)
@@ -301,10 +305,9 @@ impl RemoteMirrors {
         }
     }
 
-    pub(crate) fn indices(&self) -> Vec<usize> {
-        self.mirrors.keys().copied().collect()
-    }
-
+    // Whole-collection iteration currently only backs tests; composition
+    // walks descriptors instead so view order follows the fleet config.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn iter(&self) -> impl Iterator<Item = &RemoteMirror> {
         self.mirrors.values()
     }

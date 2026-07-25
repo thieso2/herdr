@@ -76,6 +76,9 @@ pub(crate) struct FleetSelection {
 }
 
 impl FleetSelection {
+    // Chrome constructs selections via `Default`; `new` reads better at
+    // test call sites.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn new() -> Self {
         Self::default()
     }

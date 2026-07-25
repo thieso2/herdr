@@ -1,0 +1,458 @@
+<title>herdr — remotes panel prototype</title>
+<style>
+  :root{
+    --crust:#11111b; --base:#1e1e2e; --panel:#181825;
+    --s0:#313244; --s1:#45475a; --sdim:#1e1e2e;
+    --o0:#6c7086; --o1:#7f849c; --text:#cdd6f4; --sub:#a6adc8;
+    --accent:#89b4fa; --mauve:#cba6f7; --green:#a6e3a1; --yellow:#f9e2af;
+    --red:#f38ba8; --blue:#89b4fa; --teal:#94e2d5; --peach:#fab387;
+    --mono:ui-monospace,"Cascadia Mono","JetBrains Mono","DejaVu Sans Mono",Menlo,Consolas,monospace;
+  }
+  html{background:var(--crust)}
+  body{margin:0;font-family:var(--mono);color:var(--sub);background:var(--crust);
+       -webkit-font-smoothing:antialiased}
+  .wrap{max-width:1080px;margin:0 auto;padding:28px 20px 90px}
+  header h1{font-size:15px;font-weight:700;color:var(--text);margin:0 0 4px;letter-spacing:.02em}
+  header p{font-size:12px;color:var(--o1);margin:0 0 20px}
+  .cols{display:flex;gap:24px;align-items:flex-start;flex-wrap:wrap}
+  .termcol{flex:0 0 auto}
+  .termwrap{border:1px solid var(--s0);border-radius:6px;overflow:hidden;background:var(--base);
+            box-shadow:0 8px 32px rgba(0,0,0,.45)}
+  .tabbar,.line{font-size:13px;line-height:1.45;white-space:pre;font-family:var(--mono)}
+  .tabbar{background:var(--panel)}
+  .tbody{display:flex}
+  #sidebar{flex:0 0 auto}
+  #pane{flex:1 1 auto;font-size:13px;line-height:1.45;white-space:pre;padding:0 0 0 1ch;
+        color:var(--o0);min-width:46ch}
+  .line span{cursor:default}
+  .line .clk{cursor:pointer}
+  #status{font-size:11px;color:var(--o1);min-height:18px;padding:8px 2px 0;transition:opacity .5s;opacity:0}
+  #status.show{opacity:1}
+  aside{flex:1 1 300px;min-width:280px;font-size:12px;line-height:1.65}
+  aside h2{font-size:12px;color:var(--text);margin:0 0 6px;font-weight:700}
+  aside h3{font-size:11px;color:var(--o1);margin:16px 0 4px;font-weight:700;
+           text-transform:uppercase;letter-spacing:.08em}
+  aside p{margin:0 0 8px;color:var(--sub)}
+  aside ul{margin:0;padding-left:16px;color:var(--sub)}
+  aside li{margin-bottom:4px}
+  aside .q{color:var(--peach)}
+  aside kbd{background:var(--s0);color:var(--text);border-radius:3px;padding:0 5px;font-size:11px}
+  .switcher{position:fixed;left:50%;bottom:20px;transform:translateX(-50%);
+    display:flex;align-items:center;gap:2px;background:#e6e9f7;color:#11111b;
+    border-radius:999px;padding:6px 8px;font-size:12px;font-weight:700;
+    box-shadow:0 4px 18px rgba(0,0,0,.5);user-select:none;font-family:var(--mono)}
+  .switcher button{all:unset;cursor:pointer;padding:2px 10px;border-radius:999px;font-weight:700}
+  .switcher button:hover{background:rgba(0,0,0,.1)}
+  .switcher button:focus-visible{outline:2px solid var(--accent)}
+  .switcher .lbl{min-width:23ch;text-align:center}
+</style>
+<div class="wrap">
+  <header>
+    <h1>remotes panel + grouped sidebar — 3 takes</h1>
+    <p>everything in the fake terminal is clickable · <kbd>←</kbd>/<kbd>→</kbd> switch variants ·
+       click a remote to toggle it in/out of the view · double-click to solo it</p>
+  </header>
+  <div class="cols">
+    <div class="termcol">
+      <div class="termwrap">
+        <div class="tabbar" id="tabbar"></div>
+        <div class="tbody"><div id="sidebar"></div><div id="pane"></div></div>
+      </div>
+      <div id="status"></div>
+    </div>
+    <aside id="notes"></aside>
+  </div>
+</div>
+<div class="switcher">
+  <button id="prev" aria-label="previous variant">◀</button>
+  <span class="lbl" id="vlabel"></span>
+  <button id="next" aria-label="next variant">▶</button>
+</div>
+<script>
+const P={accent:'#89b4fa',panel:'#181825',s0:'#313244',s1:'#45475a',sdim:'#1e1e2e',
+  o0:'#6c7086',o1:'#7f849c',text:'#cdd6f4',sub:'#a6adc8',mauve:'#cba6f7',green:'#a6e3a1',
+  yellow:'#f9e2af',red:'#f38ba8',blue:'#89b4fa',teal:'#94e2d5',peach:'#fab387'};
+const SPIN=["⠋","⠙","⠹","⠸","⠼","⠴","⠦","⠧","⠇","⠏"];
+const W=26;                       // sidebar width incl. separator col
+const VARIANTS=['A','B','C'];
+const VNAMES={A:'A — remotes section',B:'B — remotes as tree roots',C:'C — chips + color coding'};
+const reduceMotion=matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+const remotes=[
+ {id:0,name:'local',conn:'connected',selected:true,color:P.blue,
+  spaces:[{name:'api',state:'idleseen',branch:'main',ahead:0,behind:0},
+          {name:'website',state:'working',branch:'main',ahead:1,behind:0}],
+  agents:[{ws:'api',tab:'shell',agent:'claude',state:'idleseen'},
+          {ws:'website',tab:'build',agent:'claude',state:'working'}]},
+ {id:1,name:'buildbox',conn:'connected',selected:true,color:P.mauve,
+  spaces:[{name:'herdr',state:'working',branch:'master',ahead:2,behind:0,
+           children:[{name:'fix-panes',state:'blocked'}]}],
+  agents:[{ws:'herdr',tab:'main',agent:'claude',state:'working'},
+          {ws:'fix-panes',tab:'main',agent:'claude',state:'blocked'}]},
+ {id:2,name:'gpu-01',conn:'connecting',selected:false,color:P.peach,
+  spaces:[{name:'train',state:'unknown',branch:'main',ahead:0,behind:0}],
+  agents:[]},
+ {id:3,name:'prod-edge',conn:'offline',selected:true,color:P.teal,
+  spaces:[{name:'edge-api',state:'idleseen',branch:'main',ahead:0,behind:0}],
+  agents:[{ws:'edge-api',tab:'logs',agent:'tail',state:'idleseen'}]},
+];
+
+const st={variant:'A',selSpace:'buildbox/herdr',actAgent:'buildbox/claude/herdr',
+          collapsed:new Set(),tick:0,statusT:null};
+const qv=new URLSearchParams(location.search).get('variant');
+if(VARIANTS.includes(qv))st.variant=qv;
+
+const cp=s=>[...s].length;
+function sp(t,s){return Object.assign({t},s||{})}
+function stateDot(k,grey){ // spaces-list glyphs
+  if(grey)return sp('○',{fg:P.o0});
+  return {blocked:sp('●',{fg:P.red}),working:sp('●',{fg:P.yellow}),
+          done:sp('●',{fg:P.teal}),idleseen:sp('○',{fg:P.green}),
+          unknown:sp('·',{fg:P.o0})}[k];
+}
+function agentIcon(k,grey){
+  if(grey)return sp('○',{fg:P.o0});
+  if(k==='working')return sp(SPIN[st.tick%10],{fg:P.yellow,spin:1});
+  return {blocked:sp('◉',{fg:P.red}),done:sp('●',{fg:P.teal}),
+          idleseen:sp('✓',{fg:P.green}),unknown:sp('○',{fg:P.o0})}[k];
+}
+function connGlyph(r){
+  if(r.conn==='offline')return sp('○',{fg:P.o0});
+  if(r.conn==='connecting')return sp(SPIN[st.tick%10],{fg:P.yellow,spin:1});
+  return sp('●',{fg:P.green});
+}
+function aggDot(r){ // most urgent agent state on that remote
+  if(r.conn==='offline'||!r.agents.length)return null;
+  const rank={blocked:0,working:1,done:2,idleseen:3};
+  const s=[...r.agents].sort((a,b)=>rank[a.state]-rank[b.state])[0].state;
+  return stateDot(s==='working'?'working':s);
+}
+const visible=()=>remotes.filter(r=>r.selected);
+const grouped=()=>visible().length>=2;
+
+function toggleRemote(r){
+  if(r.selected&&visible().length===1){flash('at least one remote stays in view');return}
+  r.selected=!r.selected;render();
+}
+function soloRemote(r){remotes.forEach(x=>x.selected=(x===r));render();}
+// single click waits briefly so a double-click can win and solo instead
+let clickTimer=null;
+function remoteClick(r){clearTimeout(clickTimer);clickTimer=setTimeout(()=>toggleRemote(r),220);}
+function remoteDbl(r){clearTimeout(clickTimer);soloRemote(r);}
+function flash(m){const el=document.getElementById('status');el.textContent=m;
+  el.classList.add('show');clearTimeout(st.statusT);
+  st.statusT=setTimeout(()=>el.classList.remove('show'),2200);}
+
+// ---- line building -------------------------------------------------------
+function line(left,opts){return Object.assign({left:left||[],right:null,bg:null,click:null,dbl:null},opts||{})}
+function blank(){return line([])}
+function sepColor(){return P.s0}
+function renderLines(lines,mount){
+  mount.innerHTML='';
+  for(const ln of lines){
+    const div=document.createElement('div');div.className='line';
+    if(ln.bg)div.style.background=ln.bg;
+    let used=0;
+    const put=c=>{const e=document.createElement('span');e.textContent=c.t;
+      if(c.fg)e.style.color=c.fg;if(c.bg)e.style.background=c.bg;
+      if(c.bold)e.style.fontWeight='700';if(c.dim)e.style.opacity='.55';
+      if(c.spin)e.classList.add('spin');
+      if(c.click||c.dbl){e.classList.add('clk');
+        if(c.click)e.onclick=ev=>{ev.stopPropagation();c.click()};
+        if(c.dbl)e.ondblclick=ev=>{ev.stopPropagation();c.dbl()};}
+      div.appendChild(e);used+=cp(c.t);};
+    ln.left.forEach(put);
+    const rlen=ln.right?ln.right.reduce((n,c)=>n+cp(c.t),0):0;
+    const pad=Math.max(0,W-1-used-rlen);
+    put(sp(' '.repeat(pad)));
+    if(ln.right)ln.right.forEach(put);
+    put(sp('│',{fg:sepColor()}));
+    if(ln.click)div.onclick=ln.click;
+    if(ln.dbl)div.ondblclick=ln.dbl;
+    if(ln.click||ln.dbl)div.classList.add('clk'),div.style.cursor='pointer';
+    mount.appendChild(div);
+  }
+}
+
+// ---- shared pieces -------------------------------------------------------
+function header(label,right){
+  const l=line([sp(' '+label,{fg:P.o0,bold:1})]);
+  if(right)l.right=right;
+  return l;
+}
+function spaceCard(out,r,s,indent,opts){
+  opts=opts||{};
+  const key=r.name+'/'+s.name, sel=st.selSpace===key, off=r.conn==='offline';
+  const isParent=!!s.children&&!opts.noChildren;
+  const ckey='wt:'+key, closed=st.collapsed.has(ckey);
+  const nameStyle=off?{fg:P.o0,dim:1}:(sel?{fg:P.text,bold:1}:{fg:P.sub});
+  const left=[];
+  if(isParent){
+    left.push(sp(' '.repeat(Math.max(0,indent-2))));
+    left.push(sp(closed?'▸':'▾',{fg:P.accent,click:()=>{closed?st.collapsed.delete(ckey):st.collapsed.add(ckey);render()}}));
+    left.push(sp(' '));
+  } else left.push(sp(' '.repeat(indent)));
+  left.push(stateDot(s.state,off));left.push(sp(' '));
+  left.push(sp(s.name,nameStyle));
+  const l0=line(left,{bg:sel?P.s0:null,click:()=>{st.selSpace=key;render()}});
+  if(opts.gutter){l0.left.unshift(sp('▎',{fg:opts.gutter}))}
+  out.push(l0);
+  // branch / git row
+  const bl=[sp(' '.repeat(indent+2))];
+  if(opts.gutter)bl.unshift(sp('▎',{fg:opts.gutter}));
+  bl.push(sp(s.branch,off?{fg:P.o0,dim:1}:(sel?{fg:P.mauve}:{fg:P.o0})));
+  if(s.ahead)bl.push(sp(' '),sp('↑'+s.ahead,{fg:off?P.o0:P.green}));
+  if(s.behind)bl.push(sp(' '),sp('↓'+s.behind,{fg:off?P.o0:P.red}));
+  if(opts.tail)bl.push(sp(' · ',{fg:P.o0,dim:1}),opts.tail);
+  out.push(line(bl,{bg:sel?P.s0:null,click:()=>{st.selSpace=key;render()}}));
+  // worktree children (single row, git tokens suppressed — matches herdr)
+  if(isParent&&!closed)for(const c of s.children){
+    const ck=r.name+'/'+c.name,csel=st.selSpace===ck;
+    const cl=[sp(' '.repeat(indent+2)),stateDot(c.state,off),sp(' '),
+      sp(c.name,off?{fg:P.o0,dim:1}:(csel?{fg:P.text,bold:1}:{fg:P.sub}))];
+    if(opts.gutter)cl.unshift(sp('▎',{fg:opts.gutter}));
+    out.push(line(cl,{bg:csel?P.s0:null,click:()=>{st.selSpace=ck;render()}}));
+  }
+}
+function agentEntry(out,r,a,opts){
+  opts=opts||{};
+  const key=r.name+'/'+a.agent+'/'+a.ws;
+  const off=r.conn==='offline';
+  const active=st.actAgent===key;
+  const l0=[sp(' '),agentIcon(a.state,off),sp(' '),
+    sp(a.ws,off?{fg:P.o0,dim:1}:(active?{fg:P.text,bold:1}:{fg:P.sub,bold:1})),
+    sp(' · ',{fg:P.o0,dim:1}),sp(a.tab,{fg:P.o0,dim:1})];
+  if(opts.remoteTag)l0.push(sp(' · ',{fg:P.o0,dim:1}),sp(r.name,{fg:P.o0,dim:1}));
+  if(opts.gutter)l0.unshift(sp('▎',{fg:opts.gutter}));
+  const c=()=>{st.actAgent=key;st.selSpace=r.name+'/'+(a.ws==='fix-panes'?'fix-panes':a.ws);render()};
+  out.push(line(l0,{bg:active?P.sdim:null,click:c}));
+  const l1=[sp('   '),sp(a.agent,{fg:P.o0,dim:1})];
+  if(opts.gutter)l1.unshift(sp('▎',{fg:opts.gutter}));
+  out.push(line(l1,{bg:active?P.sdim:null,click:c}));
+}
+function footerLine(){
+  return line([sp(' new',{fg:P.o0,click:()=>flash('would open the new-workspace dialog (56×7, accent border) — targets the remote owning the focused space')})],
+    {right:[sp('menu',{fg:P.o0,click:()=>flash('global menu — gains a "remotes" entry?')})]});
+}
+function ruleLine(){return line([sp('─'.repeat(W-1),{fg:P.s0})])}
+function agentsHeader(){
+  return header('agents',[sp('grouped',{fg:P.o0,bold:1,click:()=>flash('sort toggle: grouped ↔ priority (unchanged)')})]);
+}
+function remoteHeaderRow(r,opts){ // A/B remote row: mark + conn + name
+  opts=opts||{};
+  const mark=r.selected?sp('✓',{fg:P.accent}):sp(' ');
+  const nm=r.conn==='offline'?{fg:P.o0,dim:1}:(r.selected?{fg:P.sub,bold:1}:{fg:P.o0,dim:1});
+  const left=[sp(' '),mark,sp(' '),connGlyph(r),sp(' '),sp(r.name,nm)];
+  const right=[];
+  if(r.conn==='offline')right.push(sp('offline',{fg:P.o0,dim:1}));
+  else if(r.id===0)right.push(sp('#0',{fg:P.o0,dim:1}));
+  else{const d=aggDot(r);if(d)right.push(d)}
+  return line(left,{right,click:()=>remoteClick(r),dbl:()=>remoteDbl(r)});
+}
+
+// ---- variants ------------------------------------------------------------
+function variantA(){
+  const L=[];
+  L.push(header('remotes',[sp('add',{fg:P.o0,click:()=>flash('would open add-remote dialog — same modal grammar as new-worktree (fields: name, ssh target)')})]));
+  L.push(blank());
+  remotes.forEach(r=>L.push(remoteHeaderRow(r)));
+  L.push(blank());
+  L.push(ruleLine());
+  L.push(header('spaces'));
+  L.push(blank());
+  const vis=visible();
+  if(grouped()){
+    vis.forEach(r=>{
+      const ck='rm:'+r.name, closed=st.collapsed.has(ck);
+      L.push(line([sp(closed?'▸':'▾',{fg:P.accent}),sp(' '),
+        sp(r.name,{fg:P.o0,bold:1})],
+        {click:()=>{closed?st.collapsed.delete(ck):st.collapsed.add(ck);render()}}));
+      if(!closed)r.spaces.forEach(s=>spaceCard(L,r,s,3));
+    });
+  } else vis[0].spaces.forEach(s=>spaceCard(L,vis[0],s,1));
+  L.push(blank());
+  L.push(footerLine());
+  L.push(ruleLine());
+  L.push(agentsHeader());
+  L.push(blank());
+  if(grouped()){
+    vis.forEach(r=>{if(!r.agents.length)return;
+      L.push(line([sp('▾ ',{fg:P.accent}),sp(r.name,{fg:P.o0,bold:1})]));
+      r.agents.forEach(a=>agentEntry(L,r,a));});
+  } else vis[0].agents.forEach(a=>agentEntry(L,vis[0],a));
+  return L;
+}
+function variantB(){
+  const L=[];
+  L.push(header('spaces',[sp('add',{fg:P.o0,click:()=>flash('would open add-remote dialog')})]));
+  L.push(blank());
+  remotes.forEach(r=>{
+    L.push(remoteHeaderRow(r));
+    if(r.selected)r.spaces.forEach(s=>spaceCard(L,r,s,3));
+  });
+  L.push(blank());
+  L.push(footerLine());
+  L.push(ruleLine());
+  L.push(agentsHeader());
+  L.push(blank());
+  visible().forEach(r=>r.agents.forEach(a=>agentEntry(L,r,a,{remoteTag:grouped()})));
+  return L;
+}
+function chipLine(rs){
+  const cells=[sp(' ')];
+  rs.forEach((r,i)=>{
+    if(i)cells.push(sp(' '));
+    const selc=r.selected;
+    const dot=r.conn==='offline'?sp('○',{fg:P.o0,bg:selc?P.s0:null})
+      :r.conn==='connecting'?sp(SPIN[st.tick%10],{fg:P.yellow,bg:selc?P.s0:null,spin:1})
+      :sp('●',{fg:selc?r.color:P.o0,bg:selc?P.s0:null});
+    const style=selc?{fg:P.text,bg:P.s0}:{fg:P.o0,dim:1};
+    cells.push(sp(' ',{bg:selc?P.s0:null,click:()=>remoteClick(r),dbl:()=>remoteDbl(r)}));
+    dot.click=()=>remoteClick(r);dot.dbl=()=>remoteDbl(r);
+    cells.push(dot);
+    cells.push(sp(r.name+' ',Object.assign({click:()=>remoteClick(r),dbl:()=>remoteDbl(r)},style)));
+  });
+  return line(cells);
+}
+function variantC(){
+  const L=[];
+  L.push(header('remotes',[sp('add',{fg:P.o0,click:()=>flash('would open add-remote dialog')})]));
+  L.push(blank());
+  L.push(chipLine(remotes.slice(0,2)));
+  L.push(chipLine(remotes.slice(2)));
+  L.push(blank());
+  L.push(ruleLine());
+  L.push(header('spaces'));
+  L.push(blank());
+  const g=grouped();
+  visible().forEach(r=>{
+    r.spaces.forEach(s=>spaceCard(L,r,s,1,{
+      gutter:g?r.color:null,
+      tail:g?sp(r.name,{fg:P.o0,dim:1}):null}));
+  });
+  L.push(blank());
+  L.push(footerLine());
+  L.push(ruleLine());
+  L.push(agentsHeader());
+  L.push(blank());
+  visible().forEach(r=>r.agents.forEach(a=>agentEntry(L,r,a,{gutter:g?r.color:null})));
+  return L;
+}
+
+// ---- tab bar + pane ------------------------------------------------------
+function renderTabbar(){
+  const el=document.getElementById('tabbar');el.innerHTML='';
+  const put=(t,s)=>{const e=document.createElement('span');e.textContent=t;
+    Object.assign(e.style,s);el.appendChild(e)};
+  put(' '.repeat(W),{});
+  put(' main ',{background:P.accent,color:P.panel,fontWeight:'700'});
+  put(' logs ',{background:P.s0,color:P.o0,opacity:.7});
+  put(' + ',{color:P.o1});
+  put(' '.repeat(30),{});
+}
+function renderPane(){
+  const el=document.getElementById('pane');
+  const [rn,snm]=st.selSpace.split('/');
+  const r=remotes.find(x=>x.name===rn);
+  const off=r&&r.conn==='offline';
+  const lines=[
+    '',
+    ' ~/code/'+snm+' $ claude',
+    '',
+    ' ● reading src/detect/manifests…',
+    ' ● running just test',
+    '',
+    '   42 passed, 0 failed',
+    '',
+    off?' ⚠ prod-edge offline — read-only, showing last':' ~/code/'+snm+' $ █',
+    off?'   synced state':'',
+  ];
+  el.style.color=off?P.o0:P.o0;
+  el.textContent=lines.join('\n');
+  el.style.opacity=off?.55:1;
+}
+
+// ---- notes ---------------------------------------------------------------
+const NOTES={
+A:`<h2>A — dedicated remotes section</h2>
+<p>A third stacked section above <i>spaces</i>, speaking the exact section grammar that already exists (dim bold header, blank row, rule between sections). Each remote is one row: <b>selection mark ✓</b> (view filter) · <b>connection glyph</b> · name. Local is pinned first as <b>#0</b>. Right edge: most-urgent agent state dot — so a filtered-out remote can still wave at you.</p>
+<h3>interactions</h3>
+<ul>
+<li>click remote row → toggle it in/out of the view (connection unaffected — filter only)</li>
+<li>double-click → solo that remote</li>
+<li>with 1 remote in view, spaces/agents look exactly like today; with 2+, both lists group under <span style="color:#89b4fa">▾</span> remote headers (collapsible)</li>
+<li><i>add</i> in the header opens an add-remote modal (existing dialog grammar)</li>
+</ul>
+<h3>tradeoffs</h3>
+<ul>
+<li>costs ~6 sidebar rows before any spaces show</li>
+<li>three stacked sections in 26 cols — needs a third divider to drag</li>
+<li class="q">open: does ✓ (accent) read as "view filter" or as "connected"?</li>
+</ul>`,
+B:`<h2>B — remotes as tree roots</h2>
+<p>No separate panel. Remotes are top-level rows <i>inside</i> the spaces list; their spaces indent beneath, exactly like worktree children today. The selection mark on the root both filters <i>and</i> collapses — deselecting a remote folds its spaces away but the row stays as a status line.</p>
+<h3>interactions</h3>
+<ul>
+<li>click remote row → toggle: spaces fold in/out beneath it</li>
+<li>double-click → solo</li>
+<li>agents list stays flat; with 2+ remotes each agent grows a dim remote token (<i>ws · tab · remote</i>)</li>
+</ul>
+<h3>tradeoffs</h3>
+<ul>
+<li>zero extra chrome — spatially direct: "this space lives on that machine"</li>
+<li class="q">open: filter and disclosure are the same gesture — is hiding the same as excluding? (map says selection is a view filter only)</li>
+<li>connection state lives mid-list, not in a stable scannable block</li>
+<li>unselected remotes still cost one row each forever</li>
+</ul>`,
+C:`<h2>C — chip strip + color coding</h2>
+<p>Remotes are wrap-around <b>chips</b> (tab-bar visual language: surface bg = in view, dim = filtered out). Below, spaces and agents stay <i>flat</i> like today — no group headers at all. With 2+ remotes in view, each row instead carries its remote's <b>color gutter ▎</b> plus a dim remote token; each remote gets a stable hue (local=blue, buildbox=mauve, …).</p>
+<h3>interactions</h3>
+<ul>
+<li>click chip → toggle; double-click → solo</li>
+<li>rows never reflow into groups — the list keeps today's shape, only the gutter/token appear</li>
+</ul>
+<h3>tradeoffs</h3>
+<ul>
+<li>cheapest vertical cost; scales past ~5 remotes better than headers</li>
+<li class="q">open: a new color channel — remote hues must never collide with state colors (red/yellow/green/teal are taken)</li>
+<li class="q">open: is per-row identity (gutter) scannable enough vs. spatial grouping?</li>
+<li>chips truncate badly with long remote names</li>
+</ul>`};
+const SHARED=`<h3>shared, per the map</h3>
+<ul>
+<li>selection = view filter only; every configured remote stays connected + syncing</li>
+<li>prod-edge is offline: greyed, spaces read-only with stale scrollback, kept in place</li>
+<li>gpu-01 is connecting (spinner); it's filtered out — toggle it in to watch</li>
+<li>connection glyphs proposed: <span style="color:#a6e3a1">●</span> connected · <span style="color:#f9e2af">⠹</span> connecting · <span style="color:#6c7086">○</span> offline</li>
+</ul>`;
+
+// ---- render --------------------------------------------------------------
+function render(){
+  renderTabbar();
+  const gen={A:variantA,B:variantB,C:variantC}[st.variant];
+  const L=gen();
+  while(L.length<34)L.push(blank());
+  renderLines(L,document.getElementById('sidebar'));
+  renderPane();
+  document.getElementById('notes').innerHTML=NOTES[st.variant]+SHARED;
+  document.getElementById('vlabel').textContent=VNAMES[st.variant];
+  const u=new URL(location);u.searchParams.set('variant',st.variant);
+  history.replaceState(null,'',u);
+}
+function cycle(d){
+  const i=VARIANTS.indexOf(st.variant);
+  st.variant=VARIANTS[(i+d+VARIANTS.length)%VARIANTS.length];
+  render();
+}
+document.getElementById('prev').onclick=()=>cycle(-1);
+document.getElementById('next').onclick=()=>cycle(1);
+addEventListener('keydown',e=>{
+  if(/INPUT|TEXTAREA/.test(document.activeElement.tagName))return;
+  if(e.key==='ArrowLeft')cycle(-1);
+  if(e.key==='ArrowRight')cycle(1);
+});
+if(!reduceMotion)setInterval(()=>{st.tick++;
+  document.querySelectorAll('.spin').forEach(e=>e.textContent=SPIN[st.tick%10]);
+},140);
+render();
+</script>

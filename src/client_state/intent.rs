@@ -195,8 +195,20 @@ pub(super) fn dispatch_mouse_intent(
     // Hit testing runs on the composed state with no live runtimes: chrome
     // actions resolve exactly, pane-content interactions (selection drags)
     // simply find no runtime and do nothing.
+    let mode_before = app.mode;
     let mut empty_runtimes = crate::terminal::TerminalRuntimeRegistry::new();
     let action = app.handle_mouse(&mut empty_runtimes, mouse);
+    // handle_mouse can open modal surfaces (context menus, confirm-close,
+    // rename) whose actions are not interpreted under the flag yet. Leaving
+    // the app parked in such a mode would trap the user in a dead modal, so
+    // revert to the pre-click mode and drop the modal state.
+    if !matches!(
+        app.mode,
+        crate::app::Mode::Terminal | crate::app::Mode::Navigate | crate::app::Mode::Prefix
+    ) {
+        app.mode = mode_before;
+        app.context_menu = None;
+    }
     let Some(method) = mouse_intent_method(action, mirrors, ids, app) else {
         return;
     };
@@ -228,10 +240,14 @@ pub(super) fn mouse_intent_method(
         }
         crate::app::MouseAction::FocusTab { tab_idx } => {
             let workspace = app.active.and_then(|idx| app.workspaces.get(idx))?;
+            // The composed tab bar skips tabs with no panes (compose_into),
+            // so the hit-tested index must be resolved against the same
+            // filtered view of the catalog.
             let tab_id = catalog
                 .tabs
                 .iter()
                 .filter(|tab| tab.workspace_id == workspace.id)
+                .filter(|tab| catalog.panes.iter().any(|pane| pane.tab_id == tab.tab_id))
                 .nth(tab_idx)
                 .map(|tab| tab.tab_id.clone())?;
             Some(Method::TabFocus(TabTarget { tab_id }))
@@ -328,6 +344,63 @@ mod tests {
     fn unbound_prefix_keys_map_to_nothing() {
         let (mirrors, ids, app) = composed();
         assert!(prefix_intent_method(key(KeyCode::Char('~')), &mirrors, &ids, &app).is_none());
+    }
+
+    #[test]
+    fn tab_focus_index_skips_pane_less_catalog_tabs() {
+        let (mut mirrors, ids, app) = composed();
+        // A tab_created event landed before its pane_created: the catalog
+        // briefly holds a pane-less tab the composed tab bar does not show.
+        let empty_tab: crate::api::schema::tabs::TabInfo =
+            serde_json::from_value(serde_json::json!({
+                "tab_id": "t_2_0",
+                "workspace_id": "ws_2",
+                "number": 0,
+                "label": "empty",
+                "focused": false,
+                "pane_count": 0,
+                "agent_status": "idle"
+            }))
+            .expect("tab info deserializes");
+        mirrors.local_mut().catalog.tabs.insert(0, empty_tab);
+
+        // The composed tab bar shows only t_2_1, at index 0; clicking it must
+        // not resolve to the invisible empty tab.
+        let method = mouse_intent_method(
+            Some(MouseAction::FocusTab { tab_idx: 0 }),
+            &mirrors,
+            &ids,
+            &app,
+        )
+        .expect("tab focus intent");
+        let Method::TabFocus(target) = method else {
+            panic!("expected tab.focus, got {method:?}");
+        };
+        assert_eq!(target.tab_id, "t_2_1");
+    }
+
+    #[tokio::test]
+    async fn right_click_does_not_trap_the_client_in_a_dead_context_menu() {
+        let (mut mirrors, mut ids, mut app) = composed();
+        app.mode = crate::app::Mode::Terminal;
+        crate::ui::compute_view(&mut app, ratatui::layout::Rect::new(0, 0, 106, 20));
+        let inner = app.view.pane_infos.first().expect("pane info").inner_rect;
+
+        let mut link = super::super::run::SessionLink::Incompatible;
+        let mouse = MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Right),
+            column: inner.x + 1,
+            row: inner.y + 1,
+            modifiers: KeyModifiers::empty(),
+        };
+        dispatch_mouse_intent(mouse, &mut link, &mut mirrors, &mut ids, &mut app);
+
+        assert_eq!(
+            app.mode,
+            crate::app::Mode::Terminal,
+            "unsupported modal modes must not survive the dispatch"
+        );
+        assert!(app.context_menu.is_none(), "no dead context menu remains");
     }
 
     #[test]

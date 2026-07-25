@@ -206,18 +206,19 @@ fn build_tab_layout(
     tab_panes: &[&PaneInfo],
     snapshot: Option<&PaneLayoutSnapshot>,
 ) -> (TileLayout, PaneId, bool) {
-    let focused_public = snapshot
-        .map(|snapshot| snapshot.focused_pane_id.as_str())
-        .or_else(|| {
-            tab_panes
-                .iter()
-                .find(|pane| pane.focused)
-                .map(|pane| pane.pane_id.as_str())
-        });
+    // Focus authority: the catalog's pane.focused flags are kept current by
+    // pane_focused events, while the layout snapshot's focused_pane_id only
+    // refreshes on layout.updated (create/close/split/move) — so the pane
+    // flags win and the snapshot is only a fallback.
+    let focused_public = tab_panes
+        .iter()
+        .find(|pane| pane.focused)
+        .map(|pane| pane.pane_id.as_str())
+        .or_else(|| snapshot.map(|snapshot| snapshot.focused_pane_id.as_str()));
     let zoomed = snapshot.is_some_and(|snapshot| snapshot.zoomed);
 
     if let Some(snapshot) = snapshot {
-        if let Some(layout) = layout_from_snapshot(ids, snapshot, tab_panes) {
+        if let Some(layout) = layout_from_snapshot(ids, snapshot, tab_panes, focused_public) {
             let root = leftmost_leaf(layout.root()).unwrap_or(layout.focused());
             return (layout, root, zoomed);
         }
@@ -249,6 +250,7 @@ fn layout_from_snapshot(
     ids: &mut ComposeIds,
     snapshot: &PaneLayoutSnapshot,
     tab_panes: &[&PaneInfo],
+    focused_public: Option<&str>,
 ) -> Option<TileLayout> {
     if snapshot.panes.len() != tab_panes.len() {
         return None;
@@ -283,7 +285,7 @@ fn layout_from_snapshot(
     if leaves.next().is_some() {
         return None;
     }
-    let focus = ids.pane_id(&snapshot.focused_pane_id);
+    let focus = ids.pane_id(focused_public.unwrap_or(snapshot.focused_pane_id.as_str()));
     Some(TileLayout::from_saved(root, focus))
 }
 
@@ -539,6 +541,36 @@ mod tests {
             "replica screen must render: {rendered:?}"
         );
         assert!(rendered.contains("repo"), "sidebar shows the catalog label");
+    }
+
+    #[tokio::test]
+    async fn pane_focused_events_move_the_composed_focus() {
+        let mut mirror = mirror_with_layout();
+        let chrome = GlobalChrome::new();
+        let mut ids = ComposeIds::new();
+        let mut app = AppState::test_new();
+        compose_into(&mirror, &chrome, &mut ids, &mut app);
+        let focused = app.workspaces[0].focused_pane_id().expect("focused pane");
+        assert_eq!(ids.public_pane_id(focused), Some("p_2_1"));
+
+        // The server emits pane_focused without a layout.updated; the stale
+        // layout snapshot must not pin the composed focus to the old pane.
+        let focused_event: crate::api::schema::EventEnvelope =
+            serde_json::from_value(serde_json::json!({
+                "event": "pane_focused",
+                "data": { "type": "pane_focused", "pane_id": "p_2_10", "workspace_id": "ws_2" }
+            }))
+            .expect("event deserializes");
+        assert!(mirror.catalog.apply(42, &focused_event));
+
+        compose_into(&mirror, &chrome, &mut ids, &mut app);
+        let focused = app.workspaces[0].focused_pane_id().expect("focused pane");
+        assert_eq!(
+            ids.public_pane_id(focused),
+            Some("p_2_10"),
+            "composed focus must follow pane_focused events, not the stale layout snapshot"
+        );
+        app.assert_invariants_for_test();
     }
 
     #[test]

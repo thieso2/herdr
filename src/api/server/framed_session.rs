@@ -43,8 +43,8 @@ use crate::protocol::framed::{
     SessionHelloParams, StreamCloseParams, StreamHistoryParams, StreamOpenParams,
     StreamResizeParams, StreamScrollDirection, StreamScrollParams, StreamScrollSource,
     API_REQUEST_METHOD, CAPABILITY_CATALOG, CAPABILITY_NOTIFICATION, CAPABILITY_PANE_STREAM,
-    CAPABILITY_PASTE_IMAGE, CAPABILITY_WINDOW_TITLE, CATALOG_EVENT, CONTROL_STREAM_ID,
-    FRAMED_PROTOCOL_MIN_SUPPORTED, FRAMED_PROTOCOL_VERSION, FRAME_HEADER_BYTES,
+    CAPABILITY_PASTE_IMAGE, CAPABILITY_WINDOW_TITLE, CATALOG_EVENT, CATALOG_RESYNC_EVENT,
+    CONTROL_STREAM_ID, FRAMED_PROTOCOL_MIN_SUPPORTED, FRAMED_PROTOCOL_VERSION, FRAME_HEADER_BYTES,
     HISTORY_FETCH_MAX_BYTES, HISTORY_PAGE_DEFAULT_BYTES, HISTORY_PAGE_MIN_BYTES,
     HISTORY_PAGE_SERVED_MAX_BYTES, MAX_FRAME_PAYLOAD, NOTIFICATION_POSTED_EVENT,
     PANE_PASTE_IMAGE_METHOD, PANE_SEND_BYTES_METHOD, PING_METHOD, SESSION_HELLO_METHOD,
@@ -373,7 +373,23 @@ fn pump_session_output(
     let wants_window_title = session.has_capability(CAPABILITY_WINDOW_TITLE);
     let wants_catalog = session.has_capability(CAPABILITY_CATALOG);
     if wants_notifications || wants_window_title || wants_catalog {
-        for (sequence, envelope) in event_hub.events_after(*event_cursor) {
+        let (events, lost) = event_hub.events_after_with_loss(*event_cursor);
+        if lost && wants_catalog {
+            // The bounded event buffer overflowed past this session's cursor:
+            // catalog events are gone for good, so the mirrored catalog can
+            // only be repaired by a fresh session.snapshot resync.
+            let sent = write_control_allow_disconnect(
+                stream,
+                &serde_json::json!({
+                    "event": CATALOG_RESYNC_EVENT,
+                    "data": { "reason": "event_overflow" },
+                }),
+            )?;
+            if !sent {
+                return Ok(PumpOutcome::PeerClosed);
+            }
+        }
+        for (sequence, envelope) in events {
             *event_cursor = sequence;
             let payload = match envelope.event {
                 crate::api::schema::EventKind::NotificationPosted if wants_notifications => {
@@ -752,7 +768,7 @@ fn handle_api_request_passthrough(
             &error_response(
                 &request.id,
                 "invalid_params",
-                "long-poll methods are not available over api.request;                  negotiate the catalog capability for events",
+                "long-poll methods are not available over api.request; negotiate the catalog capability for events",
                 None,
             ),
         );

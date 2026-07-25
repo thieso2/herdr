@@ -628,6 +628,75 @@ mod tests {
         );
     }
 
+    /// The planned pane resizes are part of the flag-off contract the render
+    /// digest cannot see: they must match the composed pane geometry, honor
+    /// the direct-attach resize locks, and actually reach the runtimes.
+    #[tokio::test]
+    async fn compute_view_plans_pane_resizes_matching_composed_geometry() {
+        let mut app = characterization_app_state();
+        let area = Rect::new(0, 0, 106, 20);
+        let requests = compute_view_with_content(&mut app, &EmptyPaneContentSource, area);
+
+        // One request per visible pane, targeting its inner rect geometry.
+        let ws = &app.workspaces[0];
+        let mut expected: Vec<(crate::terminal::TerminalId, u16, u16)> = app
+            .view
+            .pane_infos
+            .iter()
+            .map(|info| {
+                let terminal_id = ws.terminal_id(info.id).expect("pane terminal id").clone();
+                (terminal_id, info.inner_rect.width, info.inner_rect.height)
+            })
+            .collect();
+        assert_eq!(expected.len(), 2, "both visible panes plan a resize");
+        for (terminal_id, cols, rows) in expected.drain(..) {
+            assert!(
+                requests
+                    .iter()
+                    .any(|request| request.terminal_id == terminal_id
+                        && request.cols == cols
+                        && request.rows == rows),
+                "missing planned resize for {terminal_id:?} to {cols}x{rows}; got {requests:?}"
+            );
+        }
+
+        // Applying the plan reaches the pane runtimes through the registry
+        // lookup seam.
+        app.apply_pane_resize_requests_to_test_runtimes(&requests);
+        let focused = app.workspaces[0].focused_pane_id().expect("focused pane");
+        let focused_info = app
+            .view
+            .pane_infos
+            .iter()
+            .find(|info| info.id == focused)
+            .expect("focused pane info");
+        let runtime = app.workspaces[0]
+            .test_runtimes
+            .get(&focused)
+            .expect("test runtime");
+        let metrics = runtime.scroll_metrics().expect("scroll metrics");
+        assert_eq!(
+            metrics.viewport_rows as u16, focused_info.inner_rect.height,
+            "planned resize was applied to the runtime"
+        );
+
+        // A direct-attach resize lock excludes exactly that pane from the plan.
+        let locked = app.workspaces[0]
+            .terminal_id(focused)
+            .expect("terminal id")
+            .clone();
+        app.direct_attach_resize_locks.insert(locked.clone());
+        let requests = compute_view_with_content(&mut app, &EmptyPaneContentSource, area);
+        assert!(
+            requests.iter().all(|request| request.terminal_id != locked),
+            "locked pane must not be resized: {requests:?}"
+        );
+        assert!(
+            !requests.is_empty(),
+            "the unlocked pane still plans its resize"
+        );
+    }
+
     /// Same characterization for the mobile layout and its navigate panel.
     #[tokio::test]
     async fn mobile_compute_view_render_is_characterized() {

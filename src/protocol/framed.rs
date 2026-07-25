@@ -162,6 +162,12 @@ pub const STREAM_REVOKED_EVENT: &str = "stream.revoked";
 /// event envelope and `seq` its hub sequence.
 pub const CATALOG_EVENT: &str = "catalog.event";
 
+/// Event frame telling a catalog client that the server's bounded event
+/// buffer overflowed past the client's cursor: catalog events were lost and
+/// the client must request a fresh `session.snapshot` to resync. Sent only
+/// on sessions that negotiated the `catalog` capability.
+pub const CATALOG_RESYNC_EVENT: &str = "catalog.resync_required";
+
 /// Error code answering a `stream.open` that asked for write mode without
 /// takeover while another live stream holds the pane's write grant.
 pub const PANE_WRITE_LOCKED_ERROR: &str = "pane_write_locked";
@@ -909,6 +915,10 @@ pub struct StreamOpened {
     /// ANSI snapshot of the pane screen at the subscription point.
     pub snapshot: String,
     pub history_cursor: String,
+    /// Pane grid size the snapshot was captured at; 0 when the server did
+    /// not report it.
+    pub cols: u16,
+    pub rows: u16,
 }
 
 /// Parses a `stream.open` response into the opened stream, or the server's
@@ -950,6 +960,16 @@ pub fn parse_stream_opened(
             .and_then(|value| value.as_str())
             .unwrap_or_default()
             .to_string(),
+        cols: stream
+            .get("cols")
+            .and_then(|value| value.as_u64())
+            .and_then(|value| u16::try_from(value).ok())
+            .unwrap_or_default(),
+        rows: stream
+            .get("rows")
+            .and_then(|value| value.as_u64())
+            .and_then(|value| u16::try_from(value).ok())
+            .unwrap_or_default(),
     })
 }
 
@@ -1745,6 +1765,8 @@ mod tests {
                     "sequence": 40,
                     "snapshot": "screen",
                     "history_cursor": "cursor",
+                    "cols": 120,
+                    "rows": 40,
                 },
             },
         }))
@@ -1757,6 +1779,8 @@ mod tests {
                 sequence: 40,
                 snapshot: "screen".to_string(),
                 history_cursor: "cursor".to_string(),
+                cols: 120,
+                rows: 40,
             }
         );
     }

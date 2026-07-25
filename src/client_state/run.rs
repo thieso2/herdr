@@ -14,7 +14,7 @@
 
 #![cfg(unix)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, Write as _};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
@@ -30,9 +30,11 @@ use crate::ipc::LocalStream;
 use crate::protocol::framed::{
     control_error, pane_send_bytes_request, parse_session_snapshot, parse_session_welcome,
     parse_stream_opened, read_frame, session_hello_request_with_capabilities,
-    session_snapshot_request, stream_open_request, stream_resize_request, write_frame, Frame,
-    FrameType, FramedCodecError, StreamMode, CAPABILITY_CATALOG, CAPABILITY_PANE_STREAM,
-    CATALOG_EVENT, CONTROL_STREAM_ID, FRAMED_MAGIC, STREAM_CLOSED_EVENT, STREAM_REVOKED_EVENT,
+    session_snapshot_request, stream_close_request, stream_open_request, stream_resize_request,
+    write_frame, Frame, FrameType, FramedCodecError, SessionWelcome, StreamMode,
+    CAPABILITY_CATALOG, CAPABILITY_PANE_STREAM, CATALOG_EVENT, CATALOG_RESYNC_EVENT,
+    CONTROL_STREAM_ID, FRAMED_MAGIC, PANE_WRITE_LOCKED_ERROR, STREAM_CLOSED_EVENT,
+    STREAM_REVOKED_EVENT,
 };
 use crate::terminal::TerminalId;
 
@@ -69,8 +71,9 @@ enum LoopEvent {
 /// In-flight control requests awaiting their response frame.
 enum Pending {
     Snapshot,
-    StreamOpen { pane_id: String },
+    StreamOpen { pane_id: String, mode: StreamMode },
     History { stream_id: u32 },
+    Resize { stream_id: u32 },
     Api,
 }
 
@@ -81,6 +84,10 @@ pub(super) struct Session {
     pending: HashMap<String, Pending>,
     /// Last size sent per stream id, to keep stream.resize idempotent.
     sent_sizes: HashMap<u32, (u16, u16)>,
+    /// Streams opened read-only because another client holds the pane's
+    /// write grant; their geometry belongs to that writer, so no
+    /// stream.resize is sent on them.
+    read_only: HashSet<u32>,
 }
 
 impl Session {
@@ -108,8 +115,13 @@ impl Session {
 
 /// Outcome of one connect attempt.
 enum ConnectOutcome {
-    Connected(Session),
-    Incompatible { message: String },
+    Connected {
+        session: Session,
+        welcome: SessionWelcome,
+    },
+    Incompatible {
+        message: String,
+    },
     Failed(String),
 }
 
@@ -133,6 +145,7 @@ fn connect() -> ConnectOutcome {
         next_request_id: 1,
         pending: HashMap::new(),
         sent_sizes: HashMap::new(),
+        read_only: HashSet::new(),
     };
     let id = session.request_id("hello");
     let hello = session_hello_request_with_capabilities(
@@ -187,7 +200,7 @@ fn connect() -> ConnectOutcome {
                 server_version = %welcome.server_version,
                 "pure client negotiated framed catalog session"
             );
-            ConnectOutcome::Connected(session)
+            ConnectOutcome::Connected { session, welcome }
         }
         Err(err) => ConnectOutcome::Failed(err),
     }
@@ -389,15 +402,18 @@ fn establish(
     debug!(remote = mirror.remote_index, name = %mirror.name, "connecting");
     mirror.connection.connect_started();
     match connect() {
-        ConnectOutcome::Connected(mut session) => {
+        ConnectOutcome::Connected {
+            mut session,
+            welcome,
+        } => {
+            // The mirror holds what the server actually negotiated, not what
+            // this client asked for: capability gates (pane streams) and any
+            // protocol downgrade must reflect the welcome.
             mirror
                 .connection
                 .connected(crate::protocol::framed::NegotiatedSession {
-                    protocol: crate::protocol::framed::FRAMED_PROTOCOL_VERSION,
-                    capabilities: vec![
-                        CAPABILITY_PANE_STREAM.to_owned(),
-                        CAPABILITY_CATALOG.to_owned(),
-                    ],
+                    protocol: welcome.protocol,
+                    capabilities: welcome.capabilities,
                 });
             // Full resync: the fresh snapshot plus re-opened streams are the
             // only source of truth for this connection.
@@ -601,6 +617,20 @@ fn handle_server_frame(
                             mirror.catalog.apply(seq, &envelope);
                         }
                     }
+                    CATALOG_RESYNC_EVENT => {
+                        // The server's bounded event buffer overflowed past
+                        // our cursor: catalog events were lost, so only a
+                        // fresh snapshot can repair the mirror.
+                        warn!("catalog events lost to server buffer overflow; resyncing");
+                        if let Link::Up(session) = link {
+                            let id = session.request_id("snapshot");
+                            session.pending.insert(id.clone(), Pending::Snapshot);
+                            if let Err(err) = session.send_control(&session_snapshot_request(&id)) {
+                                warn!(err = %err, "catalog resync snapshot request failed");
+                                session.pending.remove(&id);
+                            }
+                        }
+                    }
                     STREAM_CLOSED_EVENT | STREAM_REVOKED_EVENT => {
                         if let Some(stream_id) = payload
                             .get("data")
@@ -612,6 +642,10 @@ fn handle_server_frame(
                                 debug!(pane = %pane_id, stream = stream_id, event, "pane stream ended");
                             }
                             mirror.stream_closed(stream_id);
+                            if let Link::Up(session) = link {
+                                session.sent_sizes.remove(&stream_id);
+                                session.read_only.remove(&stream_id);
+                            }
                         }
                     }
                     _ => {}
@@ -635,6 +669,27 @@ fn handle_server_frame(
                                 let mut catalog = SessionCatalog::new();
                                 catalog.resync(&snapshot, sequence);
                                 mirror.catalog = catalog;
+                                // A mid-session resync can reveal panes that
+                                // closed while events were lost; their
+                                // streams must not linger.
+                                let stale: Vec<(String, u32)> = mirror
+                                    .pane_streams
+                                    .iter()
+                                    .filter(|(pane_id, _)| mirror.catalog.pane(pane_id).is_none())
+                                    .map(|(pane_id, stream_id)| (pane_id.clone(), *stream_id))
+                                    .collect();
+                                for (pane_id, stream_id) in stale {
+                                    debug!(pane = %pane_id, stream = stream_id, "closing stream for pane gone after resync");
+                                    let close_id = session.request_id("close");
+                                    if let Err(err) = session
+                                        .send_control(&stream_close_request(&close_id, stream_id))
+                                    {
+                                        warn!(err = %err, "stream.close send failed");
+                                    }
+                                    mirror.stream_closed(stream_id);
+                                    session.sent_sizes.remove(&stream_id);
+                                    session.read_only.remove(&stream_id);
+                                }
                                 chrome.connection_status = None;
                             }
                             Err(err) => warn!(err = %err, "session.snapshot did not deserialize"),
@@ -642,27 +697,82 @@ fn handle_server_frame(
                     }
                     Err(err) => warn!(err = %err, "session.snapshot failed"),
                 },
-                Some(Pending::StreamOpen { pane_id }) => match parse_stream_opened(&payload) {
-                    Ok(opened) => {
-                        let history_cursor = (!opened.history_cursor.is_empty())
-                            .then(|| opened.history_cursor.clone());
-                        match crate::terminal::replica::PaneReplica::open(
-                            &opened.snapshot,
-                            opened.sequence,
-                            history_cursor,
-                            80,
-                            24,
-                            scrollback_limit,
-                        ) {
-                            Ok(replica) => mirror.stream_opened(pane_id, opened.stream_id, replica),
-                            Err(err) => warn!(err = %err, "replica open failed"),
+                Some(Pending::StreamOpen { pane_id, mode }) => {
+                    match parse_stream_opened(&payload) {
+                        Ok(opened) => {
+                            if mirror.catalog.pane(&pane_id).is_none() {
+                                // The pane vanished while the stream opened.
+                                debug!(pane = %pane_id, "pane gone before its stream opened; closing");
+                                let close_id = session.request_id("close");
+                                if let Err(err) = session.send_control(&stream_close_request(
+                                    &close_id,
+                                    opened.stream_id,
+                                )) {
+                                    warn!(err = %err, "stream.close send failed");
+                                }
+                                return;
+                            }
+                            let history_cursor = (!opened.history_cursor.is_empty())
+                                .then(|| opened.history_cursor.clone());
+                            // Seed the replica at the size the snapshot was
+                            // captured at; the next draw plans the real geometry.
+                            let (cols, rows) = if opened.cols > 0 && opened.rows > 0 {
+                                (opened.cols, opened.rows)
+                            } else {
+                                (80, 24)
+                            };
+                            match crate::terminal::replica::PaneReplica::open(
+                                &opened.snapshot,
+                                opened.sequence,
+                                history_cursor,
+                                cols,
+                                rows,
+                                scrollback_limit,
+                            ) {
+                                Ok(replica) => {
+                                    if mode == StreamMode::Read {
+                                        session.read_only.insert(opened.stream_id);
+                                    }
+                                    mirror.stream_opened(pane_id, opened.stream_id, replica);
+                                }
+                                Err(err) => warn!(err = %err, "replica open failed"),
+                            }
                         }
+                        Err(Some(error))
+                            if error.code == PANE_WRITE_LOCKED_ERROR
+                                && mode == StreamMode::Write =>
+                        {
+                            // Another client (direct attach) holds the write
+                            // grant. Fall back to a read-only view whose
+                            // geometry stays owned by that writer.
+                            debug!(pane = %pane_id, "pane write-locked; reopening stream read-only");
+                            let open_id = session.request_id("open");
+                            session.pending.insert(
+                                open_id.clone(),
+                                Pending::StreamOpen {
+                                    pane_id: pane_id.clone(),
+                                    mode: StreamMode::Read,
+                                },
+                            );
+                            let request = stream_open_request(
+                                &open_id,
+                                &pane_id,
+                                StreamMode::Read,
+                                false,
+                                None,
+                                None,
+                            );
+                            if let Err(err) = session.send_control(&request) {
+                                warn!(err = %err, "read-only stream.open send failed");
+                                session.pending.remove(&open_id);
+                            }
+                        }
+                        Err(Some(error)) => {
+                            debug!(code = %error.code, pane = %pane_id, "stream.open rejected")
+                        }
+                        Err(None) => warn!(pane = %pane_id, "stream.open answer malformed"),
                     }
-                    Err(Some(error)) => {
-                        debug!(code = %error.code, pane = %pane_id, "stream.open rejected")
-                    }
-                    Err(None) => warn!(pane = %pane_id, "stream.open answer malformed"),
-                },
+                }
                 Some(Pending::History { stream_id }) => {
                     if let Some(replica) = mirror.replicas.get_mut(&stream_id) {
                         match replica.apply_history_response(&payload) {
@@ -671,6 +781,14 @@ fn handle_server_frame(
                             }
                             Err(err) => warn!(err = %err, "history page apply failed"),
                         }
+                    }
+                }
+                Some(Pending::Resize { stream_id }) => {
+                    if let Some(error) = control_error(&payload) {
+                        // Forget the recorded size so the next draw retries;
+                        // rejections here are transient grant races.
+                        warn!(code = %error.code, stream = stream_id, "stream.resize rejected; retrying on next draw");
+                        session.sent_sizes.remove(&stream_id);
                     }
                 }
                 Some(Pending::Api) => {
@@ -688,8 +806,9 @@ fn handle_server_frame(
     }
 }
 
-/// Opens streams for visible panes that lack one and pushes stream.resize
-/// for panes whose planned geometry changed.
+/// Opens streams for visible panes that lack one, closes streams whose
+/// panes left visibility, and pushes stream.resize for panes whose planned
+/// geometry changed.
 fn sync_pane_streams(
     session: &mut Session,
     mirrors: &mut RemoteMirrors,
@@ -706,15 +825,29 @@ fn sync_pane_streams(
     }
 
     // Visible panes: every pane of the focused workspace's active tab.
-    let visible: Vec<(String, u16, u16)> = visible_panes(&mirror.catalog);
-    for (pane_id, cols, rows) in &visible {
+    let visible: Vec<String> = visible_panes(&mirror.catalog);
+
+    // Streams for panes no longer visible are closed so resource use tracks
+    // panes visible, not panes ever visited.
+    for (pane_id, stream_id) in hidden_pane_streams(mirror, &visible) {
+        debug!(pane = %pane_id, stream = stream_id, "closing pane stream for hidden pane");
+        let id = session.request_id("close");
+        if let Err(err) = session.send_control(&stream_close_request(&id, stream_id)) {
+            warn!(err = %err, "stream.close send failed");
+        }
+        mirror.stream_closed(stream_id);
+        session.sent_sizes.remove(&stream_id);
+        session.read_only.remove(&stream_id);
+    }
+
+    for pane_id in &visible {
         if mirror.stream_for_pane(pane_id).is_some() {
             continue;
         }
         let already_opening = session
             .pending
             .values()
-            .any(|pending| matches!(pending, Pending::StreamOpen { pane_id: opening } if opening == pane_id));
+            .any(|pending| matches!(pending, Pending::StreamOpen { pane_id: opening, .. } if opening == pane_id));
         if already_opening {
             continue;
         }
@@ -723,16 +856,15 @@ fn sync_pane_streams(
             id.clone(),
             Pending::StreamOpen {
                 pane_id: pane_id.clone(),
+                mode: StreamMode::Write,
             },
         );
-        let request = stream_open_request(
-            &id,
-            pane_id,
-            StreamMode::Read,
-            false,
-            Some(*cols),
-            Some(*rows),
-        );
+        // Write mode: the pure client owns pane geometry (stream.resize
+        // requires the write grant). No cols/rows on open — the replica
+        // seeds at the server's snapshot size and the first planned resize
+        // sets the real viewport. If another client holds the grant, the
+        // response handler falls back to a read-only stream.
+        let request = stream_open_request(&id, pane_id, StreamMode::Write, false, None, None);
         if let Err(err) = session.send_control(&request) {
             warn!(err = %err, "stream.open send failed");
             return;
@@ -758,11 +890,18 @@ fn sync_pane_streams(
         let Some(stream_id) = mirror.stream_for_pane(pane_id) else {
             continue;
         };
+        if session.read_only.contains(&stream_id) {
+            // The write grant holder owns this pane's geometry.
+            continue;
+        }
         if session.sent_sizes.get(&stream_id) == Some(&(request.cols, request.rows)) {
             continue;
         }
         let id = session.request_id("resize");
         let control = stream_resize_request(&id, stream_id, request.cols, request.rows, 0, 0);
+        session
+            .pending
+            .insert(id.clone(), Pending::Resize { stream_id });
         if session.send_control(&control).is_ok() {
             session
                 .sent_sizes
@@ -770,13 +909,24 @@ fn sync_pane_streams(
             if let Some(replica) = mirror.replicas.get_mut(&stream_id) {
                 let _ = replica.resize(request.cols, request.rows, 1, 1);
             }
+        } else {
+            session.pending.remove(&id);
         }
     }
 }
 
-/// The panes of the focused workspace's active tab, with a size guess used
-/// only for the initial open (the first compute_view corrects it).
-fn visible_panes(catalog: &SessionCatalog) -> Vec<(String, u16, u16)> {
+/// Open streams whose panes are not in the visible set.
+fn hidden_pane_streams(mirror: &super::RemoteMirror, visible: &[String]) -> Vec<(String, u32)> {
+    mirror
+        .pane_streams
+        .iter()
+        .filter(|(pane_id, _)| !visible.iter().any(|visible_id| visible_id == *pane_id))
+        .map(|(pane_id, stream_id)| (pane_id.clone(), *stream_id))
+        .collect()
+}
+
+/// The panes of the focused workspace's active tab.
+fn visible_panes(catalog: &SessionCatalog) -> Vec<String> {
     let Some(workspace_id) = catalog.focused_workspace_id.as_deref().or_else(|| {
         catalog
             .workspaces
@@ -792,7 +942,7 @@ fn visible_panes(catalog: &SessionCatalog) -> Vec<(String, u16, u16)> {
         .panes
         .iter()
         .filter(|pane| pane.tab_id == workspace.active_tab_id)
-        .map(|pane| (pane.pane_id.clone(), 80, 24))
+        .map(|pane| pane.pane_id.clone())
         .collect()
 }
 
@@ -870,10 +1020,18 @@ fn handle_key(
             }
             forward_key(key, link, mirrors, ids, app);
         }
-        _ => {
-            // Navigate and modal modes: minimal client-side vocabulary.
+        Mode::Navigate => {
             if key.code == KeyCode::Char('q') {
                 app.should_quit = true;
+            }
+        }
+        _ => {
+            // Residual modal modes are unsupported under the flag; Esc or q
+            // folds back to the base modes instead of trapping the user (or
+            // quitting the whole client from inside a dead modal).
+            if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
+                app.context_menu = None;
+                app.mode = Mode::Navigate;
             }
         }
     }
@@ -891,15 +1049,42 @@ fn forward_key(
         return;
     };
     let mirror = mirrors.local();
-    let protocol = mirror
+    let replica = mirror
         .stream_for_pane(&pane_id)
-        .and_then(|stream_id| mirror.replicas.get(&stream_id))
+        .and_then(|stream_id| mirror.replicas.get(&stream_id));
+    let protocol = replica
         .map(|replica| {
             crate::input::KeyboardProtocol::from_kitty_flags(
                 replica.terminal().kitty_keyboard_flags().unwrap_or(0) as u16,
             )
         })
         .unwrap_or(crate::input::KeyboardProtocol::from_kitty_flags(0));
+    // DECCKM: outside the kitty protocol, bare arrows on a pane in
+    // application-cursor mode must be SS3 sequences, matching the legacy
+    // encoder's terminal-mode awareness.
+    if matches!(protocol, crate::input::KeyboardProtocol::Legacy)
+        && key.kind != crossterm::event::KeyEventKind::Release
+        && key.modifiers.is_empty()
+        && matches!(
+            key.code,
+            crossterm::event::KeyCode::Up
+                | crossterm::event::KeyCode::Down
+                | crossterm::event::KeyCode::Left
+                | crossterm::event::KeyCode::Right
+        )
+    {
+        let application_cursor = replica
+            .and_then(|replica| crate::pane::plain_terminal_input_state(replica.terminal()))
+            .map(|state| state.application_cursor)
+            .unwrap_or(false);
+        if application_cursor {
+            let bytes = crate::input::encode_cursor_key(key.code, true);
+            if !bytes.is_empty() {
+                send_pane_bytes(link, &pane_id, &bytes);
+            }
+            return;
+        }
+    }
     let bytes = crate::input::encode_terminal_key(key, protocol);
     if bytes.is_empty() {
         return;
@@ -943,7 +1128,9 @@ fn send_pane_bytes(link: &mut Link, pane_id: &str, bytes: &[u8]) {
 }
 
 /// Mouse: wheel scrolls the replica locally (or forwards to reporting
-/// panes); clicks resolve against the computed view into focus intents.
+/// panes); buttons and drags inside reporting panes are encoded and
+/// forwarded; remaining clicks resolve against the computed view into
+/// focus intents.
 fn handle_mouse(
     mouse: MouseEvent,
     link: &mut Link,
@@ -954,7 +1141,7 @@ fn handle_mouse(
 ) {
     match mouse.kind {
         MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
-            let inside_focused_pane = app
+            let pane_hit = app
                 .view
                 .pane_infos
                 .iter()
@@ -962,8 +1149,8 @@ fn handle_mouse(
                     info.inner_rect
                         .contains(ratatui::layout::Position::new(mouse.column, mouse.row))
                 })
-                .map(|info| info.id);
-            let Some(pane_id) = inside_focused_pane else {
+                .map(|info| (info.id, info.inner_rect));
+            let Some((pane_id, inner_rect)) = pane_hit else {
                 return;
             };
             let Some(public) = ids.public_pane_id(pane_id).map(str::to_owned) else {
@@ -980,10 +1167,11 @@ fn handle_mouse(
             let reporting = input_state.is_some_and(|state| state.mouse_reporting_enabled());
             if reporting {
                 if let Some(state) = input_state {
+                    // Mouse reports are pane-local coordinates.
                     if let Some(bytes) = crate::input::encode_mouse_scroll(
                         mouse.kind,
-                        mouse.column,
-                        mouse.row,
+                        mouse.column.saturating_sub(inner_rect.x),
+                        mouse.row.saturating_sub(inner_rect.y),
                         mouse.modifiers,
                         state.mouse_protocol_encoding,
                     ) {
@@ -1001,10 +1189,83 @@ fn handle_mouse(
             replica.scroll_delta(delta);
             request_backfill_if_needed(link, stream_id, mirrors);
         }
+        MouseEventKind::Down(_) | MouseEventKind::Up(_) | MouseEventKind::Drag(_)
+            if forward_reported_mouse_button(mouse, link, mirrors, ids, app) => {}
         _ => {
             super::intent::dispatch_mouse_intent(mouse, link, mirrors, ids, app);
         }
     }
+}
+
+/// Encodes a button/drag event for a mouse-reporting pane and forwards it as
+/// pane bytes, focusing the pane first when it was not focused. Returns
+/// false when the event is not over a reporting pane, so it falls through to
+/// chrome intent dispatch.
+fn forward_reported_mouse_button(
+    mouse: MouseEvent,
+    link: &mut Link,
+    mirrors: &mut RemoteMirrors,
+    ids: &mut ComposeIds,
+    app: &mut AppState,
+) -> bool {
+    if app.mode != Mode::Terminal {
+        return false;
+    }
+    let pane_hit = app
+        .view
+        .pane_infos
+        .iter()
+        .find(|info| {
+            info.inner_rect
+                .contains(ratatui::layout::Position::new(mouse.column, mouse.row))
+        })
+        .map(|info| (info.id, info.inner_rect));
+    let Some((pane_id, inner_rect)) = pane_hit else {
+        return false;
+    };
+    let Some(public) = ids.public_pane_id(pane_id).map(str::to_owned) else {
+        return false;
+    };
+    let mirror = mirrors.local();
+    let Some(replica) = mirror
+        .stream_for_pane(&public)
+        .and_then(|stream_id| mirror.replicas.get(&stream_id))
+    else {
+        return false;
+    };
+    let Some(state) = crate::pane::plain_terminal_input_state(replica.terminal()) else {
+        return false;
+    };
+    if !state.mouse_reporting_enabled() {
+        return false;
+    }
+    let Some(bytes) = crate::input::encode_mouse_button(
+        mouse.kind,
+        mouse.column.saturating_sub(inner_rect.x),
+        mouse.row.saturating_sub(inner_rect.y),
+        mouse.modifiers,
+        state.mouse_protocol_encoding,
+    ) else {
+        return false;
+    };
+    // Clicking an unfocused reporting pane focuses it and delivers the
+    // report, matching the legacy pane-first routing.
+    if matches!(mouse.kind, MouseEventKind::Down(_)) {
+        let focused = app
+            .active
+            .and_then(|idx| app.workspaces.get(idx))
+            .and_then(|ws| ws.focused_pane_id());
+        if focused != Some(pane_id) {
+            send_api_request(
+                link,
+                crate::api::schema::Method::PaneFocus(crate::api::schema::PaneTarget {
+                    pane_id: public.clone(),
+                }),
+            );
+        }
+    }
+    send_pane_bytes(link, &public, &bytes);
+    true
 }
 
 /// Sends a JSON API request over the framed control plane. Fire-and-forget:
@@ -1034,3 +1295,77 @@ pub(super) fn send_api_request(link: &mut Link, method: crate::api::schema::Meth
 }
 
 pub(super) use Link as SessionLink;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::{KeyCode, KeyModifiers};
+
+    fn key(code: KeyCode) -> crate::input::TerminalKey {
+        crate::input::TerminalKey::new(code, KeyModifiers::empty())
+    }
+
+    #[tokio::test]
+    async fn residual_modal_modes_never_quit_on_q() {
+        let mut link = Link::Incompatible;
+        let mut mirrors = RemoteMirrors::with_local();
+        let mut ids = ComposeIds::new();
+        let mut app = AppState::test_new();
+
+        app.mode = Mode::ContextMenu;
+        handle_key(
+            key(KeyCode::Char('q')),
+            &mut link,
+            &mut mirrors,
+            &mut ids,
+            &mut app,
+        );
+        assert!(
+            !app.should_quit,
+            "q inside a dead modal must not quit the client"
+        );
+        assert_eq!(app.mode, Mode::Navigate);
+
+        app.mode = Mode::ConfirmClose;
+        handle_key(
+            key(KeyCode::Esc),
+            &mut link,
+            &mut mirrors,
+            &mut ids,
+            &mut app,
+        );
+        assert!(!app.should_quit);
+        assert_eq!(app.mode, Mode::Navigate);
+
+        // Navigate itself still quits on q.
+        handle_key(
+            key(KeyCode::Char('q')),
+            &mut link,
+            &mut mirrors,
+            &mut ids,
+            &mut app,
+        );
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn hidden_pane_streams_are_selected_for_closing() {
+        let mut mirror = super::super::RemoteMirror::test_with_adversarial_catalog();
+        let visible_replica =
+            crate::terminal::replica::PaneReplica::open("a", 1, None, 80, 24, 64 * 1024)
+                .expect("replica opens");
+        mirror.stream_opened("p_2_1", 3, visible_replica);
+        let hidden_replica =
+            crate::terminal::replica::PaneReplica::open("b", 1, None, 80, 24, 64 * 1024)
+                .expect("replica opens");
+        mirror.stream_opened("p_10_1", 4, hidden_replica);
+
+        let visible = vec!["p_2_1".to_owned(), "p_2_10".to_owned()];
+        let hidden = hidden_pane_streams(&mirror, &visible);
+        assert_eq!(hidden, vec![("p_10_1".to_owned(), 4)]);
+
+        mirror.stream_closed(4);
+        assert!(hidden_pane_streams(&mirror, &visible).is_empty());
+        mirror.assert_invariants_for_test();
+    }
+}

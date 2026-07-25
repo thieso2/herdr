@@ -28,6 +28,7 @@ mod cursor;
 mod input;
 mod kitty_keyboard;
 mod osc;
+pub(crate) mod output_tap;
 mod state;
 mod terminal;
 mod xtgettcap;
@@ -971,6 +972,7 @@ pub struct PaneRuntime {
     child_wait_completed: Option<Arc<AtomicBool>>,
     kitty_keyboard_flags: Arc<AtomicU16>,
     detection_content_seq: Arc<AtomicU64>,
+    output_tap: Arc<output_tap::PaneOutputTap>,
     full_lifecycle_authority_active: Arc<AtomicBool>,
     detect_reset_notify: Arc<Notify>,
     pending_release: Arc<Mutex<Option<PendingAgentRelease>>>,
@@ -1779,6 +1781,7 @@ impl PaneRuntime {
         let reported_cwd = Arc::new(Mutex::new(None));
         let kitty_keyboard_flags = Arc::new(AtomicU16::new(keyboard_protocol_flags));
         let detection_content_seq = Arc::new(AtomicU64::new(0));
+        let output_tap = Arc::new(output_tap::PaneOutputTap::default());
 
         let io = {
             let terminal = terminal.clone();
@@ -1786,6 +1789,7 @@ impl PaneRuntime {
             let render_notify = render_notify.clone();
             let render_dirty = render_dirty.clone();
             let detection_content_seq = detection_content_seq.clone();
+            let output_tap = output_tap.clone();
             let child_pid = child_pid.clone();
             let read_events = events.clone();
             let reported_cwd = reported_cwd.clone();
@@ -1793,8 +1797,9 @@ impl PaneRuntime {
             let delay_rt = rt.clone();
             let on_read = Box::new(move |bytes: &[u8]| {
                 let shell_pid = child_pid.load(Ordering::Acquire);
-                let result =
-                    terminal.process_pty_bytes(pane_id, shell_pid, bytes, &response_writer);
+                let result = output_tap.publish_with(bytes, || {
+                    terminal.process_pty_bytes(pane_id, shell_pid, bytes, &response_writer)
+                });
                 observe_detection_content_change(bytes, &detection_content_seq);
                 if result.request_render && !render_dirty.swap(true, Ordering::AcqRel) {
                     render_notify.notify_one();
@@ -1859,6 +1864,7 @@ impl PaneRuntime {
             child_wait_completed: None,
             kitty_keyboard_flags,
             detection_content_seq,
+            output_tap,
             full_lifecycle_authority_active,
             detect_reset_notify,
             pending_release,
@@ -1912,6 +1918,7 @@ impl PaneRuntime {
         let reported_cwd = Arc::new(Mutex::new(None));
         let child_wait_completed = Arc::new(AtomicBool::new(false));
         let detection_content_seq = Arc::new(AtomicU64::new(0));
+        let output_tap = Arc::new(output_tap::PaneOutputTap::default());
         let full_lifecycle_authority_active = Arc::new(AtomicBool::new(false));
         {
             let child_pid = child_pid.clone();
@@ -1945,14 +1952,16 @@ impl PaneRuntime {
             let render_notify = render_notify.clone();
             let render_dirty = render_dirty.clone();
             let detection_content_seq = detection_content_seq.clone();
+            let output_tap = output_tap.clone();
             let child_pid = child_pid.clone();
             let events = events.clone();
             let reported_cwd = reported_cwd.clone();
             let rt = tokio::runtime::Handle::current();
             let on_read = Box::new(move |bytes: &[u8]| {
                 let shell_pid = child_pid.load(Ordering::Acquire);
-                let result =
-                    terminal.process_pty_bytes(pane_id, shell_pid, bytes, &response_writer);
+                let result = output_tap.publish_with(bytes, || {
+                    terminal.process_pty_bytes(pane_id, shell_pid, bytes, &response_writer)
+                });
                 if agent_detection == AgentDetection::Enabled {
                     observe_detection_content_change(bytes, &detection_content_seq);
                 }
@@ -2373,6 +2382,7 @@ impl PaneRuntime {
             child_wait_completed: Some(child_wait_completed),
             kitty_keyboard_flags,
             detection_content_seq,
+            output_tap,
             full_lifecycle_authority_active,
             detect_reset_notify,
             pending_release,
@@ -2575,6 +2585,16 @@ impl PaneRuntime {
     pub fn snapshot_history(&self) -> Option<String> {
         let ansi = self.recent_unwrapped_ansi(usize::MAX);
         (!ansi.trim().is_empty()).then_some(ansi)
+    }
+
+    /// Subscribes to this pane's raw PTY output tail and captures the visible
+    /// screen as an ANSI snapshot under the tap lock, so the subscription
+    /// sequence, the snapshot, and the tail are mutually consistent.
+    pub(crate) fn subscribe_output_with_snapshot(
+        &self,
+    ) -> (output_tap::PaneOutputSubscription, String) {
+        self.output_tap
+            .subscribe_with_snapshot(|| self.visible_ansi())
     }
 
     pub fn extract_selection(&self, selection: &crate::selection::Selection) -> Option<String> {
@@ -2812,7 +2832,9 @@ impl PaneRuntime {
 
     pub(crate) fn test_process_pty_bytes(&self, bytes: &[u8]) {
         let (tx, _rx) = mpsc::channel(1);
-        let _ = self.terminal.process_pty_bytes(self.pane_id, 0, bytes, &tx);
+        let _ = self.output_tap.publish_with(bytes, || {
+            self.terminal.process_pty_bytes(self.pane_id, 0, bytes, &tx)
+        });
     }
 
     pub(crate) fn test_with_scrollback_bytes(
@@ -2853,6 +2875,7 @@ impl PaneRuntime {
                 child_wait_completed: None,
                 kitty_keyboard_flags: Arc::new(AtomicU16::new(0)),
                 detection_content_seq: Arc::new(AtomicU64::new(0)),
+                output_tap: Arc::new(output_tap::PaneOutputTap::default()),
                 full_lifecycle_authority_active: Arc::new(AtomicBool::new(false)),
                 detect_reset_notify: Arc::new(Notify::new()),
                 pending_release: Arc::new(Mutex::new(None)),
@@ -3351,6 +3374,7 @@ mod tests {
             child_wait_completed: None,
             kitty_keyboard_flags: Arc::new(AtomicU16::new(0)),
             detection_content_seq: Arc::new(AtomicU64::new(0)),
+            output_tap: Arc::new(output_tap::PaneOutputTap::default()),
             full_lifecycle_authority_active: Arc::new(AtomicBool::new(false)),
             detect_reset_notify: Arc::new(Notify::new()),
             pending_release: Arc::new(Mutex::new(None)),
@@ -3382,6 +3406,7 @@ mod tests {
             child_wait_completed: None,
             kitty_keyboard_flags: Arc::new(AtomicU16::new(0)),
             detection_content_seq: Arc::new(AtomicU64::new(0)),
+            output_tap: Arc::new(output_tap::PaneOutputTap::default()),
             full_lifecycle_authority_active: Arc::new(AtomicBool::new(false)),
             detect_reset_notify: Arc::new(Notify::new()),
             pending_release: Arc::new(Mutex::new(None)),

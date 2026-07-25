@@ -301,15 +301,21 @@ fn write_framed_control(stream: &mut UnixStream, value: &serde_json::Value) {
     stream.flush().unwrap();
 }
 
-fn read_framed_control(stream: &mut UnixStream) -> serde_json::Value {
+fn read_framed_frame(stream: &mut UnixStream) -> (u8, u32, Vec<u8>) {
     let mut header = [0u8; 10];
     stream.read_exact(&mut header).unwrap();
     let len = u32::from_le_bytes([header[0], header[1], header[2], header[3]]) as usize;
-    assert_eq!(header[4], 0, "expected a control frame");
+    let frame_type = header[4];
     let stream_id = u32::from_le_bytes([header[6], header[7], header[8], header[9]]);
-    assert_eq!(stream_id, 0, "control frames use stream id 0");
     let mut payload = vec![0u8; len];
     stream.read_exact(&mut payload).unwrap();
+    (frame_type, stream_id, payload)
+}
+
+fn read_framed_control(stream: &mut UnixStream) -> serde_json::Value {
+    let (frame_type, stream_id, payload) = read_framed_frame(stream);
+    assert_eq!(frame_type, 0, "expected a control frame");
+    assert_eq!(stream_id, 0, "control frames use stream id 0");
     serde_json::from_slice(&payload).unwrap()
 }
 
@@ -401,6 +407,136 @@ fn framed_session_and_ndjson_coexist_on_api_socket() {
         &serde_json::json!({"id": "beat_2", "method": "ping", "params": {}}),
     );
     assert_eq!(read_framed_control(&mut framed)["id"], "beat_2");
+
+    cleanup_spawned_herdr(child, base);
+}
+
+#[test]
+fn framed_stream_open_tails_live_pane_output_and_accepts_input() {
+    use base64::Engine as _;
+
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let socket_path = runtime_dir.join("herdr.sock");
+
+    let child = spawn_herdr(&config_home, &runtime_dir, &socket_path);
+    wait_for_socket(&socket_path, Duration::from_secs(5));
+
+    // A real pane comes from workspace.create over the NDJSON API.
+    let created = send_request(
+        &socket_path,
+        &format!(
+            r#"{{"id":"ws_1","method":"workspace.create","params":{{"cwd":"{}","focus":true}}}}"#,
+            base.display()
+        ),
+    );
+    assert_eq!(created["result"]["type"], "workspace_created");
+    let pane_id = created["result"]["root_pane"]["pane_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let mut framed = UnixStream::connect(&socket_path).unwrap();
+    framed
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    framed.write_all(b"HRDR").unwrap();
+    write_framed_control(
+        &mut framed,
+        &serde_json::json!({
+            "id": "hello_s",
+            "method": "session.hello",
+            "params": {"protocol": 1, "min_protocol": 1, "capabilities": ["pane-stream"]},
+        }),
+    );
+    assert_eq!(
+        read_framed_control(&mut framed)["result"]["type"],
+        "session.welcome"
+    );
+
+    // stream.open returns the server-allocated stream id, the pane output
+    // sequence, a screen snapshot, and an opaque history cursor.
+    write_framed_control(
+        &mut framed,
+        &serde_json::json!({
+            "id": "open_1",
+            "method": "stream.open",
+            "params": {"pane_id": pane_id},
+        }),
+    );
+    let opened = read_framed_control(&mut framed);
+    assert_eq!(opened["id"], "open_1");
+    assert_eq!(opened["result"]["type"], "pane_stream_opened");
+    let stream = &opened["result"]["stream"];
+    assert_eq!(stream["pane_id"], serde_json::json!(pane_id));
+    let stream_id = stream["stream_id"].as_u64().unwrap();
+    assert_ne!(stream_id, 0, "stream ids never reuse the control stream id");
+    assert!(stream["sequence"].is_u64());
+    assert!(stream["snapshot"].is_string());
+    assert!(!stream["history_cursor"].as_str().unwrap().is_empty());
+
+    // Pane input is a control-plane method; the raw PTY echo of the typed
+    // command arrives as DATA frames on the allocated stream id.
+    let marker = "herdr_stream_e2e_marker";
+    let data = base64::engine::general_purpose::STANDARD.encode(format!("echo {marker}\r"));
+    write_framed_control(
+        &mut framed,
+        &serde_json::json!({
+            "id": "in_1",
+            "method": "pane.send_bytes",
+            "params": {"pane_id": pane_id, "data_base64": data},
+        }),
+    );
+
+    let mut tail = Vec::new();
+    let mut input_acked = false;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        let (frame_type, frame_stream_id, payload) = read_framed_frame(&mut framed);
+        if frame_type == 0 {
+            let control: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+            assert_eq!(control["id"], "in_1");
+            assert_eq!(control["result"]["type"], "ok");
+            input_acked = true;
+            continue;
+        }
+        assert_eq!(frame_type, 1, "expected a data frame");
+        assert_eq!(
+            frame_stream_id as u64, stream_id,
+            "data frames carry the allocated stream id"
+        );
+        tail.extend_from_slice(&payload);
+        if input_acked && String::from_utf8_lossy(&tail).contains(marker) {
+            break;
+        }
+    }
+    assert!(input_acked, "pane.send_bytes must be acknowledged");
+    assert!(
+        String::from_utf8_lossy(&tail).contains(marker),
+        "raw PTY output tail must carry the echoed marker"
+    );
+
+    // stream.close detaches the tail; residual buffered data frames may
+    // still arrive before the response.
+    write_framed_control(
+        &mut framed,
+        &serde_json::json!({
+            "id": "close_1",
+            "method": "stream.close",
+            "params": {"stream_id": stream_id},
+        }),
+    );
+    loop {
+        let (frame_type, _, payload) = read_framed_frame(&mut framed);
+        if frame_type == 0 {
+            let control: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+            assert_eq!(control["id"], "close_1");
+            assert_eq!(control["result"]["type"], "stream_closed");
+            break;
+        }
+    }
 
     cleanup_spawned_herdr(child, base);
 }

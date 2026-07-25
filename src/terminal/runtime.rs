@@ -365,6 +365,14 @@ impl TerminalRuntime {
         self.0.snapshot_history()
     }
 
+    /// Subscribes to the raw PTY output tail, capturing a consistent visible
+    /// screen ANSI snapshot at the subscription point.
+    pub(crate) fn subscribe_output_with_snapshot(
+        &self,
+    ) -> (crate::pane::output_tap::PaneOutputSubscription, String) {
+        self.0.subscribe_output_with_snapshot()
+    }
+
     pub fn extract_selection(&self, selection: &crate::selection::Selection) -> Option<String> {
         self.0.extract_selection(selection)
     }

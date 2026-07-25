@@ -166,6 +166,9 @@ pub enum ResponseResult {
     PaneRead {
         read: PaneReadResult,
     },
+    PaneStreamOpened {
+        stream: super::panes::PaneStreamOpenInfo,
+    },
     PaneGraphicsInfo {
         cell_width_px: u32,
         cell_height_px: u32,

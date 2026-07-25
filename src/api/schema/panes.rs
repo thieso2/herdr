@@ -312,6 +312,45 @@ pub struct PaneGraphicsStreamParams {
     pub owner: String,
 }
 
+/// Internal params for the framed `stream.open` control method. The stream id
+/// is server-allocated by the framed session layer before dispatch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct PaneStreamOpenParams {
+    pub pane_id: String,
+    pub stream_id: u32,
+}
+
+/// Internal params for the framed `pane.send_bytes` control method.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct PaneSendBytesParams {
+    pub pane_id: String,
+    pub data_base64: String,
+}
+
+/// Internal params for the framed `pane.paste_image` control method.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct PanePasteImageParams {
+    pub pane_id: String,
+    pub extension: String,
+    pub data_base64: String,
+}
+
+/// Result payload of a successful framed `stream.open`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct PaneStreamOpenInfo {
+    pub pane_id: String,
+    pub workspace_id: String,
+    /// Server-allocated stream id; never reused within a server process.
+    pub stream_id: u32,
+    /// Pane output byte sequence captured with the snapshot. The stream's
+    /// DATA tail begins at the byte after this sequence.
+    pub sequence: u64,
+    /// ANSI snapshot of the visible screen at the subscription point.
+    pub snapshot: String,
+    /// Opaque cursor identifying the snapshot point in pane history.
+    pub history_cursor: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct PaneReportAgentParams {
     pub pane_id: String,

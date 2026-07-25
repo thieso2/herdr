@@ -155,7 +155,7 @@ fn handle_connection(
     let line = match preamble {
         ConnectionPreamble::FramedSession => {
             debug!("framed session opened on api socket");
-            return framed_session::serve(stream, running);
+            return framed_session::serve(stream, api_tx, event_hub, running);
         }
         ConnectionPreamble::RequestLine(line) => line,
     };
@@ -425,6 +425,9 @@ fn api_method_name(method: &Method) -> &'static str {
         Method::PaneGraphicsStreamSet(_) => "pane.graphics.stream.set",
         Method::PaneGraphicsStreamOpen(_) => "pane.graphics.stream.open",
         Method::PaneGraphicsStreamClose(_) => "pane.graphics.stream.close",
+        Method::PaneStreamOpen(_) => "stream.open",
+        Method::PaneSendBytes(_) => "pane.send_bytes",
+        Method::PanePasteImage(_) => "pane.paste_image",
         Method::PaneReportAgent(_) => "pane.report_agent",
         Method::PaneReportAgentSession(_) => "pane.report_agent_session",
         Method::PaneReportMetadata(_) => "pane.report_metadata",

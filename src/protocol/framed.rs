@@ -51,17 +51,58 @@ pub const FRAMED_PROTOCOL_MIN_SUPPORTED: u32 = 1;
 /// server-allocated and never reuse this value.
 pub const CONTROL_STREAM_ID: u32 = 0;
 
+/// Capability gating `stream.open`, DATA-frame output tails, and the
+/// `pane.send_bytes` input method.
+pub const CAPABILITY_PANE_STREAM: &str = "pane-stream";
+
+/// Capability gating `notification.posted` event broadcasts.
+pub const CAPABILITY_NOTIFICATION: &str = "notification";
+
+/// Capability gating `window_title.changed` event broadcasts.
+pub const CAPABILITY_WINDOW_TITLE: &str = "window-title";
+
+/// Capability gating the `pane.paste_image` method.
+pub const CAPABILITY_PASTE_IMAGE: &str = "paste-image";
+
 /// Capability flags this server advertises during `session.hello`.
 /// Capabilities are additive feature flags; the negotiated set is the
-/// intersection with the client's flags. `pane-stream` joins this list once
-/// `stream.open` is served.
-pub const SERVER_CAPABILITIES: &[&str] = &[];
+/// intersection with the client's flags.
+pub const SERVER_CAPABILITIES: &[&str] = &[
+    CAPABILITY_PANE_STREAM,
+    CAPABILITY_NOTIFICATION,
+    CAPABILITY_WINDOW_TITLE,
+    CAPABILITY_PASTE_IMAGE,
+];
 
 /// Control-plane method opening a framed session.
 pub const SESSION_HELLO_METHOD: &str = "session.hello";
 
 /// Control-plane heartbeat method.
 pub const PING_METHOD: &str = "ping";
+
+/// Control-plane method opening a pane output stream.
+pub const STREAM_OPEN_METHOD: &str = "stream.open";
+
+/// Control-plane method closing an open pane output stream.
+pub const STREAM_CLOSE_METHOD: &str = "stream.close";
+
+/// Control-plane method writing raw bytes to a pane PTY.
+pub const PANE_SEND_BYTES_METHOD: &str = "pane.send_bytes";
+
+/// Control-plane method staging an image and pasting its path into a pane.
+pub const PANE_PASTE_IMAGE_METHOD: &str = "pane.paste_image";
+
+/// Event name broadcast to framed clients when the server posts a
+/// notification.
+pub const NOTIFICATION_POSTED_EVENT: &str = "notification.posted";
+
+/// Event name broadcast to framed clients when the requested client window
+/// title changes.
+pub const WINDOW_TITLE_CHANGED_EVENT: &str = "window_title.changed";
+
+/// Event name sent when the server closes an open stream, for example when
+/// the pane behind it goes away.
+pub const STREAM_CLOSED_EVENT: &str = "stream.closed";
 
 // ---------------------------------------------------------------------------
 // Frame codec
@@ -285,6 +326,79 @@ pub struct NegotiatedSession {
     pub protocol: u32,
     /// Capability flags active for this session (client ∩ server).
     pub capabilities: Vec<String>,
+}
+
+impl NegotiatedSession {
+    /// True when the capability flag was negotiated for this session.
+    pub fn has_capability(&self, capability: &str) -> bool {
+        self.capabilities.iter().any(|c| c == capability)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Pane-stream control vocabulary
+// ---------------------------------------------------------------------------
+
+/// Parameters of the `stream.open` control request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StreamOpenParams {
+    /// Public pane id whose output tail the stream should carry.
+    pub pane_id: String,
+}
+
+/// Parameters of the `stream.close` control request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StreamCloseParams {
+    /// Server-allocated id of the stream to close.
+    pub stream_id: u32,
+}
+
+/// Parameters of the `pane.send_bytes` control request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PaneSendBytesControlParams {
+    /// Public pane id receiving the input.
+    pub pane_id: String,
+    /// Base64-encoded raw bytes written to the pane PTY.
+    pub data_base64: String,
+}
+
+/// Parameters of the `pane.paste_image` control request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PanePasteImageControlParams {
+    /// Public pane id receiving the paste.
+    pub pane_id: String,
+    /// Image file extension hint (`png`, `jpg`, ...).
+    pub extension: String,
+    /// Base64-encoded image bytes.
+    pub data_base64: String,
+}
+
+/// Version prefix of the opaque history cursor format.
+const HISTORY_CURSOR_PREFIX: &str = "hdrc1";
+
+/// Encodes an opaque history cursor from a pane identity and the pane output
+/// byte sequence captured with the snapshot. Clients must treat the value as
+/// opaque; only the server interprets it.
+pub fn encode_history_cursor(pane_id: &str, sequence: u64) -> String {
+    use base64::Engine as _;
+    let raw = format!("{HISTORY_CURSOR_PREFIX}:{sequence}:{pane_id}");
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(raw.as_bytes())
+}
+
+/// Decodes an opaque history cursor back into `(pane_id, sequence)`.
+// The server-side consumer arrives with the history-replay migration stage;
+// until then only tests exercise the decode half of the cursor codec.
+#[allow(dead_code)]
+pub fn decode_history_cursor(cursor: &str) -> Option<(String, u64)> {
+    use base64::Engine as _;
+    let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(cursor.as_bytes())
+        .ok()?;
+    let raw = String::from_utf8(raw).ok()?;
+    let rest = raw.strip_prefix(HISTORY_CURSOR_PREFIX)?.strip_prefix(':')?;
+    let (sequence, pane_id) = rest.split_once(':')?;
+    let sequence = sequence.parse().ok()?;
+    (!pane_id.is_empty()).then(|| (pane_id.to_owned(), sequence))
 }
 
 /// Negotiates a `session.hello` against this server's version window and
@@ -643,6 +757,79 @@ mod tests {
         let session = negotiate_session_hello(&hello(FRAMED_PROTOCOL_VERSION, None, &[])).unwrap();
         assert_eq!(session.protocol, FRAMED_PROTOCOL_VERSION);
         assert!(session.capabilities.is_empty());
+    }
+
+    #[test]
+    fn hello_negotiates_pane_surface_capabilities() {
+        let session = negotiate_session_hello(&hello(
+            FRAMED_PROTOCOL_VERSION,
+            None,
+            &[
+                "pane-stream",
+                "notification",
+                "window-title",
+                "paste-image",
+                "future-unknown",
+            ],
+        ))
+        .unwrap();
+        assert_eq!(
+            session.capabilities,
+            vec!["pane-stream", "notification", "window-title", "paste-image"]
+        );
+        assert!(session.has_capability(CAPABILITY_PANE_STREAM));
+        assert!(session.has_capability(CAPABILITY_NOTIFICATION));
+        assert!(session.has_capability(CAPABILITY_WINDOW_TITLE));
+        assert!(session.has_capability(CAPABILITY_PASTE_IMAGE));
+        assert!(!session.has_capability("future-unknown"));
+    }
+
+    #[test]
+    fn history_cursor_round_trips_and_is_opaque() {
+        let cursor = encode_history_cursor("p_2_7", 123_456_789);
+        assert!(!cursor.contains("p_2_7"), "cursor must look opaque");
+        assert_eq!(
+            decode_history_cursor(&cursor),
+            Some(("p_2_7".to_owned(), 123_456_789))
+        );
+
+        assert_eq!(decode_history_cursor(""), None);
+        assert_eq!(decode_history_cursor("not-base64!!"), None);
+        assert_eq!(decode_history_cursor("aGVsbG8"), None);
+    }
+
+    #[test]
+    fn event_name_constants_match_event_kind_dot_names() {
+        assert_eq!(
+            NOTIFICATION_POSTED_EVENT,
+            crate::api::schema::EventKind::NotificationPosted.dot_name()
+        );
+        assert_eq!(
+            WINDOW_TITLE_CHANGED_EVENT,
+            crate::api::schema::EventKind::WindowTitleChanged.dot_name()
+        );
+    }
+
+    #[test]
+    fn stream_open_params_decode_from_control_json() {
+        let params: StreamOpenParams =
+            serde_json::from_value(serde_json::json!({"pane_id": "p_1"})).unwrap();
+        assert_eq!(params.pane_id, "p_1");
+
+        let close: StreamCloseParams =
+            serde_json::from_value(serde_json::json!({"stream_id": 7})).unwrap();
+        assert_eq!(close.stream_id, 7);
+
+        let send: PaneSendBytesControlParams =
+            serde_json::from_value(serde_json::json!({"pane_id": "p_1", "data_base64": "aGk="}))
+                .unwrap();
+        assert_eq!(send.data_base64, "aGk=");
+
+        let paste: PanePasteImageControlParams = serde_json::from_value(
+            serde_json::json!({"pane_id": "p_1", "extension": "png", "data_base64": "aGk="}),
+        )
+        .unwrap();
+        assert_eq!(paste.extension, "png");
     }
 
     #[test]

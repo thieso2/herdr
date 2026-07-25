@@ -678,6 +678,50 @@
             },
             {
               "properties": {
+                "body": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "kind": {
+                  "$ref": "#/schemas/event/$defs/NotificationEventKind"
+                },
+                "message": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "notification_posted",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "kind",
+                "message"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "title": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "type": {
+                  "const": "window_title_changed",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
                 "layout": {
                   "$ref": "#/schemas/event/$defs/PaneLayoutSnapshot"
                 },
@@ -720,7 +764,18 @@
             "pane_exited",
             "pane_agent_detected",
             "pane_agent_status_changed",
+            "notification_posted",
+            "window_title_changed",
             "layout_updated"
+          ],
+          "type": "string"
+        },
+        "NotificationEventKind": {
+          "description": "Delivery kind of a posted notification. Mirrors the legacy client\nprotocol's notify kinds without referencing the frozen wire types.",
+          "enum": [
+            "sound",
+            "toast",
+            "system_toast"
           ],
           "type": "string"
         },
@@ -6869,6 +6924,50 @@
             },
             {
               "properties": {
+                "body": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "kind": {
+                  "$ref": "#/schemas/success_response/$defs/NotificationEventKind"
+                },
+                "message": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "notification_posted",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "kind",
+                "message"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "title": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "type": {
+                  "const": "window_title_changed",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
                 "layout": {
                   "$ref": "#/schemas/success_response/$defs/PaneLayoutSnapshot"
                 },
@@ -6926,6 +7025,8 @@
             "pane_exited",
             "pane_agent_detected",
             "pane_agent_status_changed",
+            "notification_posted",
+            "window_title_changed",
             "layout_updated"
           ],
           "type": "string"
@@ -7181,6 +7282,15 @@
               "type": "object"
             }
           ]
+        },
+        "NotificationEventKind": {
+          "description": "Delivery kind of a posted notification. Mirrors the legacy client\nprotocol's notify kinds without referencing the frozen wire types.",
+          "enum": [
+            "sound",
+            "toast",
+            "system_toast"
+          ],
+          "type": "string"
         },
         "NotificationShowReason": {
           "enum": [
@@ -7817,6 +7927,46 @@
             "offset_from_bottom",
             "max_offset_from_bottom",
             "viewport_rows"
+          ],
+          "type": "object"
+        },
+        "PaneStreamOpenInfo": {
+          "description": "Result payload of a successful framed `stream.open`.",
+          "properties": {
+            "history_cursor": {
+              "description": "Opaque cursor identifying the snapshot point in pane history.",
+              "type": "string"
+            },
+            "pane_id": {
+              "type": "string"
+            },
+            "sequence": {
+              "description": "Pane output byte sequence captured with the snapshot. The stream's\nDATA tail begins at the byte after this sequence.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "snapshot": {
+              "description": "ANSI snapshot of the visible screen at the subscription point.",
+              "type": "string"
+            },
+            "stream_id": {
+              "description": "Server-allocated stream id; never reused within a server process.",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "workspace_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "pane_id",
+            "workspace_id",
+            "stream_id",
+            "sequence",
+            "snapshot",
+            "history_cursor"
           ],
           "type": "object"
         },
@@ -9249,6 +9399,22 @@
               "required": [
                 "type",
                 "read"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "stream": {
+                  "$ref": "#/schemas/success_response/$defs/PaneStreamOpenInfo"
+                },
+                "type": {
+                  "const": "pane_stream_opened",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "stream"
               ],
               "type": "object"
             },

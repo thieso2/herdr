@@ -1388,6 +1388,366 @@ impl AppState {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Pure-client modal interpretation
+// ---------------------------------------------------------------------------
+//
+// The pure client reuses the exact rename / confirm-close / context-menu
+// state machines above, but instead of dispatching in-process API requests
+// it returns the control-plane methods to send over the framed session. In
+// the composed pure-client state, workspace ids are the server's public ids;
+// pane and tab public ids resolve through [`PureModalIds`].
+
+/// Public-id resolution the pure client provides when interpreting modal
+/// state into control-plane methods.
+pub(crate) struct PureModalIds<'a> {
+    /// Public pane id behind a composed local pane id.
+    pub(crate) pane_public: &'a dyn Fn(crate::layout::PaneId) -> Option<String>,
+    /// Public tab id at a composed (workspace index, tab index) position.
+    pub(crate) tab_public: &'a dyn Fn(usize, usize) -> Option<String>,
+}
+
+/// Handles one key in a pure-client modal mode. Mutates the modal state
+/// exactly like the legacy handlers and returns the methods to dispatch.
+pub(crate) fn pure_client_modal_key(
+    state: &mut AppState,
+    key: KeyEvent,
+    ids: &PureModalIds<'_>,
+) -> Vec<crate::api::schema::Method> {
+    match state.mode {
+        Mode::RenameWorkspace | Mode::RenameTab | Mode::RenamePane => {
+            if let Some(action) = modal_action_from_key(&key, RENAME_ACTIONS) {
+                return pure_rename_action(state, action, ids);
+            }
+            handle_rename_edit_key(state, key);
+            Vec::new()
+        }
+        Mode::ConfirmClose => match modal_action_from_key(&key, CONFIRM_CLOSE_ACTIONS) {
+            Some(ModalAction::Confirm) => pure_confirm_close_accept(state),
+            Some(ModalAction::Cancel) => {
+                confirm_close_cancel(state);
+                Vec::new()
+            }
+            _ => Vec::new(),
+        },
+        Mode::ContextMenu => match key.code {
+            KeyCode::Esc => {
+                state.context_menu = None;
+                leave_modal(state);
+                Vec::new()
+            }
+            KeyCode::Up => {
+                if let Some(menu) = &mut state.context_menu {
+                    menu.list.move_prev();
+                }
+                Vec::new()
+            }
+            KeyCode::Down => {
+                if let Some(menu) = &mut state.context_menu {
+                    menu.list.move_next(menu.items().len());
+                }
+                Vec::new()
+            }
+            KeyCode::Enter => {
+                if let Some(menu) = state.context_menu.take() {
+                    let idx = menu.list.highlighted;
+                    return pure_context_menu_action(state, menu, idx, ids);
+                }
+                Vec::new()
+            }
+            _ => Vec::new(),
+        },
+        _ => Vec::new(),
+    }
+}
+
+/// Handles a modal mouse action in the pure client.
+pub(crate) fn pure_client_modal_mouse(
+    state: &mut AppState,
+    action: super::mouse::MouseAction,
+    ids: &PureModalIds<'_>,
+) -> Vec<crate::api::schema::Method> {
+    match action {
+        super::mouse::MouseAction::RenameModal(action) => pure_rename_action(state, action, ids),
+        super::mouse::MouseAction::ConfirmCloseAccept => pure_confirm_close_accept(state),
+        super::mouse::MouseAction::ContextMenu { menu, idx } => {
+            pure_context_menu_action(state, menu, idx, ids)
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn pure_rename_action(
+    state: &mut AppState,
+    action: ModalAction,
+    ids: &PureModalIds<'_>,
+) -> Vec<crate::api::schema::Method> {
+    match action {
+        ModalAction::Save => pure_save_rename_modal(state, ids),
+        ModalAction::Clear => {
+            state.name_input.clear();
+            state.name_input_replace_on_type = false;
+            Vec::new()
+        }
+        ModalAction::Cancel => {
+            cancel_rename_modal(state);
+            Vec::new()
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// Mirror of `save_rename_modal_via_api` returning the methods to send.
+/// The workspace-create-with-cwd path is absent: the pure client never sets
+/// `pending_workspace_create_cwd` (worktree dialogs stay unsupported).
+fn pure_save_rename_modal(
+    state: &mut AppState,
+    ids: &PureModalIds<'_>,
+) -> Vec<crate::api::schema::Method> {
+    let new_name = if state.name_input.trim().is_empty() {
+        state.name_input.clone()
+    } else {
+        state.name_input.trim().to_string()
+    };
+    let mut methods = Vec::new();
+    match state.mode {
+        Mode::RenameWorkspace => {
+            if !state.workspaces.is_empty() && !new_name.is_empty() {
+                let ws_idx = state.selected.min(state.workspaces.len() - 1);
+                methods.push(crate::api::schema::Method::WorkspaceRename(
+                    crate::api::schema::WorkspaceRenameParams {
+                        workspace_id: state.workspaces[ws_idx].id.clone(),
+                        label: new_name,
+                    },
+                ));
+            }
+        }
+        Mode::RenameTab if state.creating_new_tab => {
+            let default_name = next_new_tab_default_name(state);
+            let label = if new_name.is_empty() || new_name == default_name {
+                None
+            } else {
+                Some(new_name)
+            };
+            methods.push(crate::api::schema::Method::TabCreate(
+                crate::api::schema::TabCreateParams {
+                    workspace_id: None,
+                    cwd: None,
+                    focus: true,
+                    label,
+                    env: Default::default(),
+                },
+            ));
+        }
+        Mode::RenameTab if !new_name.is_empty() => {
+            if let Some(ws_idx) = state.active {
+                let tab_idx = state.workspaces[ws_idx].active_tab;
+                let keep_auto_name = state.workspaces[ws_idx]
+                    .tabs
+                    .get(tab_idx)
+                    .is_some_and(|tab| tab.is_auto_named())
+                    && state.workspaces[ws_idx]
+                        .tab_display_name(tab_idx)
+                        .is_some_and(|name| new_name == name);
+                if !keep_auto_name {
+                    if let Some(tab_id) = (ids.tab_public)(ws_idx, tab_idx) {
+                        methods.push(crate::api::schema::Method::TabRename(
+                            crate::api::schema::TabRenameParams {
+                                tab_id,
+                                label: new_name,
+                            },
+                        ));
+                    }
+                }
+            }
+        }
+        Mode::RenamePane => {
+            if let Some(pane_id) = state.rename_pane_target {
+                if let Some(pane_id) = (ids.pane_public)(pane_id) {
+                    methods.push(crate::api::schema::Method::PaneRename(
+                        crate::api::schema::PaneRenameParams {
+                            pane_id,
+                            label: Some(new_name),
+                        },
+                    ));
+                }
+            }
+        }
+        _ => {}
+    }
+    cancel_rename_modal(state);
+    methods
+}
+
+/// Mirror of `confirm_close_accept_via_api`: closes the selected workspace.
+fn pure_confirm_close_accept(state: &mut AppState) -> Vec<crate::api::schema::Method> {
+    let mut methods = Vec::new();
+    if let Some(workspace) = state.workspaces.get(state.selected) {
+        methods.push(crate::api::schema::Method::WorkspaceClose(
+            crate::api::schema::WorkspaceTarget {
+                workspace_id: workspace.id.clone(),
+            },
+        ));
+    }
+    state.mode = if state.active.is_some() {
+        Mode::Terminal
+    } else {
+        Mode::Navigate
+    };
+    methods
+}
+
+/// Mirror of `apply_context_menu_action_via_api` for the item subset the
+/// pure client supports. Worktree operations and plugin items stay
+/// unsupported under the flag and close the menu as no-ops.
+fn pure_context_menu_action(
+    state: &mut AppState,
+    menu: crate::app::state::ContextMenuState,
+    idx: usize,
+    ids: &PureModalIds<'_>,
+) -> Vec<crate::api::schema::Method> {
+    use crate::app::state::ContextMenuKind;
+
+    let item = menu.items().get(idx).copied();
+    let mut methods = Vec::new();
+    match (menu.kind, item) {
+        (
+            ContextMenuKind::Workspace { ws_idx } | ContextMenuKind::GitWorkspace { ws_idx, .. },
+            Some("Rename"),
+        ) => {
+            // No live runtimes in the pure client: display names resolve
+            // from the composed terminal metadata.
+            let empty = crate::terminal::TerminalRuntimeRegistry::new();
+            if ws_idx < state.workspaces.len() {
+                open_rename_workspace(state, &empty, ws_idx);
+            }
+        }
+        (
+            ContextMenuKind::Workspace { ws_idx } | ContextMenuKind::GitWorkspace { ws_idx, .. },
+            Some("Close" | "Close group"),
+        ) => {
+            state.selected = ws_idx.min(state.workspaces.len().saturating_sub(1));
+            if state.confirm_close {
+                open_confirm_close(state);
+            } else {
+                if let Some(workspace) = state.workspaces.get(ws_idx) {
+                    methods.push(crate::api::schema::Method::WorkspaceClose(
+                        crate::api::schema::WorkspaceTarget {
+                            workspace_id: workspace.id.clone(),
+                        },
+                    ));
+                }
+                state.mode = Mode::Navigate;
+            }
+        }
+        (
+            ContextMenuKind::GitWorkspace {
+                ws_idx, collapsed, ..
+            },
+            Some("Collapse" | "Expand"),
+        ) => {
+            if let Some(key) = state
+                .workspaces
+                .get(ws_idx)
+                .and_then(|ws| ws.worktree_space())
+                .map(|space| space.key.clone())
+            {
+                if collapsed {
+                    state.collapsed_space_keys.remove(&key);
+                } else {
+                    state.collapsed_space_keys.insert(key);
+                }
+            }
+            leave_modal(state);
+        }
+        (ContextMenuKind::Tab { ws_idx, tab_idx }, Some("New tab")) => {
+            methods.extend(pure_focus_tab(state, ws_idx, tab_idx, ids));
+            open_new_tab_dialog(state);
+        }
+        (ContextMenuKind::Tab { ws_idx, tab_idx }, Some("Rename")) => {
+            methods.extend(pure_focus_tab(state, ws_idx, tab_idx, ids));
+            open_rename_active_tab(state, false);
+        }
+        (ContextMenuKind::Tab { ws_idx, tab_idx }, Some("Close")) => {
+            if let Some(tab_id) = (ids.tab_public)(ws_idx, tab_idx) {
+                methods.push(crate::api::schema::Method::TabClose(
+                    crate::api::schema::TabTarget { tab_id },
+                ));
+            }
+            leave_modal(state);
+        }
+        (ContextMenuKind::Pane { pane_id, .. }, Some("Rename pane")) => {
+            open_rename_pane(state, pane_id);
+        }
+        (ContextMenuKind::Pane { pane_id, .. }, Some("Clear pane name")) => {
+            if let Some(pane_id) = (ids.pane_public)(pane_id) {
+                methods.push(crate::api::schema::Method::PaneRename(
+                    crate::api::schema::PaneRenameParams {
+                        pane_id,
+                        label: None,
+                    },
+                ));
+            }
+            leave_modal(state);
+        }
+        (
+            ContextMenuKind::Pane {
+                pane_id,
+                source_pane_id: Some(source_pane_id),
+                ..
+            },
+            Some("Swap with focused pane"),
+        ) => {
+            let source_public = (ids.pane_public)(source_pane_id);
+            let target_public = (ids.pane_public)(pane_id);
+            if let (Some(source_public), Some(target_public)) = (source_public, target_public) {
+                methods.push(crate::api::schema::Method::PaneSwap(
+                    crate::api::schema::PaneSwapParams {
+                        pane_id: None,
+                        direction: None,
+                        source_pane_id: Some(source_public),
+                        target_pane_id: Some(target_public),
+                    },
+                ));
+            }
+            leave_modal(state);
+        }
+        (kind, item) => {
+            tracing::debug!(?kind, ?item, "context menu item unsupported in the pure client");
+            leave_modal(state);
+        }
+    }
+    methods
+}
+
+/// Locally focuses a (workspace, tab) position so a modal opened right after
+/// prefills against the clicked target, and returns the focus methods that
+/// make the server converge on the same focus.
+fn pure_focus_tab(
+    state: &mut AppState,
+    ws_idx: usize,
+    tab_idx: usize,
+    ids: &PureModalIds<'_>,
+) -> Vec<crate::api::schema::Method> {
+    let mut methods = Vec::new();
+    if let Some(workspace) = state.workspaces.get_mut(ws_idx) {
+        methods.push(crate::api::schema::Method::WorkspaceFocus(
+            crate::api::schema::WorkspaceTarget {
+                workspace_id: workspace.id.clone(),
+            },
+        ));
+        workspace.switch_tab(tab_idx);
+        state.active = Some(ws_idx);
+        state.selected = ws_idx;
+        if let Some(tab_id) = (ids.tab_public)(ws_idx, tab_idx) {
+            methods.push(crate::api::schema::Method::TabFocus(
+                crate::api::schema::TabTarget { tab_id },
+            ));
+        }
+    }
+    methods
+}
+
 #[cfg(test)]
 mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};

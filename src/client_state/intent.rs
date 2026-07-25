@@ -11,8 +11,9 @@
 use crossterm::event::MouseEvent;
 
 use crate::api::schema::{
-    Method, PaneDirection, PaneFocusDirectionParams, PaneSplitParams, PaneTarget, PaneZoomParams,
-    SplitDirection, TabCreateParams, TabTarget, WorkspaceCreateParams, WorkspaceTarget,
+    LayoutSetSplitRatioParams, Method, PaneDirection, PaneFocusDirectionParams, PaneSplitParams,
+    PaneTarget, PaneZoomParams, SplitDirection, TabCreateParams, TabMoveParams, TabTarget,
+    WorkspaceCreateParams, WorkspaceMoveParams, WorkspaceTarget,
 };
 use crate::app::AppState;
 use crate::input::TerminalKey;
@@ -198,21 +199,113 @@ pub(super) fn dispatch_mouse_intent(
     let mode_before = app.mode;
     let mut empty_runtimes = crate::terminal::TerminalRuntimeRegistry::new();
     let action = app.handle_mouse(&mut empty_runtimes, mouse);
-    // handle_mouse can open modal surfaces (context menus, confirm-close,
-    // rename) whose actions are not interpreted under the flag yet. Leaving
-    // the app parked in such a mode would trap the user in a dead modal, so
-    // revert to the pre-click mode and drop the modal state.
+    // handle_mouse can open modal surfaces. Context menus, confirm-close,
+    // and rename dialogs are interpreted client-side below; anything else
+    // (settings, worktree dialogs) stays unsupported under the flag, so
+    // revert to the pre-click mode instead of trapping the user in a dead
+    // modal.
     if !matches!(
         app.mode,
-        crate::app::Mode::Terminal | crate::app::Mode::Navigate | crate::app::Mode::Prefix
+        crate::app::Mode::Terminal
+            | crate::app::Mode::Navigate
+            | crate::app::Mode::Prefix
+            | crate::app::Mode::Copy
+            | crate::app::Mode::ContextMenu
+            | crate::app::Mode::ConfirmClose
+            | crate::app::Mode::RenameWorkspace
+            | crate::app::Mode::RenameTab
+            | crate::app::Mode::RenamePane
     ) {
         app.mode = mode_before;
         app.context_menu = None;
     }
-    let Some(method) = mouse_intent_method(action, mirrors, ids, app) else {
+    let Some(action) = action else {
+        return;
+    };
+    if matches!(
+        action,
+        crate::app::MouseAction::RenameModal(_)
+            | crate::app::MouseAction::ConfirmCloseAccept
+            | crate::app::MouseAction::ContextMenu { .. }
+    ) {
+        let methods = interpret_modal_mouse(action, mirrors, ids, app);
+        for method in methods {
+            super::run::send_api_request(link, method);
+        }
+        return;
+    }
+    let Some(method) = mouse_intent_method(Some(action), mirrors, ids, app) else {
         return;
     };
     super::run::send_api_request(link, method);
+}
+
+/// Interprets a modal mouse action (rename dialog buttons, confirm-close,
+/// context menu items) into control-plane methods through the shared
+/// pure-client modal state machines.
+fn interpret_modal_mouse(
+    action: crate::app::MouseAction,
+    mirrors: &RemoteMirrors,
+    ids: &ComposeIds,
+    app: &mut AppState,
+) -> Vec<Method> {
+    let ws_ids: Vec<String> = app.workspaces.iter().map(|ws| ws.id.clone()).collect();
+    let catalog = &mirrors.local().catalog;
+    let pane_public =
+        |pane_id: crate::layout::PaneId| ids.public_pane_id(pane_id).map(str::to_owned);
+    let tab_public = |ws_idx: usize, tab_idx: usize| {
+        composed_tab_public_id(catalog, ws_ids.get(ws_idx)?, tab_idx)
+    };
+    let modal_ids = crate::app::PureModalIds {
+        pane_public: &pane_public,
+        tab_public: &tab_public,
+    };
+    crate::app::pure_client_modal_mouse(app, action, &modal_ids)
+}
+
+/// Interprets a key in a pure-client modal mode (rename dialogs,
+/// confirm-close, context menu) into control-plane methods.
+pub(super) fn dispatch_modal_key(
+    key: crate::input::TerminalKey,
+    link: &mut SessionLink,
+    mirrors: &mut RemoteMirrors,
+    ids: &mut ComposeIds,
+    app: &mut AppState,
+) {
+    let methods = {
+        let ws_ids: Vec<String> = app.workspaces.iter().map(|ws| ws.id.clone()).collect();
+        let catalog = &mirrors.local().catalog;
+        let pane_public =
+            |pane_id: crate::layout::PaneId| ids.public_pane_id(pane_id).map(str::to_owned);
+        let tab_public = |ws_idx: usize, tab_idx: usize| {
+            composed_tab_public_id(catalog, ws_ids.get(ws_idx)?, tab_idx)
+        };
+        let modal_ids = crate::app::PureModalIds {
+            pane_public: &pane_public,
+            tab_public: &tab_public,
+        };
+        crate::app::pure_client_modal_key(app, key.as_key_event(), &modal_ids)
+    };
+    for method in methods {
+        super::run::send_api_request(link, method);
+    }
+}
+
+/// Public tab id at a composed tab-bar position. The composed tab bar skips
+/// tabs with no panes (compose_into), so positions resolve against the same
+/// filtered view of the catalog.
+fn composed_tab_public_id(
+    catalog: &super::SessionCatalog,
+    workspace_id: &str,
+    tab_idx: usize,
+) -> Option<String> {
+    catalog
+        .tabs
+        .iter()
+        .filter(|tab| tab.workspace_id == workspace_id)
+        .filter(|tab| catalog.panes.iter().any(|pane| pane.tab_id == tab.tab_id))
+        .nth(tab_idx)
+        .map(|tab| tab.tab_id.clone())
 }
 
 /// The JSON API method a resolved chrome mouse action maps to, if any.
@@ -240,16 +333,7 @@ pub(super) fn mouse_intent_method(
         }
         crate::app::MouseAction::FocusTab { tab_idx } => {
             let workspace = app.active.and_then(|idx| app.workspaces.get(idx))?;
-            // The composed tab bar skips tabs with no panes (compose_into),
-            // so the hit-tested index must be resolved against the same
-            // filtered view of the catalog.
-            let tab_id = catalog
-                .tabs
-                .iter()
-                .filter(|tab| tab.workspace_id == workspace.id)
-                .filter(|tab| catalog.panes.iter().any(|pane| pane.tab_id == tab.tab_id))
-                .nth(tab_idx)
-                .map(|tab| tab.tab_id.clone())?;
+            let tab_id = composed_tab_public_id(catalog, &workspace.id, tab_idx)?;
             Some(Method::TabFocus(TabTarget { tab_id }))
         }
         crate::app::MouseAction::FocusPane { pane_id, .. } => {
@@ -258,8 +342,41 @@ pub(super) fn mouse_intent_method(
                 pane_id: public.to_owned(),
             }))
         }
-        // Everything else (drag reordering, split-ratio drags, modals,
-        // context menus, settings) stays unsupported under the flag for now.
+        crate::app::MouseAction::MoveWorkspace {
+            source_ws_idx,
+            insert_idx,
+        } => {
+            let workspace = app.workspaces.get(source_ws_idx)?;
+            Some(Method::WorkspaceMove(WorkspaceMoveParams {
+                workspace_id: workspace.id.clone(),
+                insert_index: insert_idx,
+            }))
+        }
+        crate::app::MouseAction::MoveTab {
+            ws_idx,
+            source_tab_idx,
+            insert_idx,
+        } => {
+            let workspace = app.workspaces.get(ws_idx)?;
+            let tab_id = composed_tab_public_id(catalog, &workspace.id, source_tab_idx)?;
+            Some(Method::TabMove(TabMoveParams {
+                tab_id,
+                insert_index: insert_idx,
+            }))
+        }
+        crate::app::MouseAction::SetSplitRatio { path, ratio } => {
+            // The server resolves the focused tab; the composed layout
+            // follows on the next layout.updated event.
+            Some(Method::LayoutSetSplitRatio(LayoutSetSplitRatioParams {
+                tab_id: None,
+                pane_id: None,
+                path,
+                ratio,
+            }))
+        }
+        // Settings, toast targets, and modal actions are handled elsewhere
+        // (modal actions in interpret_modal_mouse; settings stays
+        // unsupported under the flag).
         _ => None,
     }
 }
@@ -380,7 +497,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn right_click_does_not_trap_the_client_in_a_dead_context_menu() {
+    async fn right_click_opens_a_live_context_menu_that_esc_closes() {
         let (mut mirrors, mut ids, mut app) = composed();
         app.mode = crate::app::Mode::Terminal;
         crate::ui::compute_view(&mut app, ratatui::layout::Rect::new(0, 0, 106, 20));
@@ -395,12 +512,162 @@ mod tests {
         };
         dispatch_mouse_intent(mouse, &mut link, &mut mirrors, &mut ids, &mut app);
 
-        assert_eq!(
-            app.mode,
-            crate::app::Mode::Terminal,
-            "unsupported modal modes must not survive the dispatch"
+        // Context menus are interpreted client-side now: the menu opens and
+        // stays; Esc closes it back to a base mode.
+        assert_eq!(app.mode, crate::app::Mode::ContextMenu);
+        assert!(app.context_menu.is_some(), "context menu opened");
+        dispatch_modal_key(
+            crate::input::TerminalKey::new(KeyCode::Esc, KeyModifiers::empty()),
+            &mut link,
+            &mut mirrors,
+            &mut ids,
+            &mut app,
         );
-        assert!(app.context_menu.is_none(), "no dead context menu remains");
+        assert!(app.context_menu.is_none(), "esc closes the menu");
+        assert_eq!(app.mode, crate::app::Mode::Terminal);
+    }
+
+    #[test]
+    fn drag_actions_map_to_move_and_split_ratio_methods() {
+        let (mirrors, ids, app) = composed();
+
+        let method = mouse_intent_method(
+            Some(MouseAction::MoveWorkspace {
+                source_ws_idx: 1,
+                insert_idx: 0,
+            }),
+            &mirrors,
+            &ids,
+            &app,
+        )
+        .expect("workspace move intent");
+        let Method::WorkspaceMove(params) = method else {
+            panic!("expected workspace.move, got {method:?}");
+        };
+        assert_eq!(params.workspace_id, "ws_10");
+        assert_eq!(params.insert_index, 0);
+
+        let method = mouse_intent_method(
+            Some(MouseAction::MoveTab {
+                ws_idx: 0,
+                source_tab_idx: 0,
+                insert_idx: 1,
+            }),
+            &mirrors,
+            &ids,
+            &app,
+        )
+        .expect("tab move intent");
+        let Method::TabMove(params) = method else {
+            panic!("expected tab.move, got {method:?}");
+        };
+        assert_eq!(params.tab_id, "t_2_1");
+
+        let method = mouse_intent_method(
+            Some(MouseAction::SetSplitRatio {
+                path: vec![false],
+                ratio: 0.25,
+            }),
+            &mirrors,
+            &ids,
+            &app,
+        )
+        .expect("split ratio intent");
+        let Method::LayoutSetSplitRatio(params) = method else {
+            panic!("expected layout.set_split_ratio, got {method:?}");
+        };
+        assert_eq!(params.path, vec![false]);
+        assert!((params.ratio - 0.25).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn rename_and_confirm_close_modals_interpret_into_methods() {
+        let (mut mirrors, mut ids, mut app) = composed();
+        let mut link = super::super::run::SessionLink::Incompatible;
+
+        // Rename workspace: type into the modal, Enter emits the rename.
+        app.mode = crate::app::Mode::RenameWorkspace;
+        app.selected = 0;
+        app.name_input = "renamed".to_owned();
+        app.name_input_replace_on_type = false;
+        let methods = {
+            let ws_ids: Vec<String> = app.workspaces.iter().map(|ws| ws.id.clone()).collect();
+            let catalog = &mirrors.local().catalog;
+            let pane_public = |pane_id: crate::layout::PaneId| {
+                ids.public_pane_id(pane_id).map(str::to_owned)
+            };
+            let tab_public = |ws_idx: usize, tab_idx: usize| {
+                composed_tab_public_id(catalog, ws_ids.get(ws_idx)?, tab_idx)
+            };
+            let modal_ids = crate::app::PureModalIds {
+                pane_public: &pane_public,
+                tab_public: &tab_public,
+            };
+            crate::app::pure_client_modal_key(
+                &mut app,
+                crossterm::event::KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+                &modal_ids,
+            )
+        };
+        assert_eq!(methods.len(), 1);
+        let Method::WorkspaceRename(params) = &methods[0] else {
+            panic!("expected workspace.rename, got {methods:?}");
+        };
+        assert_eq!(params.workspace_id, "ws_2");
+        assert_eq!(params.label, "renamed");
+        assert_ne!(app.mode, crate::app::Mode::RenameWorkspace);
+
+        // Confirm-close accept closes the selected workspace.
+        app.mode = crate::app::Mode::ConfirmClose;
+        app.selected = 1;
+        dispatch_modal_key(
+            crate::input::TerminalKey::new(KeyCode::Enter, KeyModifiers::empty()),
+            &mut link,
+            &mut mirrors,
+            &mut ids,
+            &mut app,
+        );
+        assert_ne!(app.mode, crate::app::Mode::ConfirmClose);
+    }
+
+    #[test]
+    fn context_menu_pane_items_interpret_into_methods() {
+        let (mirrors, ids, mut app) = composed();
+        let pane_id = app.workspaces[0]
+            .focused_pane_id()
+            .expect("composed focused pane");
+        let menu = crate::app::state::ContextMenuState {
+            kind: crate::app::state::ContextMenuKind::Pane {
+                ws_idx: 0,
+                tab_idx: 0,
+                pane_id,
+                source_pane_id: None,
+                has_manual_label: true,
+            },
+            x: 0,
+            y: 0,
+            list: crate::app::state::MenuListState::new(0),
+        };
+        let clear_idx = menu
+            .items()
+            .iter()
+            .position(|item| *item == "Clear pane name")
+            .expect("clear item");
+        let methods = interpret_modal_mouse(
+            crate::app::MouseAction::ContextMenu {
+                menu,
+                idx: clear_idx,
+            },
+            &mirrors,
+            &ids,
+            &mut app,
+        );
+        assert_eq!(methods.len(), 1);
+        let Method::PaneRename(params) = &methods[0] else {
+            panic!("expected pane.rename, got {methods:?}");
+        };
+        assert_eq!(params.pane_id, "p_2_1");
+        assert_eq!(params.label, None);
     }
 
     #[test]

@@ -47,6 +47,9 @@ mod settings;
 mod sidebar;
 mod terminal;
 
+pub(crate) use self::modal::{
+    pure_client_modal_key, pure_client_modal_mouse, PureModalIds,
+};
 pub(crate) use self::mouse::MouseAction;
 pub(crate) use self::{
     modal::{

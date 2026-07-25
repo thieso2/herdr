@@ -1053,6 +1053,13 @@ fn handle_raw_input(
     match raw {
         crate::raw_input::RawInputEvent::Key(key) => handle_key(key, link, mirrors, ids, app),
         crate::raw_input::RawInputEvent::Paste(text) => {
+            if matches!(
+                app.mode,
+                Mode::RenameWorkspace | Mode::RenameTab | Mode::RenamePane
+            ) {
+                crate::app::insert_rename_input_text(app, &text);
+                return;
+            }
             if app.mode == Mode::Terminal {
                 if try_paste_image(&text, link, mirrors, ids, app) {
                     return;
@@ -1153,6 +1160,13 @@ fn handle_key(
             {
                 request_backfill_if_needed(link, stream_id, mirrors);
             }
+        }
+        Mode::RenameWorkspace
+        | Mode::RenameTab
+        | Mode::RenamePane
+        | Mode::ConfirmClose
+        | Mode::ContextMenu => {
+            super::intent::dispatch_modal_key(key, link, mirrors, ids, app);
         }
         _ => {
             // Residual modal modes are unsupported under the flag; Esc or q
@@ -1505,6 +1519,8 @@ mod tests {
         let mut ids = ComposeIds::new();
         let mut app = AppState::test_new();
 
+        // Context menus are interpreted client-side now: q does nothing and
+        // never quits; Esc closes the menu back to a base mode.
         app.mode = Mode::ContextMenu;
         handle_key(
             key(KeyCode::Char('q')),
@@ -1513,13 +1529,32 @@ mod tests {
             &mut ids,
             &mut app,
         );
-        assert!(
-            !app.should_quit,
-            "q inside a dead modal must not quit the client"
+        assert!(!app.should_quit, "q inside a modal must not quit");
+        assert_eq!(app.mode, Mode::ContextMenu);
+        handle_key(
+            key(KeyCode::Esc),
+            &mut link,
+            &mut mirrors,
+            &mut ids,
+            &mut app,
         );
+        assert!(!app.should_quit);
         assert_eq!(app.mode, Mode::Navigate);
 
+        // Confirm-close cancels on Esc.
         app.mode = Mode::ConfirmClose;
+        handle_key(
+            key(KeyCode::Esc),
+            &mut link,
+            &mut mirrors,
+            &mut ids,
+            &mut app,
+        );
+        assert!(!app.should_quit);
+        assert_eq!(app.mode, Mode::Navigate);
+
+        // Still-unsupported modal modes fold back to Navigate on Esc/q.
+        app.mode = Mode::Settings;
         handle_key(
             key(KeyCode::Esc),
             &mut link,

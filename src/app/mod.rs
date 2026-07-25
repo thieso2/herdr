@@ -18,6 +18,7 @@ mod input;
 // Re-exported for the unix-only pure-client intent interpreter (#20).
 #[cfg(unix)]
 pub(crate) use input::MouseAction;
+pub(crate) use input::{insert_rename_input_text, pure_client_modal_key, pure_client_modal_mouse, PureModalIds};
 mod popup;
 mod runtime;
 mod runtime_mutations;

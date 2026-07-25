@@ -99,6 +99,11 @@ pub struct PaneReplica {
     /// screen and drain into the terminal on the next rebuild.
     pages: VecDeque<String>,
     pages_bytes: usize,
+    /// True when the newest queued page (the deque back, which abuts the
+    /// already-baked content on rebuild) ends on a mid-line cut: a younger
+    /// page's hard-capped start cut a logical line there, so the rebuild
+    /// must join it to the local dump without fabricating a line break.
+    newest_page_cut_mid_line: bool,
     /// Cursor for the next older page; `None` once the top was reached or
     /// paging stopped.
     next_cursor: Option<String>,
@@ -125,10 +130,13 @@ pub struct PaneReplica {
     written_state: VtScanState,
     /// Terminal row total right after the last bake (open/rebuild/resize).
     baked_total_rows: usize,
-    /// Text of absolute row 0 at the last bake, recorded only while row 0
-    /// sits in (immutable) scrollback; `None` while the top row is still on
-    /// the active screen and can be legitimately rewritten.
-    history_anchor: Option<String>,
+    /// Anchored row count and text of the topmost scrollback rows (up to
+    /// [`HISTORY_ANCHOR_ROWS`]) at the last bake, recorded only while those
+    /// rows sit in (immutable) scrollback; `None` while the top row is still
+    /// on the active screen and can be legitimately rewritten. Several rows
+    /// are anchored instead of one so identical repetitive top rows are far
+    /// less likely to collide after an eviction.
+    history_anchor: Option<(usize, String)>,
 }
 
 impl PaneReplica {
@@ -155,6 +163,7 @@ impl PaneReplica {
             scrollback_limit_bytes,
             pages: VecDeque::new(),
             pages_bytes: 0,
+            newest_page_cut_mid_line: false,
             next_cursor: history_cursor.filter(|cursor| !cursor.is_empty()),
             at_history_top: false,
             budget_exhausted: false,
@@ -338,6 +347,12 @@ impl PaneReplica {
             self.budget_exhausted = true;
         }
         self.pages_bytes = self.pages_bytes.saturating_add(page.content.len());
+        if self.pages.is_empty() {
+            // This page becomes the deque back: the one whose end abuts the
+            // already-baked content on the next rebuild. Later pushes only
+            // prepend older pages, which stay byte-contiguous in the deque.
+            self.newest_page_cut_mid_line = page.end_cut_mid_line;
+        }
         self.pages.push_front(page.content);
         self.enforce_page_budget();
         if self
@@ -437,12 +452,19 @@ impl PaneReplica {
             self.stop_backfill();
             self.pages.clear();
             self.pages_bytes = 0;
+            self.newest_page_cut_mid_line = false;
             self.rebase_history_anchor()?;
             return Ok(0);
         }
         // Every newline in the queued pages must contribute at least one new
         // row to the rebuilt terminal; fewer means the fresh terminal
-        // front-evicted while baking.
+        // front-evicted while baking. This is a lower bound: soft-wrapped
+        // logical lines render to more rows than their newline count, so a
+        // small bake-time eviction can hide behind the soft-wrap surplus.
+        // Computing the exact rendered row count would require re-rendering
+        // the pages at the current width; the residual failure mode is
+        // bounded (a visual gap in the oldest history), so the lower bound
+        // is kept.
         let page_line_rows: usize = self
             .pages
             .iter()
@@ -459,11 +481,15 @@ impl PaneReplica {
             ends_with_newline = page.ends_with('\n');
         }
         if !seed.history.is_empty() {
-            if !ends_with_newline {
-                // Server page boundaries are newline-aligned, but the newest
-                // page ends mid-line (the last history row has no trailing
-                // newline); keep it from merging with the local dump's first
-                // row.
+            if !ends_with_newline && !self.newest_page_cut_mid_line {
+                // The newest page ends at a genuine row boundary whose row
+                // carries no trailing newline (the bottom of the server
+                // capture); keep it from merging with the local dump's first
+                // row. When the server flagged the page end as a hard-capped
+                // mid-line cut instead, the local dump's first row continues
+                // the same logical line, so the page joins it directly and a
+                // fabricated break would split the line at every page
+                // boundary.
                 fresh.write(b"\r\n");
             }
             fresh.write(seed.history.as_bytes());
@@ -482,6 +508,7 @@ impl PaneReplica {
         self.terminal = fresh;
         self.pages.clear();
         self.pages_bytes = 0;
+        self.newest_page_cut_mid_line = false;
         self.set_scroll_offset_from_bottom(offset_from_bottom);
         if new_total < old_total.saturating_add(page_line_rows) {
             // The fresh terminal evicted its oldest rows while the pages and
@@ -510,8 +537,14 @@ impl PaneReplica {
 
     /// True when scrollback rows above the last-baked content are gone
     /// (ghostty eviction or an ED 3 erase), observed as a shrunken row total
-    /// or a changed top row. Row 0 is immutable while it sits in scrollback,
-    /// so a text change there means the original row was dropped.
+    /// or changed anchor rows. Scrollback rows are immutable while they sit
+    /// above the active screen, so a text change in the anchored top rows
+    /// means the original rows were dropped and different content slid up
+    /// into their place. Detection stays probabilistic in one pathological
+    /// shape: content whose every row is identical can slide up by a whole
+    /// number of rows and still match the anchor while a tail flood keeps
+    /// the row total above the floor. The bounded failure mode is a visual
+    /// gap in the oldest history.
     fn top_rows_lost_since_bake(
         &self,
         scrollbar: &TerminalScrollbar,
@@ -520,25 +553,29 @@ impl PaneReplica {
             return Ok(true);
         }
         match &self.history_anchor {
-            Some(anchor) => Ok(self.top_row_text()? != *anchor),
+            Some((rows, anchor)) => Ok(self.top_rows_text(*rows)? != *anchor),
             None => Ok(false),
         }
     }
 
-    fn top_row_text(&self) -> Result<String, GhosttyError> {
+    fn top_rows_text(&self, rows: usize) -> Result<String, GhosttyError> {
+        let last_row = u32::try_from(rows.saturating_sub(1)).unwrap_or(0);
         self.terminal
-            .read_text_screen((0, 0), (self.cols.saturating_sub(1), 0), false)
+            .read_text_screen((0, 0), (self.cols.saturating_sub(1), last_row), false)
     }
 
     /// Re-anchors eviction detection on the terminal's current content:
-    /// records the row total and, once row 0 has scrolled into (immutable)
-    /// scrollback, its text. Runs after open, every rebuild, and every
-    /// resize, because baking and reflow legitimately change both.
+    /// records the row total and, once rows have scrolled into (immutable)
+    /// scrollback, the text of the topmost few. Runs after open, every
+    /// rebuild, and every resize, because baking and reflow legitimately
+    /// change both.
     fn rebase_history_anchor(&mut self) -> Result<(), GhosttyError> {
         let scrollbar = self.terminal.scrollbar()?;
         self.baked_total_rows = scrollbar.total;
-        self.history_anchor = if scrollbar.total > scrollbar.len {
-            Some(self.top_row_text()?)
+        let scrollback_rows = scrollbar.total.saturating_sub(scrollbar.len);
+        self.history_anchor = if scrollback_rows > 0 {
+            let rows = scrollback_rows.min(HISTORY_ANCHOR_ROWS);
+            Some((rows, self.top_rows_text(rows)?))
         } else {
             None
         };
@@ -557,6 +594,11 @@ impl PaneReplica {
 /// (huge OSC/APC payload) cannot buffer without bound; past the cap the bytes
 /// are written through and rebuilds are deferred instead.
 const HELD_TAIL_MAX_BYTES: usize = 64 * 1024;
+
+/// Number of topmost scrollback rows recorded for eviction detection. One
+/// row is enough for correctness on distinct content; several rows keep
+/// identical repetitive top rows from colliding after an eviction.
+const HISTORY_ANCHOR_ROWS: usize = 8;
 
 /// Streaming scanner state tracking whether a VT byte stream currently rests
 /// between complete escape sequences and UTF-8 codepoints ("ground"). Used to
@@ -677,8 +719,8 @@ fn keep_tail_newline_aligned(text: &str, max_bytes: usize) -> String {
 mod tests {
     use super::*;
     use crate::protocol::framed::{
-        decode_history_cursor, encode_history_cursor, history_page_start, HistoryCursor,
-        StreamHistoryParams,
+        decode_history_cursor, encode_history_cursor, history_page_end_cut_mid_line,
+        history_page_start, HistoryCursor, StreamHistoryParams,
     };
 
     /// Simulates the framed server's `stream.history` handler over an
@@ -733,6 +775,7 @@ mod tests {
                     "content": &self.capture[start..end],
                     "next_cursor": next_cursor,
                     "at_top": start == 0,
+                    "end_cut_mid_line": history_page_end_cut_mid_line(&self.capture, end),
                 },
             })
         }
@@ -948,6 +991,64 @@ mod tests {
         replica.resize(10, 5, 8, 16).unwrap();
         local.resize(10, 5, 8, 16).unwrap();
         assert_eq!(screen_text(replica.terminal()), screen_text(&local));
+    }
+
+    #[test]
+    fn mid_line_cut_pages_reassemble_split_logical_line_without_fabricated_breaks() {
+        use std::fmt::Write as _;
+
+        // One newline-free logical line far larger than the page budget, so
+        // several hard-capped mid-line cuts land inside it and every rebuild
+        // joins a cut page end onto already-baked content.
+        let mut long_line = String::new();
+        for segment in 0..3_000 {
+            write!(long_line, "seg{segment:06} ").unwrap();
+        }
+        assert!(long_line.len() >= 30_000);
+        assert!(!long_line.contains('\n'));
+        // Enough short lines after the long one that the active screen holds
+        // only whole lines: a logical line spanning the history/screen
+        // boundary is truncated there by the snapshot+history capture design
+        // itself, which is not what this test pins down.
+        let mut input = format!("head line\r\n{long_line}\r\n");
+        for tail_line in 0..8 {
+            write!(input, "tail {tail_line}\r\n").unwrap();
+        }
+        input.push_str("prompt> ");
+
+        let mut local = Terminal::new(40, 6, 100_000_000).unwrap();
+        local.write(input.as_bytes());
+
+        let mut streamed = Terminal::new(40, 6, 100_000_000).unwrap();
+        streamed.write(input.as_bytes());
+        let (server, seed, cursor) = TestHistoryServer::from_terminal(&streamed);
+        let mut replica = PaneReplica::open(
+            &seed.snapshot,
+            0,
+            Some(cursor),
+            seed.cols,
+            seed.rows,
+            100_000_000,
+        )
+        .unwrap();
+
+        // Page-budget pages: each rebuild bakes one page, so the next page's
+        // end is the previous page's hard-capped mid-line start.
+        backfill_all(&mut replica, &server, 4 * 1024);
+        assert!(replica.history_exhausted());
+
+        // The reassembled replica must match an unsplit reference terminal
+        // exactly: same row total and identical text, which pins the logical
+        // line count. A fabricated break per page boundary would split the
+        // long line into one logical line per page and add rows.
+        assert_eq!(
+            replica.terminal().total_rows().unwrap(),
+            local.total_rows().unwrap()
+        );
+        let replica_text = screen_text(replica.terminal());
+        let local_text = screen_text(&local);
+        assert_eq!(replica_text.lines().count(), local_text.lines().count());
+        assert_eq!(replica_text, local_text);
     }
 
     #[test]

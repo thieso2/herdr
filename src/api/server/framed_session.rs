@@ -34,17 +34,18 @@ use crate::pane::output_tap::{
     cancel_pending_stream, claim_pending_stream, register_pending_stream, PaneStreamAttachment,
 };
 use crate::protocol::framed::{
-    decode_frame_header, decode_history_cursor, encode_history_cursor, history_page_start,
-    negotiate_session_hello, write_frame, Frame, FrameType, FramedCodecError, HelloError,
-    HelloRemedy, HistoryCursor, NegotiatedSession, PanePasteImageControlParams,
-    PaneSendBytesControlParams, SessionHelloParams, StreamCloseParams, StreamHistoryParams,
-    StreamOpenParams, CAPABILITY_NOTIFICATION, CAPABILITY_PANE_STREAM, CAPABILITY_PASTE_IMAGE,
-    CAPABILITY_WINDOW_TITLE, CONTROL_STREAM_ID, FRAMED_PROTOCOL_MIN_SUPPORTED,
-    FRAMED_PROTOCOL_VERSION, FRAME_HEADER_BYTES, HISTORY_FETCH_MAX_BYTES,
-    HISTORY_PAGE_DEFAULT_BYTES, HISTORY_PAGE_MIN_BYTES, HISTORY_PAGE_SERVED_MAX_BYTES,
-    MAX_FRAME_PAYLOAD, NOTIFICATION_POSTED_EVENT, PANE_PASTE_IMAGE_METHOD, PANE_SEND_BYTES_METHOD,
-    PING_METHOD, SESSION_HELLO_METHOD, STREAM_CLOSED_EVENT, STREAM_CLOSE_METHOD,
-    STREAM_HISTORY_METHOD, STREAM_OPEN_METHOD, WINDOW_TITLE_CHANGED_EVENT,
+    decode_frame_header, decode_history_cursor, encode_history_cursor,
+    history_page_end_cut_mid_line, history_page_start, negotiate_session_hello, write_frame, Frame,
+    FrameType, FramedCodecError, HelloError, HelloRemedy, HistoryCursor, NegotiatedSession,
+    PanePasteImageControlParams, PaneSendBytesControlParams, SessionHelloParams, StreamCloseParams,
+    StreamHistoryParams, StreamOpenParams, CAPABILITY_NOTIFICATION, CAPABILITY_PANE_STREAM,
+    CAPABILITY_PASTE_IMAGE, CAPABILITY_WINDOW_TITLE, CONTROL_STREAM_ID,
+    FRAMED_PROTOCOL_MIN_SUPPORTED, FRAMED_PROTOCOL_VERSION, FRAME_HEADER_BYTES,
+    HISTORY_FETCH_MAX_BYTES, HISTORY_PAGE_DEFAULT_BYTES, HISTORY_PAGE_MIN_BYTES,
+    HISTORY_PAGE_SERVED_MAX_BYTES, MAX_FRAME_PAYLOAD, NOTIFICATION_POSTED_EVENT,
+    PANE_PASTE_IMAGE_METHOD, PANE_SEND_BYTES_METHOD, PING_METHOD, SESSION_HELLO_METHOD,
+    STREAM_CLOSED_EVENT, STREAM_CLOSE_METHOD, STREAM_HISTORY_METHOD, STREAM_OPEN_METHOD,
+    WINDOW_TITLE_CHANGED_EVENT,
 };
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -797,6 +798,10 @@ fn handle_stream_history(
             "content": &history.content[start..end],
             "next_cursor": next_cursor,
             "at_top": start == 0,
+            // A younger page's hard-capped start can cut a logical line at
+            // `end`; the client must then join this page to the content
+            // below it without fabricating a line break.
+            "end_cut_mid_line": history_page_end_cut_mid_line(&history.content, end),
         },
     });
     let payload = match serde_json::to_vec(&response) {
@@ -1710,6 +1715,7 @@ mod tests {
         // Page backward with a small budget; the pages must reassemble the
         // capture exactly: gap-free, duplicate-free, newline-aligned.
         let mut pages: Vec<String> = Vec::new();
+        let mut cuts: Vec<bool> = Vec::new();
         loop {
             send_control(
                 &mut client,
@@ -1723,6 +1729,7 @@ mod tests {
                 !page.content.contains("\x1b[?"),
                 "history pages must never re-assert modes"
             );
+            cuts.push(page.end_cut_mid_line);
             pages.push(page.content);
             match page.next_cursor {
                 Some(next) => {
@@ -1746,6 +1753,10 @@ mod tests {
                 "page boundary must be newline-aligned"
             );
         }
+        assert!(
+            cuts.iter().all(|cut| !cut),
+            "newline-aligned boundaries must never be flagged as mid-line cuts"
+        );
 
         // A jump-to-top sized fetch from the original cursor returns the
         // whole capture in one page.
@@ -1801,6 +1812,7 @@ mod tests {
             .to_owned();
 
         let mut pages: Vec<String> = Vec::new();
+        let mut cuts: Vec<bool> = Vec::new();
         loop {
             send_control(
                 &mut client,
@@ -1814,6 +1826,7 @@ mod tests {
                 "newline-free page must stay hard-capped, got {}",
                 page.content.len()
             );
+            cuts.push(page.end_cut_mid_line);
             pages.push(page.content);
             match page.next_cursor {
                 Some(next) => cursor = next,
@@ -1826,6 +1839,13 @@ mod tests {
         assert!(pages.len() > 2, "budget must split the capture");
         let rejoined: String = pages.iter().rev().map(String::as_str).collect();
         assert_eq!(rejoined, history);
+        // The first page ends at the capture end (not a cut); every later
+        // page ends where a hard-capped start cut the logical line.
+        assert!(!cuts[0], "the capture end is never a mid-line cut");
+        assert!(
+            cuts[1..].iter().all(|cut| *cut),
+            "hard-capped newline-free boundaries must be flagged as cuts"
+        );
 
         // The session survives the whole walk.
         send_control(

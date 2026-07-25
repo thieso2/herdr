@@ -503,6 +503,17 @@ pub fn history_page_start(history: &str, end: usize, max_bytes: usize) -> usize 
     candidate
 }
 
+/// True when the history page ending at byte `end` of the capture was cut
+/// mid-line: the byte before the boundary is not a newline and younger
+/// capture content continues the same logical line at `end`. This happens
+/// when the younger page's [`history_page_start`] hit the hard byte cap
+/// without a newline inside the budget. Clients must join such a page to the
+/// content below it without fabricating a line break. The capture end itself
+/// is never mid-line -- the last history row simply has no trailing newline.
+pub fn history_page_end_cut_mid_line(history: &str, end: usize) -> bool {
+    end > 0 && end < history.len() && history.as_bytes()[end - 1] != b'\n'
+}
+
 /// Negotiates a `session.hello` against this server's version window and
 /// capability flags.
 pub fn negotiate_session_hello(
@@ -627,6 +638,10 @@ pub struct StreamHistoryPage {
     pub next_cursor: Option<String>,
     /// True when this page reaches the oldest retained history.
     pub at_top: bool,
+    /// True when the page's end is a mid-line cut: the younger content
+    /// already at the client continues the same logical line, so the page
+    /// must be joined to it without inserting a line break.
+    pub end_cut_mid_line: bool,
 }
 
 /// Parses a `stream.history` control response.
@@ -657,11 +672,16 @@ pub fn parse_stream_history(response: &serde_json::Value) -> Result<StreamHistor
         .get("at_top")
         .and_then(|value| value.as_bool())
         .unwrap_or(next_cursor.is_none());
+    let end_cut_mid_line = result
+        .get("end_cut_mid_line")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
     Ok(StreamHistoryPage {
         stream_id: stream_id as u32,
         content,
         next_cursor,
         at_top,
+        end_cut_mid_line,
     })
 }
 
@@ -1050,6 +1070,23 @@ mod tests {
     }
 
     #[test]
+    fn history_page_end_cut_mid_line_contract() {
+        let history = "aaa\nbbb\nccc";
+        // The capture end is never a mid-line cut: the last row simply has
+        // no trailing newline.
+        assert!(!history_page_end_cut_mid_line(history, history.len()));
+        // A newline-aligned interior boundary is not a cut.
+        assert!(!history_page_end_cut_mid_line(history, 4));
+        assert!(!history_page_end_cut_mid_line(history, 8));
+        // An interior boundary inside a line is a cut.
+        assert!(history_page_end_cut_mid_line(history, 2));
+        assert!(history_page_end_cut_mid_line(history, 9));
+        // Degenerate boundaries are not cuts.
+        assert!(!history_page_end_cut_mid_line(history, 0));
+        assert!(!history_page_end_cut_mid_line("", 0));
+    }
+
+    #[test]
     fn served_page_cap_bounds_worst_case_encoded_response() {
         // ESC escapes to a six-byte `\u001b` in JSON, the worst-case string
         // expansion. A full served page of ESC bytes plus a maximal cursor
@@ -1310,8 +1347,24 @@ mod tests {
                 content: "line\r\n".to_owned(),
                 next_cursor: Some("older".to_owned()),
                 at_top: false,
+                // Absent on the wire decodes as a newline-aligned boundary.
+                end_cut_mid_line: false,
             }
         );
+
+        let cut = parse_stream_history(&serde_json::json!({
+            "id": "r1b",
+            "result": {
+                "type": "stream_history",
+                "stream_id": 9,
+                "content": "partial line tail",
+                "next_cursor": "older",
+                "at_top": false,
+                "end_cut_mid_line": true,
+            },
+        }))
+        .unwrap();
+        assert!(cut.end_cut_mid_line);
 
         let top = parse_stream_history(&serde_json::json!({
             "id": "r2",

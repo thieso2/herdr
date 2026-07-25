@@ -284,6 +284,126 @@ fn event_by_kind<'a>(events: &'a [serde_json::Value], kind: &str) -> &'a serde_j
         .unwrap_or_else(|| panic!("missing event {kind}"))
 }
 
+// Hand-encoded framed-protocol helpers. These deliberately do not share code
+// with the server: they pin the frame wire layout (10-byte little-endian
+// header: len u32 / type u8 / reserved u8 / stream_id u32) from the outside.
+
+fn write_framed_control(stream: &mut UnixStream, value: &serde_json::Value) {
+    let payload = serde_json::to_vec(value).unwrap();
+    let mut header = Vec::with_capacity(10);
+    header.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    header.push(0); // CONTROL
+    header.push(0); // reserved
+    header.extend_from_slice(&0u32.to_le_bytes()); // control stream id
+    stream.write_all(&header).unwrap();
+    stream.write_all(&payload).unwrap();
+    stream.flush().unwrap();
+}
+
+fn read_framed_control(stream: &mut UnixStream) -> serde_json::Value {
+    let mut header = [0u8; 10];
+    stream.read_exact(&mut header).unwrap();
+    let len = u32::from_le_bytes([header[0], header[1], header[2], header[3]]) as usize;
+    assert_eq!(header[4], 0, "expected a control frame");
+    let stream_id = u32::from_le_bytes([header[6], header[7], header[8], header[9]]);
+    assert_eq!(stream_id, 0, "control frames use stream id 0");
+    let mut payload = vec![0u8; len];
+    stream.read_exact(&mut payload).unwrap();
+    serde_json::from_slice(&payload).unwrap()
+}
+
+#[test]
+fn framed_session_and_ndjson_coexist_on_api_socket() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let socket_path = runtime_dir.join("herdr.sock");
+
+    let child = spawn_herdr(&config_home, &runtime_dir, &socket_path);
+    wait_for_socket(&socket_path, Duration::from_secs(5));
+
+    // A framed client negotiates session.hello and heartbeats over ping.
+    let mut framed = UnixStream::connect(&socket_path).unwrap();
+    framed
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    framed.write_all(b"HRDR").unwrap();
+    write_framed_control(
+        &mut framed,
+        &serde_json::json!({
+            "id": "hello_1",
+            "method": "session.hello",
+            "params": {"protocol": 1, "min_protocol": 1, "capabilities": ["pane-stream"]},
+        }),
+    );
+    let welcome = read_framed_control(&mut framed);
+    assert_eq!(welcome["id"], "hello_1");
+    assert_eq!(welcome["result"]["type"], "session.welcome");
+    assert_eq!(welcome["result"]["protocol"], 1);
+    assert_eq!(
+        welcome["result"]["server_version"],
+        env!("CARGO_PKG_VERSION")
+    );
+
+    write_framed_control(
+        &mut framed,
+        &serde_json::json!({"id": "beat_1", "method": "ping", "params": {}}),
+    );
+    let pong = read_framed_control(&mut framed);
+    assert_eq!(pong["id"], "beat_1");
+    assert_eq!(pong["result"]["type"], "pong");
+    assert_eq!(pong["result"]["protocol"], 1);
+
+    // An out-of-window hello is rejected with an exact-remedy payload and the
+    // connection closes.
+    let mut skewed = UnixStream::connect(&socket_path).unwrap();
+    skewed
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    skewed.write_all(b"HRDR").unwrap();
+    write_framed_control(
+        &mut skewed,
+        &serde_json::json!({
+            "id": "hello_2",
+            "method": "session.hello",
+            "params": {"protocol": 99, "min_protocol": 99},
+        }),
+    );
+    let rejection = read_framed_control(&mut skewed);
+    assert_eq!(rejection["error"]["code"], "protocol_out_of_window");
+    assert_eq!(rejection["error"]["data"]["remedy"], "upgrade_server");
+    assert!(rejection["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("upgrade this herdr server"));
+    let mut rest = Vec::new();
+    assert_eq!(
+        skewed.read_to_end(&mut rest).unwrap(),
+        0,
+        "server must close the connection after rejecting the hello"
+    );
+
+    // A legacy NDJSON client on the same socket is unaffected, while the
+    // framed session above is still open.
+    let value = send_request(
+        &socket_path,
+        r#"{"id":"legacy_1","method":"ping","params":{}}"#,
+    );
+    assert_eq!(value["id"], "legacy_1");
+    assert_eq!(value["result"]["type"], "pong");
+    assert_eq!(value["result"]["protocol"], 18);
+
+    // The framed session still heartbeats after the other connections.
+    write_framed_control(
+        &mut framed,
+        &serde_json::json!({"id": "beat_2", "method": "ping", "params": {}}),
+    );
+    assert_eq!(read_framed_control(&mut framed)["id"], "beat_2");
+
+    cleanup_spawned_herdr(child, base);
+}
+
 #[test]
 fn ping_over_socket_returns_version() {
     let _lock = test_lock();

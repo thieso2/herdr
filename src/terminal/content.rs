@@ -83,6 +83,14 @@ pub(crate) trait PaneContent {
 
     /// Extracts the selected text from the pane's screen rows.
     fn extract_selection(&self, selection: &crate::selection::Selection) -> Option<String>;
+
+    /// Visible kitty image placements, fetching pixel data only for images
+    /// `needs_data` accepts. Dyn-compatible flavor of the runtime's generic
+    /// method so host graphics painting works through the seam.
+    fn kitty_image_placements_with_data_filter(
+        &self,
+        needs_data: &mut dyn FnMut(crate::ghostty::KittyImageDescriptor) -> bool,
+    ) -> Vec<crate::ghostty::KittyImagePlacement>;
 }
 
 impl PaneContent for TerminalRuntime {
@@ -156,6 +164,15 @@ impl PaneContent for TerminalRuntime {
 
     fn extract_selection(&self, selection: &crate::selection::Selection) -> Option<String> {
         TerminalRuntime::extract_selection(self, selection)
+    }
+
+    fn kitty_image_placements_with_data_filter(
+        &self,
+        needs_data: &mut dyn FnMut(crate::ghostty::KittyImageDescriptor) -> bool,
+    ) -> Vec<crate::ghostty::KittyImagePlacement> {
+        TerminalRuntime::kitty_image_placements_with_data_filter(self, |descriptor| {
+            needs_data(descriptor)
+        })
     }
 }
 
@@ -249,6 +266,16 @@ impl PaneContent for std::cell::RefCell<super::replica::PaneReplica> {
 
     fn extract_selection(&self, selection: &crate::selection::Selection) -> Option<String> {
         crate::pane::plain_terminal_extract_selection(self.borrow().terminal(), selection)
+    }
+
+    fn kitty_image_placements_with_data_filter(
+        &self,
+        needs_data: &mut dyn FnMut(crate::ghostty::KittyImageDescriptor) -> bool,
+    ) -> Vec<crate::ghostty::KittyImagePlacement> {
+        self.borrow()
+            .terminal()
+            .kitty_image_placements_with_data_filter(|descriptor| needs_data(descriptor))
+            .unwrap_or_default()
     }
 }
 

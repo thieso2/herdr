@@ -878,6 +878,25 @@ pub fn pane_send_bytes_request(id: &str, pane_id: &str, data: &[u8]) -> serde_js
     })
 }
 
+/// Builds a `pane.paste_image` control request.
+pub fn pane_paste_image_request(
+    id: &str,
+    pane_id: &str,
+    extension: &str,
+    data: &[u8],
+) -> serde_json::Value {
+    use base64::Engine as _;
+    serde_json::json!({
+        "id": id,
+        "method": PANE_PASTE_IMAGE_METHOD,
+        "params": PanePasteImageControlParams {
+            pane_id: pane_id.to_owned(),
+            extension: extension.to_owned(),
+            data_base64: base64::engine::general_purpose::STANDARD.encode(data),
+        },
+    })
+}
+
 /// A control-plane error answer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ControlError {

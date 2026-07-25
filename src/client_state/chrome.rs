@@ -19,6 +19,12 @@ pub(crate) struct GlobalChrome {
     /// One-line connection status surfaced while the remote is not
     /// connected (connecting, offline with retry, or incompatible).
     pub(crate) connection_status: Option<String>,
+    /// Last window title written to the host terminal. Focused-remote-wins:
+    /// with a single remote today the local remote is always focused, so
+    /// its `window_title.changed` facts apply directly; a multi-remote
+    /// client keeps this selector and writes only the focused remote's
+    /// title.
+    pub(crate) window_title: Option<String>,
 }
 
 impl GlobalChrome {

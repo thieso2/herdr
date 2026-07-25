@@ -1570,6 +1570,24 @@ fn reload_local_client_config(
     }
 }
 
+/// Applies a `notification.posted` event with this client's local policy:
+/// the sound config decides whether sounds play, and toast kinds route to
+/// the terminal or system notifier. Shared by the legacy client (wire
+/// `Notify` messages) and the pure client (framed notification events).
+pub(crate) fn apply_notification_event(
+    kind: crate::api::schema::events::NotificationEventKind,
+    message: &str,
+    body: Option<&str>,
+    sound_config: &crate::config::SoundConfig,
+) {
+    let kind = match kind {
+        crate::api::schema::events::NotificationEventKind::Sound => NotifyKind::Sound,
+        crate::api::schema::events::NotificationEventKind::Toast => NotifyKind::Toast,
+        crate::api::schema::events::NotificationEventKind::SystemToast => NotifyKind::SystemToast,
+    };
+    handle_notify(kind, message, body, sound_config);
+}
+
 fn handle_notify(
     kind: NotifyKind,
     message: &str,
@@ -1660,7 +1678,7 @@ fn should_bridge_clipboard_image_paste(
 }
 
 #[cfg(unix)]
-fn read_image_file_from_terminal_drop(
+pub(crate) fn read_image_file_from_terminal_drop(
     data: &[u8],
     is_remote_client: bool,
 ) -> Option<crate::platform::ClipboardImage> {
@@ -1797,7 +1815,7 @@ fn window_title_osc(title: Option<&str>) -> Vec<u8> {
     format!("\x1b]0;{safe_title}\x07").into_bytes()
 }
 
-fn write_window_title(title: Option<&str>) {
+pub(crate) fn write_window_title(title: Option<&str>) {
     let _ = io::stdout().write_all(&window_title_osc(title));
 }
 

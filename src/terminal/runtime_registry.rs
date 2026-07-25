@@ -56,6 +56,9 @@ impl TerminalRuntimeRegistry {
         }
     }
 
+    // Production tracing that counted runtimes moved behind the pane
+    // content seam; tests still assert registry counts directly.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn len(&self) -> usize {
         self.runtimes.len()
     }

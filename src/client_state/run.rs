@@ -155,6 +155,7 @@ fn connect() -> ConnectOutcome {
             CAPABILITY_CATALOG,
             crate::protocol::framed::CAPABILITY_NOTIFICATION,
             crate::protocol::framed::CAPABILITY_WINDOW_TITLE,
+            crate::protocol::framed::CAPABILITY_PASTE_IMAGE,
         ],
     );
     if let Err(err) = session.send_control(&hello) {
@@ -211,6 +212,12 @@ fn connect() -> ConnectOutcome {
 pub(crate) fn run_pure_client(config: &crate::config::Config) -> io::Result<()> {
     crate::logging::startup("client");
     info!("running pure client of the local server (remote #0)");
+
+    // Terminal graphics respect the same [experimental] kitty_graphics gate
+    // as the server render path: replicas ingest kitty APC data from the
+    // pane DATA stream, and the pure client paints visible placements onto
+    // the host terminal after each draw.
+    crate::kitty_graphics::set_enabled(config.experimental.kitty_graphics);
 
     let mut mirrors = RemoteMirrors::with_local();
     let mut chrome = GlobalChrome::new();
@@ -343,12 +350,27 @@ fn run_loop(
             }
             sync_mode(app);
             let mut resize_requests = Vec::new();
+            let mut painted_area = ratatui::layout::Rect::default();
             terminal.draw(|frame| {
                 let source = MirrorPaneSource::new(mirrors.local());
                 resize_requests = crate::ui::compute_view_with_content(app, &source, frame.area());
                 app.sync_copy_mode_search_geometry();
                 crate::ui::render_with_content(app, &source, frame);
+                painted_area = frame.area();
             })?;
+            if crate::kitty_graphics::is_enabled() {
+                let cell_size =
+                    crate::kitty_graphics::HostCellSize::try_from_terminal(painted_area)
+                        .unwrap_or_else(|| {
+                            crate::kitty_graphics::HostCellSize::fallback_for_area(painted_area)
+                        });
+                let source = MirrorPaneSource::new(mirrors.local());
+                if let Err(err) =
+                    crate::kitty_graphics::paint_local_pane_graphics(app, &source, cell_size)
+                {
+                    debug!(err = %err, "kitty graphics paint failed");
+                }
+            }
             if let Link::Up(session) = &mut link {
                 sync_pane_streams(session, mirrors, &resize_requests, scrollback_limit);
             }
@@ -372,7 +394,14 @@ fn run_loop(
                 dirty = true;
             }
             LoopEvent::Frame(frame) => {
-                handle_server_frame(frame, &mut link, mirrors, chrome, scrollback_limit);
+                handle_server_frame(
+                    frame,
+                    &mut link,
+                    mirrors,
+                    chrome,
+                    &config.ui.sound,
+                    scrollback_limit,
+                );
                 dirty = true;
             }
             LoopEvent::Disconnected => {
@@ -390,9 +419,14 @@ fn run_loop(
                     }
                 }
                 LoopEvent::Resize(_, _) => {}
-                LoopEvent::Frame(frame) => {
-                    handle_server_frame(frame, &mut link, mirrors, chrome, scrollback_limit)
-                }
+                LoopEvent::Frame(frame) => handle_server_frame(
+                    frame,
+                    &mut link,
+                    mirrors,
+                    chrome,
+                    &config.ui.sound,
+                    scrollback_limit,
+                ),
                 LoopEvent::Disconnected => {
                     drop_link(&mut link, mirrors, chrome, "server connection closed")
                 }
@@ -602,6 +636,7 @@ fn handle_server_frame(
     link: &mut Link,
     mirrors: &mut RemoteMirrors,
     chrome: &mut GlobalChrome,
+    sound: &crate::config::SoundConfig,
     scrollback_limit: usize,
 ) {
     let mirror = mirrors.local_mut();
@@ -640,6 +675,38 @@ fn handle_server_frame(
                                 warn!(err = %err, "catalog resync snapshot request failed");
                                 session.pending.remove(&id);
                             }
+                        }
+                    }
+                    crate::protocol::framed::NOTIFICATION_POSTED_EVENT => {
+                        // Client-side policy: the server states the fact, this
+                        // client decides sound/terminal-toast/system-toast per
+                        // its own sound config and notifiers.
+                        let Some(data) = payload.get("data").cloned() else {
+                            return;
+                        };
+                        if let Ok(crate::api::schema::events::EventData::NotificationPosted {
+                            kind,
+                            message,
+                            body,
+                        }) = serde_json::from_value(data)
+                        {
+                            crate::client::apply_notification_event(
+                                kind,
+                                &message,
+                                body.as_deref(),
+                                sound,
+                            );
+                        }
+                    }
+                    crate::protocol::framed::WINDOW_TITLE_CHANGED_EVENT => {
+                        let Some(data) = payload.get("data").cloned() else {
+                            return;
+                        };
+                        if let Ok(crate::api::schema::events::EventData::WindowTitleChanged {
+                            title,
+                        }) = serde_json::from_value(data)
+                        {
+                            apply_remote_window_title(chrome, mirror.remote_index, title);
                         }
                     }
                     STREAM_CLOSED_EVENT | STREAM_REVOKED_EVENT => {
@@ -817,6 +884,23 @@ fn handle_server_frame(
     }
 }
 
+/// Applies a `window_title.changed` fact from a remote to the host
+/// terminal. Focused-remote-wins: with a single remote today the local
+/// remote is always focused, so the title applies directly; when
+/// multi-remote lands, only the focused remote's title is written and this
+/// selector gains the focus check.
+fn apply_remote_window_title(
+    chrome: &mut GlobalChrome,
+    _remote_index: usize,
+    title: Option<String>,
+) {
+    if chrome.window_title == title {
+        return;
+    }
+    crate::client::write_window_title(title.as_deref());
+    chrome.window_title = title;
+}
+
 /// Opens streams for visible panes that lack one, closes streams whose
 /// panes left visibility, and pushes stream.resize for panes whose planned
 /// geometry changed.
@@ -970,6 +1054,9 @@ fn handle_raw_input(
         crate::raw_input::RawInputEvent::Key(key) => handle_key(key, link, mirrors, ids, app),
         crate::raw_input::RawInputEvent::Paste(text) => {
             if app.mode == Mode::Terminal {
+                if try_paste_image(&text, link, mirrors, ids, app) {
+                    return;
+                }
                 if let Some((pane_id, bytes)) = encode_paste(mirrors, ids, app, &text) {
                     send_pane_bytes(link, &pane_id, &bytes);
                 }
@@ -1160,6 +1247,67 @@ fn encode_paste(
         bytes.extend_from_slice(text.as_bytes());
     }
     Some((pane_id, bytes))
+}
+
+/// Bridges image pastes into `pane.paste_image`: an empty bracketed paste
+/// means the host clipboard holds an image instead of text, and a pasted
+/// path pointing at an image file is a terminal file drop. Returns false to
+/// fall through to a normal text paste.
+fn try_paste_image(
+    text: &str,
+    link: &mut Link,
+    mirrors: &RemoteMirrors,
+    ids: &ComposeIds,
+    app: &AppState,
+) -> bool {
+    let Some(pane_id) = focused_public_pane(mirrors, ids, app) else {
+        return false;
+    };
+    let negotiated_paste_image = mirrors.local().connection.negotiated().is_some_and(
+        |negotiated| {
+            negotiated.has_capability(crate::protocol::framed::CAPABILITY_PASTE_IMAGE)
+        },
+    );
+    if !negotiated_paste_image {
+        return false;
+    }
+    let image = if text.is_empty() {
+        crate::platform::read_clipboard_image()
+    } else {
+        crate::client::read_image_file_from_terminal_drop(text.as_bytes(), true)
+    };
+    let Some(image) = image else {
+        return false;
+    };
+    if image.bytes.len() > crate::protocol::MAX_CLIPBOARD_IMAGE_PAYLOAD {
+        warn!(
+            bytes = image.bytes.len(),
+            max = crate::protocol::MAX_CLIPBOARD_IMAGE_PAYLOAD,
+            "clipboard image is too large to paste"
+        );
+        return true;
+    }
+    let Link::Up(session) = link else {
+        return false;
+    };
+    info!(
+        bytes = image.bytes.len(),
+        extension = image.extension,
+        pane = %pane_id,
+        "pasting image through pane.paste_image"
+    );
+    let id = session.request_id("paste-image");
+    let request = crate::protocol::framed::pane_paste_image_request(
+        &id,
+        &pane_id,
+        image.extension,
+        &image.bytes,
+    );
+    session.pending.insert(id, Pending::Api);
+    if let Err(err) = session.send_control(&request) {
+        warn!(err = %err, "pane.paste_image send failed");
+    }
+    true
 }
 
 fn send_pane_bytes(link: &mut Link, pane_id: &str, bytes: &[u8]) {

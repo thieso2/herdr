@@ -400,10 +400,11 @@ mod tests {
     use std::sync::mpsc::{self, Receiver};
 
     fn local_stream_pair(name: &str) -> (LocalStream, LocalStream, PathBuf) {
+        static PAIR_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let path = std::env::temp_dir().join(format!(
             "herdr-framed-{name}-{}-{}.sock",
             std::process::id(),
-            Instant::now().elapsed().as_nanos()
+            PAIR_ID.fetch_add(1, Ordering::Relaxed)
         ));
         let _ = std::fs::remove_file(&path);
         let listener = bind_local_listener(&path).unwrap();

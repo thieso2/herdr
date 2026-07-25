@@ -2281,8 +2281,46 @@ mod tests {
         assert_eq!(PROTOCOL_VERSION, 18);
     }
 
+    // Compile-time freeze guards: these matches are exhaustive on purpose.
+    // Adding a variant to a frozen enum fails compilation here, so the drift
+    // is caught even though appended variants leave existing bytes unchanged.
+    fn assert_client_message_variants_frozen(msg: &ClientMessage) {
+        match msg {
+            ClientMessage::Hello { .. }
+            | ClientMessage::Input { .. }
+            | ClientMessage::ClipboardImage { .. }
+            | ClientMessage::Resize { .. }
+            | ClientMessage::Detach
+            | ClientMessage::AttachTerminal { .. }
+            | ClientMessage::AttachScroll { .. }
+            | ClientMessage::InputEvents { .. }
+            | ClientMessage::ObserveTerminal { .. }
+            | ClientMessage::ControlTerminal { .. } => {}
+        }
+    }
+
+    fn assert_server_message_variants_frozen(msg: &ServerMessage) {
+        match msg {
+            ServerMessage::Welcome { .. }
+            | ServerMessage::Frame(_)
+            | ServerMessage::Terminal(_)
+            | ServerMessage::Graphics { .. }
+            | ServerMessage::ServerShutdown { .. }
+            | ServerMessage::Notify { .. }
+            | ServerMessage::Clipboard { .. }
+            | ServerMessage::WindowTitle { .. }
+            | ServerMessage::ReloadSoundConfig
+            | ServerMessage::MouseCapture { .. }
+            | ServerMessage::KittyKeyboardReportAll { .. }
+            | ServerMessage::PrefixInputSource { .. } => {}
+        }
+    }
+
     #[test]
     fn legacy_client_message_wire_bytes_are_frozen_at_protocol_18() {
+        for (_, msg) in &frozen_client_fixtures() {
+            assert_client_message_variants_frozen(msg);
+        }
         assert_frozen_wire_bytes(
             frozen_client_fixtures(),
             &[
@@ -2330,6 +2368,9 @@ mod tests {
 
     #[test]
     fn legacy_server_message_wire_bytes_are_frozen_at_protocol_18() {
+        for (_, msg) in &frozen_server_fixtures() {
+            assert_server_message_variants_frozen(msg);
+        }
         assert_frozen_wire_bytes(
             frozen_server_fixtures(),
             &[

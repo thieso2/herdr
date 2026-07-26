@@ -25,6 +25,10 @@ mod tab;
 mod workspace;
 mod worktree;
 
+// Re-exported for the brand guard test in `crate::identity`.
+#[cfg(test)]
+pub(crate) use completion::COMPLETION_BIN_NAME;
+
 const TERMINAL_SESSION_OBSERVE_USAGE: &str =
     "usage: herdr terminal session observe <target> [--cols N] [--rows N]";
 const TERMINAL_SESSION_CONTROL_USAGE: &str =

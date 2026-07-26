@@ -47,9 +47,9 @@ run_herdr() {
 session_dir() {
   local session="$1"
   if [[ "$session" == "default" ]]; then
-    printf '%s/herdr-dev' "$CONFIG_HOME"
+    printf '%s/overherdr-dev' "$CONFIG_HOME"
   else
-    printf '%s/herdr-dev/sessions/%s' "$CONFIG_HOME" "$session"
+    printf '%s/overherdr-dev/sessions/%s' "$CONFIG_HOME" "$session"
   fi
 }
 
@@ -64,7 +64,7 @@ client_socket() {
 assert_smoke_socket() {
   local socket="$1"
   case "$socket" in
-    "$CONFIG_HOME"/herdr-dev/herdr.sock | "$CONFIG_HOME"/herdr-dev/sessions/*/herdr.sock)
+    "$CONFIG_HOME"/overherdr-dev/herdr.sock | "$CONFIG_HOME"/overherdr-dev/sessions/*/herdr.sock)
       ;;
     *)
       echo "refusing to use non-smoke socket: $socket" >&2
@@ -182,8 +182,8 @@ echo "using herdr: $HERDR_BIN"
 echo "smoke base: $BASE"
 
 cargo build --locked --manifest-path "$ROOT/Cargo.toml" >/dev/null
-mkdir -p "$CONFIG_HOME/herdr-dev" "$RUNTIME_DIR" "$STATE_DIR"
-printf 'onboarding = false\n' > "$CONFIG_HOME/herdr-dev/config.toml"
+mkdir -p "$CONFIG_HOME/overherdr-dev" "$RUNTIME_DIR" "$STATE_DIR"
+printf 'onboarding = false\n' > "$CONFIG_HOME/overherdr-dev/config.toml"
 
 for session in "${sessions[@]}"; do
   echo "starting smoke session $session at $(api_socket "$session")"

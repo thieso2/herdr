@@ -411,7 +411,7 @@ fn completion_command_prints_zsh_script_without_session_startup() {
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("#compdef herdr"), "stdout: {stdout}");
+    assert!(stdout.contains("#compdef overherdr"), "stdout: {stdout}");
     assert!(
         !stdout.contains("--cwd=[]"),
         "zsh completions should not suggest equals-style values unsupported by most manual parsers: {stdout}"

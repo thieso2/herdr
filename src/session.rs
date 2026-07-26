@@ -101,9 +101,10 @@ pub fn active_name() -> Option<String> {
 }
 
 pub fn local_attach_command() -> String {
+    let brand = crate::identity::BRAND;
     match active_name() {
-        Some(name) => format!("herdr session attach {name}"),
-        None => "herdr".to_string(),
+        Some(name) => format!("{brand} session attach {name}"),
+        None => brand.to_string(),
     }
 }
 
@@ -112,9 +113,10 @@ pub fn local_stop_command() -> String {
 }
 
 pub fn stop_command_for(name: Option<&str>) -> String {
+    let brand = crate::identity::BRAND;
     match name {
-        Some(name) => format!("herdr session stop {name}"),
-        None => "herdr server stop".to_string(),
+        Some(name) => format!("{brand} session stop {name}"),
+        None => format!("{brand} server stop"),
     }
 }
 

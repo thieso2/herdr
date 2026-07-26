@@ -2440,7 +2440,7 @@ mod tests {
         };
         let msg = err.to_string();
         assert!(
-            msg.contains("Run `herdr` to reattach"),
+            msg.contains(&format!("Run `{}` to reattach", crate::identity::BRAND)),
             "should suggest default reattach command: {msg}"
         );
     }
@@ -2455,7 +2455,10 @@ mod tests {
         };
         let msg = err.to_string();
         assert!(
-            msg.contains("Run `herdr session attach work` to reattach"),
+            msg.contains(&format!(
+                "Run `{} session attach work` to reattach",
+                crate::identity::BRAND
+            )),
             "should suggest named session reattach command: {msg}"
         );
     }

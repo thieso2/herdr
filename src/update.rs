@@ -32,7 +32,7 @@ const STABLE_UPDATE_MANIFEST_URL: &str =
 const PREVIEW_UPDATE_MANIFEST_URL: &str =
     "https://raw.githubusercontent.com/thieso2/herdr/master/dist/preview.json";
 const HOMEBREW_FORMULA_API_URL: &str = "https://formulae.brew.sh/api/formula/herdr.json";
-const HERDR_UPDATE_COMMAND: &str = "herdr update";
+const HERDR_UPDATE_COMMAND: &str = crate::identity::UPDATE_COMMAND;
 const HOMEBREW_UPDATE_COMMAND: &str = "brew update && brew upgrade herdr";
 const MISE_UPDATE_COMMAND: &str = "mise upgrade herdr";
 const NIX_UPDATE_COMMAND: &str = "update through Nix";
@@ -1136,7 +1136,8 @@ fn prompt_to_complete_plain_update(
     let (singular, plural) = target_group_nouns(&plans);
     let noun = if plans.len() == 1 { singular } else { plural };
     eprintln!(
-        "To complete the update, Herdr must stop {} running {}.",
+        "To complete the update, {} must stop {} running {}.",
+        crate::identity::BRAND,
         plans.len(),
         noun
     );
@@ -1194,7 +1195,7 @@ fn print_running_session_update_summary(
     release: &ReleaseInfo,
     options: SelfUpdateOptions,
 ) {
-    eprintln!("running herdr targets:");
+    eprintln!("running {} targets:", crate::identity::BRAND);
     for plan in plans {
         if options.live_handoff {
             let capability = if server_supports_live_handoff(&plan.server) {
@@ -1551,7 +1552,12 @@ fn wait_for_server_shutdown_at(socket_path: &Path, timeout: Duration) -> Result<
 
 #[cfg(not(windows))]
 fn stop_running_server_for_update(plan: &RunningServerUpdatePlan) -> Result<(), String> {
-    eprintln!("stopping herdr {} {}...", plan.target_noun(), plan.label());
+    eprintln!(
+        "stopping {} {} {}...",
+        crate::identity::BRAND,
+        plan.target_noun(),
+        plan.label()
+    );
     stop_server_via_api_at(plan.socket_path(), SERVER_STOP_RESPONSE_TIMEOUT)?;
     wait_for_server_shutdown_at(plan.socket_path(), SERVER_HANDOFF_CONFIRM_TIMEOUT)?;
     Ok(())
@@ -1752,7 +1758,7 @@ pub(crate) fn update_install_command() -> &'static str {
 pub(crate) fn update_install_instruction(install_command: &str) -> String {
     match install_command {
         HERDR_UPDATE_COMMAND => {
-            "detach, run `herdr update`, then follow its restart guidance".to_string()
+            format!("detach, run `{HERDR_UPDATE_COMMAND}`, then follow its restart guidance")
         }
         HOMEBREW_UPDATE_COMMAND => {
             "detach, run `brew update && brew upgrade herdr`, then restart this Herdr session when ready".to_string()

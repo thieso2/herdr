@@ -1551,18 +1551,39 @@ mod tests {
     use super::*;
 
     #[test]
-    fn generated_workspace_ids_are_short_base32_handles() {
+    fn generated_workspace_ids_are_base32_handles() {
         let first = generate_workspace_id();
         let second = generate_workspace_id();
 
         assert!(first.starts_with('w'));
         assert!(second.starts_with('w'));
         assert_ne!(first, second);
-        assert!(first.len() <= 3, "unexpectedly long workspace id: {first}");
-        assert!(
-            second.len() <= 3,
-            "unexpectedly long workspace id: {second}"
-        );
+        for id in [&first, &second] {
+            assert!(
+                id[1..]
+                    .bytes()
+                    .all(|byte| PUBLIC_ID_ALPHABET.contains(&byte)),
+                "workspace id is not a base32 handle: {id}"
+            );
+        }
+    }
+
+    #[test]
+    fn workspace_handles_stay_short_as_the_counter_climbs() {
+        // Length belongs here, not on generate_workspace_id: the counter
+        // behind it is process-global, so in a full test run thousands of
+        // earlier workspaces decide how long its ids are.
+        // The encoding is bijective base32, so each width covers 32^n values
+        // starting after the previous width runs out: 32, then 1056, then
+        // 33824.
+        assert_eq!(encode_public_number(1).len(), 1);
+        assert_eq!(encode_public_number(32).len(), 1);
+        assert_eq!(encode_public_number(33).len(), 2);
+        assert_eq!(encode_public_number(1056).len(), 2);
+        assert_eq!(encode_public_number(1057).len(), 3);
+        // A session would have to open ~34k spaces to reach four characters.
+        assert_eq!(encode_public_number(33824).len(), 3);
+        assert_eq!(encode_public_number(33825).len(), 4);
     }
 
     #[test]

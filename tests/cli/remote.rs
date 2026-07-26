@@ -175,3 +175,50 @@ fn bridge_subcommand_pumps_the_framed_protocol_to_the_api_socket() {
 
     cleanup_spawned_herdr(spawned, base);
 }
+
+#[test]
+fn remote_upgrade_requires_explicit_consent_and_never_runs_by_accident() {
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let app_config = config_home.join(app_dir_name());
+    fs::create_dir_all(&app_config).unwrap();
+    fs::create_dir_all(&runtime_dir).unwrap();
+    register_runtime_dir(&runtime_dir);
+    fs::write(
+        app_config.join("remotes.toml"),
+        concat!(
+            "[[remote]]\n",
+            "name = \"gpu1\"\n",
+            "target = \"can@gpu1.invalid\"\n",
+        ),
+    )
+    .unwrap();
+
+    // The subcommand is documented in `herdr remote help`.
+    let output = run_named_cli(&config_home, &runtime_dir, &["remote", "help"]);
+    let help = String::from_utf8_lossy(&output.stderr);
+    assert!(help.contains("herdr remote upgrade"), "help: {help}");
+
+    // Missing target: usage, no ssh.
+    let output = run_named_cli(&config_home, &runtime_dir, &["remote", "upgrade"]);
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("usage: herdr remote upgrade"), "{stderr}");
+
+    // A name plus --all is contradictory.
+    let output = run_named_cli(
+        &config_home,
+        &runtime_dir,
+        &["remote", "upgrade", "--all", "gpu1"],
+    );
+    assert_eq!(output.status.code(), Some(2));
+
+    // Non-interactive stdin without --yes refuses before touching the host.
+    let output = run_named_cli(&config_home, &runtime_dir, &["remote", "upgrade", "gpu1"]);
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("requires --yes"), "{stderr}");
+
+    cleanup_test_base(&base);
+}

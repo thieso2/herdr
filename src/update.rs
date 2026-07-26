@@ -1950,6 +1950,31 @@ fn homebrew_cellar_keg_root(path: &Path) -> Option<PathBuf> {
 // Public API
 // ---------------------------------------------------------------------------
 
+/// The herdr version a fleet remote should be rolled forward to, for
+/// `herdr remote upgrade`.
+///
+/// Stable installs follow the channel: when the manifest offers something
+/// newer than this build, the fleet rolls forward to that. Preview builds are
+/// identified by build id rather than version, and the remote installer
+/// resolves preview assets for *this* build, so a preview fleet rolls forward
+/// to the version running here. Any manifest problem falls back to this
+/// build: `remote upgrade` must work offline-ish, not fail on a flaky fetch.
+#[cfg(unix)]
+pub(crate) fn remote_upgrade_target_version() -> String {
+    let current = crate::build_info::version();
+    if UpdateChannel::configured() != UpdateChannel::Stable {
+        return current;
+    }
+    match fetch_update_manifest().and_then(|manifest| release_info_from_manifest(&manifest)) {
+        Ok(Some(release)) => release.version.to_string(),
+        Ok(None) => current,
+        Err(err) => {
+            tracing::debug!(err = %err, "falling back to this build as the remote upgrade target");
+            current
+        }
+    }
+}
+
 /// Manual self-update command (`herdr update`).
 pub fn self_update(options: SelfUpdateOptions) -> Result<Version, String> {
     let channel = UpdateChannel::configured();

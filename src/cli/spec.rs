@@ -754,6 +754,19 @@ fn remote_command() -> Command {
                 .about("Apply hand edits made to remotes.toml")
                 .arg(json_flag()),
         )
+        .subcommand(
+            Command::new("upgrade")
+                .about("Roll remotes forward to the update channel's herdr")
+                .arg(Arg::new("name").value_name("NAME-OR-TARGET"))
+                .arg(flag("all"))
+                .arg(
+                    Arg::new("yes")
+                        .short('y')
+                        .long("yes")
+                        .action(ArgAction::SetTrue),
+                )
+                .arg(json_flag()),
+        )
 }
 
 fn integration_command() -> Command {

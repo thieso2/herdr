@@ -179,8 +179,16 @@ impl PaneContent for TerminalRuntime {
 /// UI seam hands out, and the pure client is single-threaded per mirror so a
 /// `RefCell` is the exact fit (no lock, borrow bugs panic in tests).
 impl PaneContent for std::cell::RefCell<super::replica::PaneReplica> {
-    fn render(&self, frame: &mut Frame, area: Rect, _show_cursor: bool) {
+    fn render(&self, frame: &mut Frame, area: Rect, show_cursor: bool) {
         crate::pane::render_plain_terminal(self.borrow().terminal(), frame, area);
+        // Mirror of GhosttyPane::render: the focused pane places the host
+        // cursor. Implemented via cursor_state so the two can never diverge.
+        if let Some(cursor) = self
+            .cursor_state(area, show_cursor)
+            .filter(|cursor| cursor.visible)
+        {
+            frame.set_cursor_position((cursor.x, cursor.y));
+        }
     }
 
     fn cursor_state(
@@ -195,7 +203,14 @@ impl PaneContent for std::cell::RefCell<super::replica::PaneReplica> {
         if cursor.x >= area.width || cursor.y >= area.height {
             return None;
         }
-        Some(cursor)
+        // Frame-absolute coordinates, matching PaneRuntime::cursor_state:
+        // callers (copy-mode entry, tab_surface) subtract the pane rect.
+        Some(crate::pane::TerminalCursorState {
+            x: area.x + cursor.x,
+            y: area.y + cursor.y,
+            visible: cursor.visible,
+            shape: cursor.shape,
+        })
     }
 
     fn scroll_metrics(&self) -> Option<crate::pane::ScrollMetrics> {
@@ -308,4 +323,86 @@ pub(crate) struct PaneResizeRequest {
     pub(crate) terminal_id: TerminalId,
     pub(crate) rows: u16,
     pub(crate) cols: u16,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::RefCell;
+
+    fn replica(snapshot: &str, cols: u16, rows: u16) -> RefCell<crate::terminal::replica::PaneReplica> {
+        RefCell::new(
+            crate::terminal::replica::PaneReplica::open(snapshot, 0, None, cols, rows, 64 * 1024)
+                .expect("replica opens"),
+        )
+    }
+
+    /// The replica-backed cursor_state must honor the same coordinate
+    /// contract as the runtime-backed one: frame-absolute coordinates
+    /// (area offset applied), not pane-local viewport coordinates.
+    #[tokio::test]
+    async fn replica_cursor_state_matches_runtime_coordinates() {
+        let runtime = TerminalRuntime::test_with_screen_bytes(20, 5, b"left");
+        let replica = replica("left", 20, 5);
+        let area = Rect::new(5, 3, 20, 5);
+
+        let from_runtime =
+            PaneContent::cursor_state(&runtime, area, true).expect("runtime cursor");
+        let from_replica =
+            PaneContent::cursor_state(&replica, area, true).expect("replica cursor");
+        assert_eq!(
+            (from_replica.x, from_replica.y, from_replica.visible),
+            (from_runtime.x, from_runtime.y, from_runtime.visible),
+            "replica cursor_state must return frame-absolute coordinates like the runtime"
+        );
+
+        assert!(PaneContent::cursor_state(&replica, area, false).is_none());
+    }
+
+    /// The pure client draws through `PaneContent::render`; the focused
+    /// pane's host cursor exists only if the replica implementation sets the
+    /// frame cursor position like `GhosttyPane::render` does.
+    #[test]
+    fn replica_render_sets_the_frame_cursor_when_shown() {
+        let replica = replica("left", 20, 5);
+        let area = Rect::new(5, 3, 20, 5);
+        let backend = ratatui::backend::TestBackend::new(40, 10);
+        let mut terminal = ratatui::Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| PaneContent::render(&replica, frame, area, true))
+            .expect("draw");
+        terminal
+            .backend_mut()
+            .assert_cursor_position((area.x + 4, area.y));
+    }
+
+    /// An unfocused pane (`show_cursor == false`) and a pane that hid its
+    /// cursor via DECTCEM must not place the host cursor.
+    #[test]
+    fn replica_render_leaves_the_cursor_unset_when_hidden() {
+        use ratatui::backend::Backend;
+
+        let unfocused = replica("ab", 20, 5);
+        let area = Rect::new(5, 3, 20, 5);
+        let backend = ratatui::backend::TestBackend::new(40, 10);
+        let mut terminal = ratatui::Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| PaneContent::render(&unfocused, frame, area, false))
+            .expect("draw");
+        let position = terminal
+            .backend_mut()
+            .get_cursor_position()
+            .expect("cursor position");
+        assert_ne!((position.x, position.y), (area.x + 2, area.y));
+
+        let hidden = replica("ab\x1b[?25l", 20, 5);
+        terminal
+            .draw(|frame| PaneContent::render(&hidden, frame, area, true))
+            .expect("draw");
+        let position = terminal
+            .backend_mut()
+            .get_cursor_position()
+            .expect("cursor position");
+        assert_ne!((position.x, position.y), (area.x + 2, area.y));
+    }
 }

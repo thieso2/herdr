@@ -2315,7 +2315,10 @@ mod tests {
                 _ => None,
             })
             .expect("cwd change emits pane.updated");
-        assert_eq!(pane.cwd.as_deref(), Some(cwd.display().to_string().as_str()));
+        assert_eq!(
+            pane.cwd.as_deref(),
+            Some(cwd.display().to_string().as_str())
+        );
         assert!(
             events.iter().any(|(_, envelope)| matches!(
                 &envelope.data,

@@ -179,9 +179,10 @@ fn project_mirror(
             active_tab,
             public_pane_numbers,
             workspace_info.git_branch.clone(),
-            workspace_info.git_ahead.zip(workspace_info.git_behind).map(
-                |(ahead, behind)| (ahead as usize, behind as usize),
-            ),
+            workspace_info
+                .git_ahead
+                .zip(workspace_info.git_behind)
+                .map(|(ahead, behind)| (ahead as usize, behind as usize)),
         ));
     }
 

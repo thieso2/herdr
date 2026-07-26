@@ -330,7 +330,11 @@ mod tests {
     use super::*;
     use std::cell::RefCell;
 
-    fn replica(snapshot: &str, cols: u16, rows: u16) -> RefCell<crate::terminal::replica::PaneReplica> {
+    fn replica(
+        snapshot: &str,
+        cols: u16,
+        rows: u16,
+    ) -> RefCell<crate::terminal::replica::PaneReplica> {
         RefCell::new(
             crate::terminal::replica::PaneReplica::open(snapshot, 0, None, cols, rows, 64 * 1024)
                 .expect("replica opens"),
@@ -346,10 +350,8 @@ mod tests {
         let replica = replica("left", 20, 5);
         let area = Rect::new(5, 3, 20, 5);
 
-        let from_runtime =
-            PaneContent::cursor_state(&runtime, area, true).expect("runtime cursor");
-        let from_replica =
-            PaneContent::cursor_state(&replica, area, true).expect("replica cursor");
+        let from_runtime = PaneContent::cursor_state(&runtime, area, true).expect("runtime cursor");
+        let from_replica = PaneContent::cursor_state(&replica, area, true).expect("replica cursor");
         assert_eq!(
             (from_replica.x, from_replica.y, from_replica.visible),
             (from_runtime.x, from_runtime.y, from_runtime.visible),

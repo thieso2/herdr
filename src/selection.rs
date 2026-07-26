@@ -208,6 +208,15 @@ impl Selection {
         self.ordered()
     }
 
+    /// Renumbers both ends after `rows` older rows were prepended above this
+    /// pane's scrollback. Screen-buffer rows count down from the top of
+    /// loaded history, so prepending shifts every existing row by `rows` and
+    /// a selection left alone would silently cover different text.
+    pub(crate) fn rebase_rows_after_prepend(&mut self, rows: u32) {
+        self.anchor.0 = self.anchor.0.saturating_add(rows);
+        self.cursor.0 = self.cursor.0.saturating_add(rows);
+    }
+
     /// Check whether a pane-relative cell (row, col) is inside the selection.
     pub fn contains(&self, viewport_row: u16, col: u16, metrics: Option<ScrollMetrics>) -> bool {
         if !self.is_visible() {
@@ -343,6 +352,14 @@ mod tests {
         sel.cursor = (er, ec);
         sel.phase = Phase::Dragging;
         sel
+    }
+
+    #[test]
+    fn prepended_history_shifts_a_selection_onto_the_same_text() {
+        let mut sel = make_sel(4, 2, 6, 9);
+        sel.rebase_rows_after_prepend(10);
+
+        assert_eq!(sel.ordered_cells(), ((14, 2), (16, 9)));
     }
 
     #[test]

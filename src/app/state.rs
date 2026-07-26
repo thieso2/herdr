@@ -1720,6 +1720,42 @@ impl AppState {
         self.request_history_backfill_pane = None;
     }
 
+    /// Renumbers this pane's absolute-row state after `rows` older rows were
+    /// prepended to its scrollback, so selections, a linewise copy-mode
+    /// anchor, and search hits keep pointing at the text they were on.
+    /// Backfilled history arrives above everything already loaded, which
+    /// shifts every existing row down by `rows`.
+    ///
+    /// The copy-mode cursor is viewport-relative and the entry offset is
+    /// measured from the bottom, so neither moves.
+    pub(crate) fn rebase_absolute_rows_after_prepend(&mut self, pane_id: PaneId, rows: usize) {
+        if rows == 0 {
+            return;
+        }
+        let rows = u32::try_from(rows).unwrap_or(u32::MAX);
+        if let Some(selection) = self
+            .selection
+            .as_mut()
+            .filter(|selection| selection.pane_id == pane_id)
+        {
+            selection.rebase_rows_after_prepend(rows);
+        }
+        let Some(copy_mode) = self
+            .copy_mode
+            .as_mut()
+            .filter(|copy_mode| copy_mode.pane_id == pane_id)
+        else {
+            return;
+        };
+        if let Some(CopyModeSelection::Linewise { anchor_row }) = copy_mode.selection.as_mut() {
+            *anchor_row = anchor_row.saturating_add(rows);
+        }
+        for text_match in &mut copy_mode.search.matches {
+            text_match.start.row = text_match.start.row.saturating_add(rows);
+            text_match.end.row = text_match.end.row.saturating_add(rows);
+        }
+    }
+
     pub fn sound_enabled(&self) -> bool {
         self.sound.enabled
     }
@@ -2543,6 +2579,69 @@ impl AppState {
 mod tests {
     use super::*;
     use crossterm::event::KeyEvent;
+
+    fn text_match(row: u32) -> crate::pane::TerminalTextMatch {
+        crate::pane::TerminalTextMatch {
+            start: crate::pane::TerminalTextPoint { row, col: 0 },
+            end: crate::pane::TerminalTextPoint { row, col: 4 },
+            source_fingerprint: 7,
+            scan_cols: 80,
+            scan_screen: crate::ghostty::ActiveScreen::Primary,
+        }
+    }
+
+    #[test]
+    fn prepended_history_renumbers_only_the_receiving_pane() {
+        let mut state = AppState::test_new();
+        let pane = PaneId::from_raw(1);
+        let other = PaneId::from_raw(2);
+
+        state.selection = Some(crate::selection::Selection::range(pane, 3, 0, 5, None));
+        state.copy_mode = Some(CopyModeState {
+            pane_id: pane,
+            cursor_row: 4,
+            cursor_col: 1,
+            entry_offset_from_bottom: 9,
+            selection: Some(CopyModeSelection::Linewise { anchor_row: 12 }),
+            search: CopyModeSearchState {
+                matches: vec![text_match(20), text_match(30)],
+                ..Default::default()
+            },
+        });
+
+        // A page landing on some other pane must not touch this one.
+        state.rebase_absolute_rows_after_prepend(other, 100);
+        let copy_mode = state.copy_mode.as_ref().expect("copy mode");
+        assert_eq!(
+            copy_mode.selection,
+            Some(CopyModeSelection::Linewise { anchor_row: 12 })
+        );
+
+        state.rebase_absolute_rows_after_prepend(pane, 10);
+
+        let copy_mode = state.copy_mode.as_ref().expect("copy mode");
+        assert_eq!(
+            copy_mode.selection,
+            Some(CopyModeSelection::Linewise { anchor_row: 22 })
+        );
+        assert_eq!(
+            copy_mode
+                .search
+                .matches
+                .iter()
+                .map(|found| (found.start.row, found.end.row))
+                .collect::<Vec<_>>(),
+            vec![(30, 30), (40, 40)]
+        );
+        // Viewport-relative and bottom-relative state stays put.
+        assert_eq!(copy_mode.cursor_row, 4);
+        assert_eq!(copy_mode.entry_offset_from_bottom, 9);
+        // A one-row selection over columns 0..=5, moved down whole.
+        assert_eq!(
+            state.selection.as_ref().expect("selection").ordered_cells(),
+            ((13, 0), (13, 5))
+        );
+    }
 
     #[test]
     fn agent_terminal_keeps_final_child_cursor_exposed() {

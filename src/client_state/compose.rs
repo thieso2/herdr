@@ -69,6 +69,20 @@ impl ComposeIds {
             .or_insert_with(PaneId::alloc)
     }
 
+    /// The local pane id already allocated for a remote's public pane id, if
+    /// that pane is composed. Unlike [`ComposeIds::pane_id`] this never
+    /// allocates, so callers reacting to stream traffic cannot mint ids for
+    /// panes the view does not hold.
+    pub(crate) fn composed_pane_id(
+        &self,
+        remote_index: usize,
+        public_pane_id: &str,
+    ) -> Option<PaneId> {
+        self.pane_ids
+            .get(&(remote_index, public_pane_id.to_owned()))
+            .copied()
+    }
+
     /// The owning remote and public pane id behind a local pane id, for
     /// control-plane calls.
     pub(crate) fn public_pane_id(&self, pane_id: PaneId) -> Option<(usize, &str)> {

@@ -1519,6 +1519,41 @@ fn scroll_focused_replica_page(code: crossterm::event::KeyCode, ctx: &mut LoopCt
     true
 }
 
+/// Feeds a stream's replica and renumbers the client's absolute-row state by
+/// however many older rows that prepended. Both ways a replica takes bytes -
+/// a history page, and a tail that lets queued pages bake in - can prepend,
+/// and history lands above everything already loaded, so a selection or
+/// search hit left alone would cover different text than the user put it on.
+///
+/// `apply` returns the prepended row count, and owns its own error
+/// reporting: a replica that failed to take the bytes prepended nothing.
+///
+/// Takes the context in pieces rather than `LoopCtx` because callers already
+/// hold `mirror` as a mutable borrow out of `LoopCtx::mirrors`.
+fn apply_and_rebase(
+    mirror: &mut super::RemoteMirror,
+    ids: &ComposeIds,
+    app: &mut AppState,
+    remote: usize,
+    stream_id: u32,
+    apply: impl FnOnce(&mut crate::terminal::replica::PaneReplica) -> usize,
+) {
+    let Some(rows) = mirror
+        .replica_mut(stream_id)
+        .map(apply)
+        .filter(|rows| *rows > 0)
+    else {
+        return;
+    };
+    let Some(pane_id) = mirror
+        .pane_for_stream(stream_id)
+        .and_then(|public| ids.composed_pane_id(remote, public))
+    else {
+        return;
+    };
+    app.rebase_absolute_rows_after_prepend(pane_id, rows);
+}
+
 /// The remote and stream serving a composed pane, if that pane is streamed.
 pub(super) fn stream_for_composed_pane(
     mirrors: &RemoteMirrors,
@@ -1603,11 +1638,21 @@ fn handle_server_frame(remote: usize, frame: Frame, ctx: &mut LoopCtx<'_>) {
     };
     match frame.frame_type {
         FrameType::Data => {
-            if let Some(replica) = mirror.replica_mut(frame.stream_id) {
-                if let Err(err) = replica.apply_tail(&frame.payload) {
-                    warn!(err = %err, stream = frame.stream_id, "replica tail apply failed");
-                }
-            }
+            // A tail that leaves the alternate screen lets queued history
+            // pages bake in, which prepends rows just like a page landing.
+            apply_and_rebase(
+                mirror,
+                ctx.ids,
+                ctx.app,
+                remote,
+                frame.stream_id,
+                |replica| {
+                    replica.apply_tail(&frame.payload).unwrap_or_else(|err| {
+                        warn!(err = %err, stream = frame.stream_id, "replica tail apply failed");
+                        0
+                    })
+                },
+            );
         }
         FrameType::Control => {
             let Ok(payload) = serde_json::from_slice::<serde_json::Value>(&frame.payload) else {
@@ -1870,14 +1915,18 @@ fn handle_server_frame(remote: usize, frame: Frame, ctx: &mut LoopCtx<'_>) {
                     }
                 }
                 Some(Pending::History { stream_id }) => {
-                    if let Some(replica) = mirror.replica_mut(stream_id) {
+                    apply_and_rebase(mirror, ctx.ids, ctx.app, remote, stream_id, |replica| {
                         match replica.apply_history_response(&payload) {
                             Ok(rows_prepended) => {
-                                debug!(stream = stream_id, rows_prepended, "history page applied")
+                                debug!(stream = stream_id, rows_prepended, "history page applied");
+                                rows_prepended
                             }
-                            Err(err) => warn!(err = %err, "history page apply failed"),
+                            Err(err) => {
+                                warn!(err = %err, "history page apply failed");
+                                0
+                            }
                         }
-                    }
+                    });
                 }
                 Some(Pending::Resize { stream_id }) => {
                     if let Some(error) = control_error(&payload) {
@@ -4241,6 +4290,266 @@ mod tests {
             assert_eq!(
                 request["method"],
                 crate::protocol::framed::STREAM_HISTORY_METHOD
+            );
+        });
+    }
+
+    /// The server's `stream.history` answer carrying `content` as the page.
+    fn stream_history_frame(request_id: &str, stream_id: u32, content: &str) -> Frame {
+        let payload = serde_json::json!({
+            "id": request_id,
+            "result": {
+                "type": "stream_history",
+                "stream_id": stream_id,
+                "content": content,
+                "next_cursor": "cursor-2",
+                "at_top": false,
+                "end_cut_mid_line": false,
+            },
+        });
+        Frame {
+            frame_type: FrameType::Control,
+            stream_id: 0,
+            payload: serde_json::to_vec(&payload).expect("payload serializes"),
+        }
+    }
+
+    #[tokio::test]
+    async fn copy_mode_scrolling_pages_history_in_lazily_not_all_at_once() {
+        with_test_ctx(vec![RemoteDescriptor::local()], |ctx| {
+            *ctx.mirrors.local_mut() = mirror_with_history(&tall_screen(60), "cursor-1");
+            compose_and_lay_out(ctx);
+            {
+                let source = MirrorPaneSource::new(ctx.mirrors.local());
+                ctx.app.enter_copy_mode(&source);
+            }
+            assert_eq!(ctx.app.mode, Mode::Copy);
+
+            let (session, mut server) = session_pair();
+            ctx.links
+                .insert(LOCAL_REMOTE_INDEX, Link::Up(Box::new(session)));
+
+            // Ctrl-U scrolls the copy-mode viewport up half a screen. (Not
+            // ctrl-b, which is the prefix key and never reaches copy mode.)
+            handle_key(
+                crate::input::TerminalKey::new(KeyCode::Char('u'), KeyModifiers::CONTROL),
+                ctx,
+            );
+
+            let request = try_read_control(&mut server).expect("the motion pages history in");
+            assert_eq!(
+                request["method"],
+                crate::protocol::framed::STREAM_HISTORY_METHOD
+            );
+            // A motion is a scroll, not a jump: one lazy page, not the budget.
+            assert_eq!(
+                request["params"]["max_bytes"],
+                crate::protocol::framed::HISTORY_PAGE_DEFAULT_BYTES
+            );
+        });
+    }
+
+    #[tokio::test]
+    async fn a_landed_history_page_renumbers_the_selection_it_pushed_down() {
+        with_test_ctx(vec![RemoteDescriptor::local()], |ctx| {
+            *ctx.mirrors.local_mut() = mirror_with_history("alpha bravo charlie\r\n", "cursor-1");
+            compose_and_lay_out(ctx);
+            let pane_id = ctx.app.workspaces[0]
+                .focused_pane_id()
+                .expect("composed focused pane");
+
+            // Select "alpha" on the first row of the loaded screen.
+            let metrics = {
+                let source = MirrorPaneSource::new(ctx.mirrors.local());
+                ctx.app.pane_scroll_metrics(&source, pane_id)
+            };
+            let mut selection = crate::selection::Selection::range(pane_id, 0, 0, 4, metrics);
+            assert!(selection.finish());
+            let before = selection.ordered_cells();
+            ctx.app.selection = Some(selection);
+
+            let (mut session, _server) = session_pair();
+            session
+                .pending
+                .insert("h1".to_owned(), Pending::History { stream_id: 3 });
+            ctx.links
+                .insert(LOCAL_REMOTE_INDEX, Link::Up(Box::new(session)));
+
+            let loaded_rows = |ctx: &LoopCtx<'_>| {
+                ctx.mirrors
+                    .local()
+                    .replicas
+                    .get(&3)
+                    .and_then(|replica| replica.borrow().scroll_metrics().ok())
+                    .map(|metrics| metrics.max_offset_from_bottom)
+                    .expect("scroll metrics")
+            };
+            let rows_before = loaded_rows(ctx);
+
+            // A page of older history lands above the loaded screen.
+            let page = tall_screen(30);
+            handle_server_frame(
+                LOCAL_REMOTE_INDEX,
+                stream_history_frame("h1", 3, &page),
+                ctx,
+            );
+
+            // The growth in scrollback is the prepend count, whatever the
+            // fixture started with.
+            let rows_prepended = loaded_rows(ctx) - rows_before;
+            assert!(rows_prepended > 0, "the page really did prepend rows");
+
+            let after = ctx
+                .app
+                .selection
+                .as_ref()
+                .expect("selection survives the page")
+                .ordered_cells();
+            assert_eq!(
+                (after.0 .0 - before.0 .0, after.1 .0 - before.1 .0),
+                (rows_prepended as u32, rows_prepended as u32),
+                "the selection moved down by exactly the rows that landed above it"
+            );
+            assert_eq!(
+                (after.0 .1, after.1 .1),
+                (before.0 .1, before.1 .1),
+                "columns are untouched"
+            );
+        });
+    }
+
+    #[tokio::test]
+    async fn a_landed_history_page_leaves_other_panes_selections_alone() {
+        with_test_ctx(vec![RemoteDescriptor::local()], |ctx| {
+            // Two panes, each with its own stream. p_1_2's stream receives
+            // the page; the selection lives on p_1_1.
+            let mut mirror = mirror_with_panes(2);
+            for (public, stream_id) in [("p_1_1", 3u32), ("p_1_2", 4)] {
+                let replica = crate::terminal::replica::PaneReplica::open(
+                    "alpha bravo charlie\r\n",
+                    10,
+                    Some("cursor-1".to_owned()),
+                    80,
+                    24,
+                    1024 * 1024,
+                )
+                .expect("replica opens");
+                mirror.stream_opened(public, stream_id, replica);
+            }
+            *ctx.mirrors.local_mut() = mirror;
+            compose_and_lay_out(ctx);
+
+            let untouched_pane = ctx
+                .ids
+                .composed_pane_id(LOCAL_REMOTE_INDEX, "p_1_1")
+                .expect("p_1_1 is composed");
+            let mut selection = crate::selection::Selection::range(untouched_pane, 0, 0, 4, None);
+            assert!(selection.finish());
+            let before = selection.ordered_cells();
+            ctx.app.selection = Some(selection);
+
+            let (mut session, _server) = session_pair();
+            session
+                .pending
+                .insert("h1".to_owned(), Pending::History { stream_id: 4 });
+            ctx.links
+                .insert(LOCAL_REMOTE_INDEX, Link::Up(Box::new(session)));
+
+            handle_server_frame(
+                LOCAL_REMOTE_INDEX,
+                stream_history_frame("h1", 4, &tall_screen(30)),
+                ctx,
+            );
+
+            assert_eq!(
+                ctx.app
+                    .selection
+                    .as_ref()
+                    .expect("selection")
+                    .ordered_cells(),
+                before,
+                "a page on one pane must not renumber another pane's selection"
+            );
+        });
+    }
+
+    #[tokio::test]
+    async fn a_page_that_bakes_when_the_alternate_screen_ends_renumbers_too() {
+        with_test_ctx(vec![RemoteDescriptor::local()], |ctx| {
+            *ctx.mirrors.local_mut() = mirror_with_history("alpha bravo charlie\r\n", "cursor-1");
+            compose_and_lay_out(ctx);
+            let pane_id = ctx.app.workspaces[0]
+                .focused_pane_id()
+                .expect("composed focused pane");
+
+            let (mut session, _server) = session_pair();
+            session
+                .pending
+                .insert("h1".to_owned(), Pending::History { stream_id: 3 });
+            ctx.links
+                .insert(LOCAL_REMOTE_INDEX, Link::Up(Box::new(session)));
+
+            // The pane enters the alternate screen, so the page that arrives
+            // next can only queue - replaying primary history there would
+            // corrupt the alternate buffer.
+            handle_server_frame(
+                LOCAL_REMOTE_INDEX,
+                Frame {
+                    frame_type: FrameType::Data,
+                    stream_id: 3,
+                    payload: b"\x1b[?1049h\x1b[HALTSCREEN".to_vec(),
+                },
+                ctx,
+            );
+            let metrics = {
+                let source = MirrorPaneSource::new(ctx.mirrors.local());
+                ctx.app.pane_scroll_metrics(&source, pane_id)
+            };
+            let mut selection = crate::selection::Selection::range(pane_id, 0, 0, 4, metrics);
+            assert!(selection.finish());
+            let before = selection.ordered_cells();
+            ctx.app.selection = Some(selection);
+
+            handle_server_frame(
+                LOCAL_REMOTE_INDEX,
+                stream_history_frame("h1", 3, &tall_screen(30)),
+                ctx,
+            );
+            assert_eq!(
+                ctx.app
+                    .selection
+                    .as_ref()
+                    .expect("selection")
+                    .ordered_cells(),
+                before,
+                "a queued page has not landed yet, so nothing moves"
+            );
+
+            // Leaving the alternate screen bakes the queued page in.
+            handle_server_frame(
+                LOCAL_REMOTE_INDEX,
+                Frame {
+                    frame_type: FrameType::Data,
+                    stream_id: 3,
+                    payload: b"\x1b[?1049l".to_vec(),
+                },
+                ctx,
+            );
+
+            let after = ctx
+                .app
+                .selection
+                .as_ref()
+                .expect("selection")
+                .ordered_cells();
+            assert!(
+                after.0 .0 > before.0 .0,
+                "the deferred bake renumbered the selection: {before:?} -> {after:?}"
+            );
+            assert_eq!(
+                after.0 .0 - before.0 .0,
+                after.1 .0 - before.1 .0,
+                "both ends moved by the same amount"
             );
         });
     }

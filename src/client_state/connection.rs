@@ -18,6 +18,10 @@ pub(crate) enum ClientConnectionState {
     Connected { negotiated: NegotiatedSession },
     /// Not connected; retrying. `attempt` counts consecutive failures.
     Offline { attempt: u32, last_error: String },
+    /// Reachable, herdr installed, but no server running there. Terminal
+    /// until the user says to start one: retrying cannot spawn a daemon, and
+    /// doing it unasked would write to someone else's machine.
+    Stopped { message: String },
     /// The protocol version windows do not overlap. Terminal for this
     /// configuration: no retries until a side is upgraded; the remedy names
     /// which one.
@@ -36,9 +40,15 @@ impl ClientConnectionState {
         matches!(self, Self::Connected { .. })
     }
 
-    /// Whether the run loop may start another connection attempt.
+    /// Whether the run loop may start another connection attempt. `Stopped`
+    /// and `Incompatible` are terminal: retrying cannot change either.
     pub(crate) fn may_retry(&self) -> bool {
         matches!(self, Self::Disconnected | Self::Offline { .. })
+    }
+
+    /// Whether this remote is waiting on an explicit start.
+    pub(crate) fn is_stopped(&self) -> bool {
+        matches!(self, Self::Stopped { .. })
     }
 
     /// A connect attempt started.
@@ -47,7 +57,10 @@ impl ClientConnectionState {
             Self::Offline { attempt, .. } | Self::Connecting { attempt } => {
                 attempt.saturating_add(1)
             }
-            Self::Disconnected | Self::Connected { .. } | Self::Incompatible { .. } => 1,
+            Self::Disconnected
+            | Self::Connected { .. }
+            | Self::Stopped { .. }
+            | Self::Incompatible { .. } => 1,
         };
         *self = Self::Connecting { attempt };
     }
@@ -67,6 +80,13 @@ impl ClientConnectionState {
         *self = Self::Offline {
             attempt,
             last_error: error.into(),
+        };
+    }
+
+    /// The far side has herdr but no running server.
+    pub(crate) fn stopped(&mut self, message: impl Into<String>) {
+        *self = Self::Stopped {
+            message: message.into(),
         };
     }
 

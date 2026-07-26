@@ -39,10 +39,24 @@ const MANAGED_INSTALL_DIR: &str = "$HOME/.local/bin";
 /// an unrelated failure that happens to mention one.
 pub const REMOTE_BINARY_MISSING_MARKER: &str = "herdr-bridge: remote binary not found";
 
+/// Printed by the far-side bridge when herdr is installed but no server is
+/// running for the requested session.
+///
+/// Like [`REMOTE_BINARY_MISSING_MARKER`] this is a contract, not a heuristic:
+/// the far side emits exactly this string, so "nothing is running there" is
+/// never confused with an unreachable host or a dead connection.
+pub const REMOTE_SERVER_STOPPED_MARKER: &str = "herdr-bridge: no server running";
+
 /// Whether a bridge failure's diagnostics say the far side has no herdr —
 /// the only failure a bootstrap install can fix.
 pub fn diagnostics_report_missing_binary(diagnostics: &str) -> bool {
     diagnostics.contains(REMOTE_BINARY_MISSING_MARKER)
+}
+
+/// Whether a bridge failure's diagnostics say the far side has herdr but no
+/// running server — the only failure an explicit `remote start` can fix.
+pub fn diagnostics_report_stopped_server(diagnostics: &str) -> bool {
+    diagnostics.contains(REMOTE_SERVER_STOPPED_MARKER)
 }
 
 /// Pumps `reader` into `tail` until EOF, keeping only the newest
@@ -76,7 +90,13 @@ fn pump_stderr_tail(mut reader: impl Read, tail: &Arc<Mutex<String>>) {
 /// anything path-shaped is a binary a `--remote` launch already located, so it
 /// is execed verbatim.
 pub fn remote_bridge_command_for(program: &str, session: &str) -> String {
-    let args = bridge_args(session);
+    remote_bridge_command_with(program, session, false)
+}
+
+/// As [`remote_bridge_command_for`], but `start` permits the far side to
+/// spawn a server if none is running. Only an explicit start passes true.
+pub fn remote_bridge_command_with(program: &str, session: &str, start: bool) -> String {
+    let args = bridge_args(session, start);
     if !is_bare_binary_name(program) {
         return format!("exec {program}{args}");
     }
@@ -91,13 +111,16 @@ pub fn remote_bridge_command_for(program: &str, session: &str) -> String {
 
 /// `--session S` (omitted for the default session) followed by the
 /// subcommand: the tail every form of the bridge command ends with.
-fn bridge_args(session: &str) -> String {
+fn bridge_args(session: &str, start: bool) -> String {
     let mut args = String::new();
     if session != crate::session::DEFAULT_SESSION_NAME {
         args.push_str(" --session ");
         args.push_str(&crate::remote::shell_quote(session));
     }
     args.push_str(" bridge");
+    if start {
+        args.push_str(" --start");
+    }
     args
 }
 
@@ -125,6 +148,41 @@ fn resolve_script(program: &str, args: &str) -> String {
          exit 127\n",
         report = crate::remote::shell_quote(&report)
     )
+}
+
+/// Starts a herdr server on `target` over one `bridge --start`, and waits
+/// for it to come up.
+///
+/// The single implementation behind every explicit start: the fleet manager's
+/// `remote.start` and the pure client's confirmation prompt both call it, so
+/// they cannot drift apart on which binary they run or what counts as
+/// success. `program` is the binary the caller already resolved for this
+/// remote — a pinned path from `--remote`, else the fork's own name — because
+/// starting a *different* binary than the one being connected is how a remote
+/// ends up serving two versions.
+///
+/// Closing both pipe halves makes the far side pump nothing and exit as soon
+/// as its daemon is up, so the child's exit status is the answer. Reading its
+/// stdout instead would block forever: the framed protocol has the client
+/// speak first, so a healthy bridge writes nothing on its own.
+pub fn start_remote_server(target: &str, session: &str, program: &str) -> Result<(), String> {
+    let (child, stdout, stdin) = BridgeChild::spawn_program_with(target, session, program, true)
+        .map_err(|err| format!("ssh bridge spawn failed: {err}"))?;
+    drop((stdout, stdin));
+    let status = child.wait().map_err(|err| err.to_string())?;
+    if status.success() {
+        return Ok(());
+    }
+    let tail = child
+        .stderr_tail()
+        .lock()
+        .map(|tail| tail.trim().replace('\n', "; "))
+        .unwrap_or_default();
+    Err(if tail.is_empty() {
+        format!("the bridge exited with {status}")
+    } else {
+        tail
+    })
 }
 
 /// A live SSH bridge child. Dropping it kills and reaps the child, which
@@ -159,11 +217,19 @@ impl BridgeChild {
     /// Spawns the bridge child for `target`/`session` with piped stdio and a
     /// background thread capturing stderr into a bounded tail.
     pub fn spawn(target: &str, session: &str) -> io::Result<(Self, ChildStdout, ChildStdin)> {
+        Self::spawn_with(target, session, false)
+    }
+
+    fn spawn_with(
+        target: &str,
+        session: &str,
+        start: bool,
+    ) -> io::Result<(Self, ChildStdout, ChildStdin)> {
         // The fleet bridge is a separate path from the `--remote` bootstrap:
         // it invokes the remote binary by bare name over ssh, so it has to ask
         // for the fork's name or it finds an unrelated upstream herdr (or, as
         // reported, nothing at all).
-        Self::spawn_program(target, session, crate::identity::BRAND)
+        Self::spawn_program_with(target, session, crate::identity::BRAND, start)
     }
 
     /// Spawns the bridge child running an explicit remote herdr path.
@@ -172,13 +238,22 @@ impl BridgeChild {
         session: &str,
         program: &str,
     ) -> io::Result<(Self, ChildStdout, ChildStdin)> {
+        Self::spawn_program_with(target, session, program, false)
+    }
+
+    fn spawn_program_with(
+        target: &str,
+        session: &str,
+        program: &str,
+        start: bool,
+    ) -> io::Result<(Self, ChildStdout, ChildStdin)> {
         let mut command = Command::new("ssh");
         command
             .arg("-T")
             .arg("-o")
             .arg("BatchMode=yes")
             .arg(target)
-            .arg(remote_bridge_command_for(program, session))
+            .arg(remote_bridge_command_with(program, session, start))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -214,6 +289,21 @@ impl BridgeChild {
             stdout,
             stdin,
         ))
+    }
+
+    /// Waits for the child to exit and returns its status.
+    ///
+    /// Used by the explicit start, whose whole job is the daemon the child
+    /// leaves behind: with stdin closed the far side pumps nothing, sees
+    /// EOF and exits, so its status *is* the answer. Reading its stdout
+    /// would block forever instead - the framed protocol has the client
+    /// speak first, so a healthy bridge writes nothing on its own.
+    pub fn wait(&self) -> io::Result<std::process::ExitStatus> {
+        let mut child = self
+            .child
+            .lock()
+            .map_err(|_| io::Error::other("bridge child mutex is poisoned"))?;
+        child.wait()
     }
 
     /// Shared handle to the bounded stderr tail for failure diagnostics.
@@ -295,6 +385,29 @@ mod tests {
     }
 
     #[test]
+    fn the_three_far_side_outcomes_are_told_apart_by_their_own_markers() {
+        // The manager routes on these: a missing binary is installed, a
+        // stopped server is offered a start, and everything else retries.
+        // Each marker must therefore match only its own failure.
+        let missing = format!("bridge closed (ssh: {REMOTE_BINARY_MISSING_MARKER}: overherdr)");
+        let stopped =
+            format!("bridge closed (ssh: {REMOTE_SERVER_STOPPED_MARKER} for session default)");
+        let unreachable = "bridge closed (ssh: Permission denied (publickey))";
+
+        assert!(diagnostics_report_missing_binary(&missing));
+        assert!(!diagnostics_report_stopped_server(&missing));
+
+        assert!(diagnostics_report_stopped_server(&stopped));
+        assert!(
+            !diagnostics_report_missing_binary(&stopped),
+            "a stopped server must never trigger a bootstrap install"
+        );
+
+        assert!(!diagnostics_report_missing_binary(unreachable));
+        assert!(!diagnostics_report_stopped_server(unreachable));
+    }
+
+    #[test]
     fn a_pinned_path_is_execed_verbatim() {
         // `--remote` already discovered or installed this exact binary;
         // re-resolving could pick a different one.
@@ -328,14 +441,17 @@ mod tests {
 
     #[test]
     fn bridge_command_quotes_named_session() {
-        assert_eq!(bridge_args("default"), " bridge");
-        assert_eq!(bridge_args("work"), " --session work bridge");
+        assert_eq!(bridge_args("default", false), " bridge");
+        assert_eq!(bridge_args("work", false), " --session work bridge");
         assert_eq!(
-            bridge_args("with'quote"),
+            bridge_args("with'quote", false),
             " --session 'with'\\''quote' bridge"
         );
+        // Only an explicit start may spawn a server on the far side.
+        assert_eq!(bridge_args("default", true), " bridge --start");
+        assert_eq!(bridge_args("work", true), " --session work bridge --start");
         // Both resolver branches carry the same quoted session through.
-        let script = resolve_script("overherdr", &bridge_args("with'quote"));
+        let script = resolve_script("overherdr", &bridge_args("with'quote", false));
         assert_eq!(
             script.matches(" --session 'with'\\''quote' bridge").count(),
             2,

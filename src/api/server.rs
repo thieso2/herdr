@@ -365,6 +365,7 @@ fn api_method_name(method: &Method) -> &'static str {
         Method::SessionSnapshot(_) => "session.snapshot",
         Method::RemoteList(_) => "remote.list",
         Method::RemoteReset(_) => "remote.reset",
+        Method::RemoteStart(_) => "remote.start",
         Method::RemoteReload(_) => "remote.reload",
         Method::WorkspaceCreate(_) => "workspace.create",
         Method::WorkspaceList(_) => "workspace.list",

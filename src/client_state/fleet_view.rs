@@ -214,6 +214,7 @@ fn chip_connection(connection: &ClientConnectionState) -> RemoteChipConnection {
         ClientConnectionState::Disconnected | ClientConnectionState::Offline { .. } => {
             RemoteChipConnection::Offline
         }
+        ClientConnectionState::Stopped { .. } => RemoteChipConnection::Stopped,
         ClientConnectionState::Incompatible { .. } => RemoteChipConnection::Incompatible,
     }
 }

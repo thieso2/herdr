@@ -91,6 +91,16 @@ pub fn incompatible_status_line(
     }
 }
 
+/// The dimmed remote's status line: what is wrong and the exact command that
+/// fixes it, in the same shape as [`incompatible_status_line`]. Shared by the
+/// fleet manager and the pure client so both say the same thing.
+pub fn stopped_status_line(name: &str) -> String {
+    format!(
+        "no {brand} server running on {name}; run `{brand} remote start {name}`",
+        brand = crate::identity::BRAND
+    )
+}
+
 /// Connection lifecycle of one remote. Plain data; renders directly into the
 /// `remote list` state column.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -113,6 +123,11 @@ pub enum ConnectionState {
         retry_at: Instant,
         last_error: String,
     },
+    /// Reachable, herdr installed, but no server running there. Terminal
+    /// until asked: retrying cannot help, because only an explicit start
+    /// writes a new daemon to that host. `remote start` (or the TUI's
+    /// confirmation) leaves this state; a manual reset re-probes.
+    Stopped { message: String },
     /// The protocol version windows do not overlap. Terminal for this
     /// configuration: no automatic retries until a side is upgraded; a manual
     /// reset or config change forces another attempt.
@@ -196,6 +211,7 @@ impl ConnectionMachine {
             ConnectionState::Connected { .. }
             | ConnectionState::Local
             | ConnectionState::Disabled
+            | ConnectionState::Stopped { .. }
             | ConnectionState::Incompatible { .. } => return,
         };
         self.state = ConnectionState::Connecting { attempt };
@@ -209,6 +225,21 @@ impl ConnectionMachine {
             _ => {}
         }
         self.state = ConnectionState::Connected { since: now };
+    }
+
+    /// The far side has herdr but no running server. Terminal until an
+    /// explicit start: automatic retries cannot bring a daemon up, and
+    /// hammering a reachable host to re-learn the same fact is pure noise.
+    pub fn on_stopped(&mut self, message: impl Into<String>) {
+        if matches!(
+            self.state,
+            ConnectionState::Local | ConnectionState::Disabled
+        ) {
+            return;
+        }
+        self.state = ConnectionState::Stopped {
+            message: message.into(),
+        };
     }
 
     /// The handshake failed because the protocol version windows do not
@@ -245,6 +276,7 @@ impl ConnectionMachine {
             ConnectionState::Offline { attempt, .. } => attempt.saturating_add(1),
             ConnectionState::Local
             | ConnectionState::Disabled
+            | ConnectionState::Stopped { .. }
             | ConnectionState::Incompatible { .. } => return,
         };
         self.state = ConnectionState::Offline {
@@ -507,6 +539,41 @@ mod tests {
         assert!(line.contains("the local herdr server"), "{line}");
         assert!(line.contains("herdr update"), "{line}");
         assert!(!line.contains("remote upgrade"), "{line}");
+    }
+
+    #[test]
+    fn stopped_is_terminal_until_started_or_reset() {
+        let now = Instant::now();
+        let mut machine = machine(now);
+        machine.on_connect_started();
+        machine.on_stopped("no server running on gpu-1");
+        assert_eq!(
+            machine.state(),
+            &ConnectionState::Stopped {
+                message: "no server running on gpu-1".into()
+            }
+        );
+
+        // Retrying cannot start a daemon, so the ladder stops entirely: no
+        // deadline, never ready, and every automatic transition is inert.
+        assert!(!machine.ready_to_connect(now + Duration::from_secs(3600)));
+        assert_eq!(machine.next_deadline(), None);
+        machine.on_connect_started();
+        machine.on_disconnected(now, "noise".into(), 0.5);
+        assert!(matches!(machine.state(), ConnectionState::Stopped { .. }));
+
+        // A reset re-probes: the user may have started it out of band.
+        machine.on_reset(now);
+        assert!(machine.ready_to_connect(now));
+
+        // Disabled and local runtimes never become stopped - neither has a
+        // bridge that could report it.
+        let mut disabled = ConnectionMachine::new(false, now, T);
+        disabled.on_stopped("x");
+        assert_eq!(disabled.state(), &ConnectionState::Disabled);
+        let mut local = ConnectionMachine::new_local(true, T);
+        local.on_stopped("x");
+        assert_eq!(local.state(), &ConnectionState::Local);
     }
 
     #[test]

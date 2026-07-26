@@ -26,7 +26,8 @@ use super::bridge_child::{self, BridgeChild};
 use super::client;
 use super::config::{diff_remotes, sanitize_entries, RemoteChange, RemoteEntry};
 use super::connection::{
-    incompatible_status_line, BackoffTuning, ConnectionMachine, ConnectionState,
+    incompatible_status_line, stopped_status_line, BackoffTuning, ConnectionMachine,
+    ConnectionState,
 };
 use crate::protocol::framed::{
     parse_pong, parse_session_welcome, ping_request, read_frame, session_hello_request, Frame,
@@ -103,6 +104,13 @@ pub trait FleetTransport: Send + Sync {
     fn repair(&self, _entry: &RemoteEntry, _failure: &str) -> Option<FleetRepair> {
         None
     }
+
+    /// Starts a server on the far side. Called only from an explicit user
+    /// action, never from the reconnect loop: it writes a daemon to that host
+    /// that outlives the connection.
+    fn start_server(&self, _entry: &RemoteEntry) -> io::Result<()> {
+        Err(io::Error::other("this transport cannot start a server"))
+    }
 }
 
 /// The production transport: a persistent SSH stdio bridge child per
@@ -155,6 +163,22 @@ impl FleetTransport for SshBridgeTransport {
             ))),
         }
     }
+
+    /// Runs one `bridge --start` on the far side. The child is dropped as
+    /// soon as the far side answers, because all we want is the daemon it
+    /// spawned; the fleet's own reconnect establishes the real session.
+    fn start_server(&self, entry: &RemoteEntry) -> io::Result<()> {
+        let target = entry.target.as_deref().ok_or_else(|| {
+            io::Error::other(format!(
+                "remote '{}' is a local runtime; it has no remote server to start",
+                entry.name
+            ))
+        })?;
+        // Saved fleet remotes are resolved by name on the far side; a
+        // `--remote` launch pins its own path and never reaches this manager.
+        bridge_child::start_remote_server(target, &entry.session, crate::identity::BRAND)
+            .map_err(|err| io::Error::other(format!("starting the remote server failed: {err}")))
+    }
 }
 
 /// Point-in-time connection state of one remote, converted to plain
@@ -172,6 +196,11 @@ pub enum RemoteStatusKind {
         attempt: u32,
         retry_in: Duration,
         last_error: String,
+    },
+    /// Reachable with herdr installed, but no server running there. No
+    /// automatic retries: only an explicit start can change it.
+    Stopped {
+        message: String,
     },
     /// The protocol version windows do not overlap; no automatic retries
     /// until a side is upgraded or a manual reset forces another attempt.
@@ -280,6 +309,31 @@ impl FleetManager {
             .filter_map(|name| shared.remotes.get(name))
             .map(|runtime| runtime.entry.clone())
             .collect()
+    }
+
+    /// Starts a server on one remote, then reconnects to it immediately.
+    ///
+    /// Only ever reached from an explicit user action: this is the one path
+    /// that spawns a daemon on someone else's machine.
+    pub fn start_remote(&mut self, name: &str) -> io::Result<()> {
+        let entry = {
+            let shared = self
+                .shared
+                .lock()
+                .map_err(|_| io::Error::other("fleet state is poisoned"))?;
+            shared
+                .remotes
+                .get(name)
+                .map(|runtime| runtime.entry.clone())
+                .ok_or_else(|| io::Error::other(format!("unknown remote '{name}'")))?
+        };
+        if !entry.enabled {
+            return Err(io::Error::other(format!("remote '{name}' is disabled")));
+        }
+        self.transport.start_server(&entry)?;
+        // Leave the terminal `Stopped` state and reconnect now.
+        self.reset(name);
+        Ok(())
     }
 
     /// Manual reset: clear the backoff and force an immediate reconnect.
@@ -437,6 +491,9 @@ fn status_kind(machine: &ConnectionMachine, now: Instant) -> RemoteStatusKind {
             retry_in: retry_at.saturating_duration_since(now),
             last_error: last_error.clone(),
         },
+        ConnectionState::Stopped { message } => RemoteStatusKind::Stopped {
+            message: message.clone(),
+        },
         ConnectionState::Incompatible { message } => RemoteStatusKind::Incompatible {
             message: message.clone(),
         },
@@ -467,6 +524,9 @@ struct Worker {
 }
 
 enum SessionEnd {
+    /// Any end that is not a clean stop. A far side reporting "no server
+    /// running" arrives here too and is classified out of the diagnostics,
+    /// because that is where the bridge's stderr tail is available.
     Failed(String),
     /// The handshake was rejected because the protocol windows do not
     /// overlap; the machine parks in `Incompatible` with no retries.
@@ -535,6 +595,19 @@ impl Worker {
                 }
                 SessionEnd::Failed(reason) => {
                     let reason = append_diagnostics(reason, diagnostics.as_ref());
+                    // A far side that reported "no server running" is not an
+                    // outage to retry: only an explicit start changes it.
+                    if bridge_child::diagnostics_report_stopped_server(&reason) {
+                        info!(remote = %self.name, "fleet remote has no server running; parking until started");
+                        let line = stopped_status_line(&self.name);
+                        if self
+                            .with_machine(|machine| machine.on_stopped(line))
+                            .is_none()
+                        {
+                            return;
+                        }
+                        continue;
+                    }
                     debug!(remote = %self.name, reason = %reason, "fleet remote disconnected");
                     match self.repair(&entry, &reason, &mut last_repair) {
                         Some(FleetRepair::Repaired(note)) => {
@@ -1431,6 +1504,138 @@ mod tests {
                 > 1),
             "a manual reset must clear the repair cooldown"
         );
+        manager.stop();
+    }
+
+    /// Transport standing in for a reachable remote with herdr installed but
+    /// no server running: connections die reporting the stopped marker until
+    /// an explicit `start_server` brings one up.
+    struct StoppedTransport {
+        running: Mutex<bool>,
+        starts: AtomicUsize,
+        connects: AtomicUsize,
+    }
+
+    impl StoppedTransport {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                running: Mutex::new(false),
+                starts: AtomicUsize::new(0),
+                connects: AtomicUsize::new(0),
+            })
+        }
+    }
+
+    impl FleetTransport for StoppedTransport {
+        fn connect(&self, _entry: &RemoteEntry) -> io::Result<FleetIo> {
+            self.connects.fetch_add(1, Ordering::SeqCst);
+            let (client_read, server_write) = io::pipe()?;
+            let (server_read, client_write) = io::pipe()?;
+            if *self.running.lock().unwrap() {
+                std::thread::spawn(move || {
+                    fake_framed_server(
+                        server_read,
+                        server_write,
+                        FakeBehavior::ServeWelcomeAndPongs,
+                    )
+                });
+                return Ok(FleetIo {
+                    reader: Box::new(client_read),
+                    writer: Box::new(client_write),
+                    guard: None,
+                    diagnostics: None,
+                });
+            }
+            drop((server_read, server_write));
+            let diagnostics = Arc::new(Mutex::new(format!(
+                "{}: session default\n",
+                bridge_child::REMOTE_SERVER_STOPPED_MARKER
+            )));
+            Ok(FleetIo {
+                reader: Box::new(client_read),
+                writer: Box::new(client_write),
+                guard: None,
+                diagnostics: Some(diagnostics),
+            })
+        }
+
+        fn start_server(&self, _entry: &RemoteEntry) -> io::Result<()> {
+            self.starts.fetch_add(1, Ordering::SeqCst);
+            *self.running.lock().unwrap() = true;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_remote_with_no_server_parks_stopped_instead_of_retrying() {
+        let transport = StoppedTransport::new();
+        // A backoff far shorter than the test: if the remote were retrying,
+        // the connect count would climb. Parking means it does not.
+        let mut manager = FleetManager::start(
+            vec![entry("gpu-1")],
+            Arc::clone(&transport) as Arc<dyn FleetTransport>,
+            tuning(Duration::from_millis(10)),
+            noop_hook(),
+        );
+
+        assert!(
+            wait_for(Duration::from_secs(5), || matches!(
+                kind_of(&manager, "gpu-1"),
+                Some(RemoteStatusKind::Stopped { .. })
+            )),
+            "a far side with no server must park, not retry: {:?}",
+            kind_of(&manager, "gpu-1")
+        );
+        let Some(RemoteStatusKind::Stopped { message }) = kind_of(&manager, "gpu-1") else {
+            panic!("expected a stopped status");
+        };
+        // The dimmed row says the exact command that fixes it.
+        assert!(message.contains("remote start gpu-1"), "{message}");
+
+        // Terminal: the retry ladder really is stopped, and nothing was
+        // started on the far side without being asked.
+        let settled = transport.connects.load(Ordering::SeqCst);
+        assert!(!wait_for(Duration::from_millis(300), || transport
+            .connects
+            .load(Ordering::SeqCst)
+            > settled + 1));
+        assert_eq!(
+            transport.starts.load(Ordering::SeqCst),
+            0,
+            "a reconnect must never spawn a daemon on someone else's machine"
+        );
+
+        // The explicit start is what leaves the state.
+        manager.start_remote("gpu-1").expect("start succeeds");
+        assert_eq!(transport.starts.load(Ordering::SeqCst), 1);
+        assert!(
+            wait_for(Duration::from_secs(5), || matches!(
+                kind_of(&manager, "gpu-1"),
+                Some(RemoteStatusKind::Connected)
+            )),
+            "starting reconnects immediately: {:?}",
+            kind_of(&manager, "gpu-1")
+        );
+        manager.stop();
+    }
+
+    #[test]
+    fn starting_an_unknown_or_disabled_remote_is_refused() {
+        let transport = StoppedTransport::new();
+        let mut disabled = entry("off");
+        disabled.enabled = false;
+        let mut manager = FleetManager::start(
+            vec![disabled],
+            Arc::clone(&transport) as Arc<dyn FleetTransport>,
+            tuning(Duration::from_millis(10)),
+            noop_hook(),
+        );
+
+        let err = manager.start_remote("nope").expect_err("unknown remote");
+        assert!(err.to_string().contains("unknown remote"), "{err}");
+        let err = manager.start_remote("off").expect_err("disabled remote");
+        assert!(err.to_string().contains("disabled"), "{err}");
+        assert_eq!(transport.starts.load(Ordering::SeqCst), 0);
         manager.stop();
     }
 

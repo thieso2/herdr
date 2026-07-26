@@ -104,6 +104,25 @@ A saved remote with no `herdr` at all is bootstrapped in place: Herdr installs t
 
 A failed bootstrap is reported in the remote's `remote list` detail and retried at most once every five minutes. `herdr remote reset <name>` retries immediately.
 
+### Starting a stopped remote
+
+Connecting never starts a server. A remote that is reachable and has Herdr installed but has nothing running reports `stopped` and dims — it is not retried, because no number of reconnects can bring a daemon up, and spawning one writes to that machine and outlives the connection:
+
+```text
+#  name    state    target              session  enabled  detail
+0  gpu-1   stopped  can@gpu-1.example   default  yes      no herdr server running on gpu-1; run `herdr remote start gpu-1`
+```
+
+Start it explicitly:
+
+```bash
+herdr remote start gpu-1
+```
+
+In the TUI the same thing surfaces as a confirmation over the fleet view — `↵ start` / `esc not now`. Declining leaves the remote dimmed; clicking its dimmed chip offers the start again. Either way the server starts and the remote connects immediately, without waiting out a backoff.
+
+`herdr remote reset <name>` re-probes a stopped remote, which is what you want after starting one out of band.
+
 Native Windows `herdr --remote` is not part of the Windows beta. From Windows, SSH into the server and run `herdr` there.
 
 By default, `herdr --remote` runs remote setup and the bridge through a temporary SSH config that includes your SSH config first, then adds fallback keepalive settings and a private per-attach control socket for connection reuse. Existing user keepalive settings win. Set `[remote].manage_ssh_config = false` to use plain `ssh` without Herdr's generated config or control socket.

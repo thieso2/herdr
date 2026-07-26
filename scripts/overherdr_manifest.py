@@ -24,10 +24,10 @@ TAG_PREFIX = "overherdr-v"
 REPO = "thieso2/herdr"
 FORK_PATCH_FLOOR = 100
 
+# macOS x86_64 is deliberately not built: this fork ships Apple Silicon only.
 ASSET_TARGETS = (
     "linux-x86_64",
     "linux-aarch64",
-    "macos-x86_64",
     "macos-aarch64",
 )
 

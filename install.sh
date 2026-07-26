@@ -48,6 +48,11 @@ esac
 
 target="${os}-${arch}"
 
+# This fork builds Apple Silicon only on macOS; Linux keeps both arches.
+if [ "$target" = "macos-x86_64" ]; then
+    die "overherdr does not ship an Intel macOS build (Apple Silicon only). Build from source: https://github.com/thieso2/herdr/blob/master/OVERHERDR.md"
+fi
+
 manifest="$(fetch "$MANIFEST_URL")" || die "could not reach $MANIFEST_URL"
 [ -n "$manifest" ] || die "empty manifest at $MANIFEST_URL"
 

@@ -138,9 +138,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - target: x86_64-apple-darwin
-            os: macos-latest
-            name: overherdr-macos-x86_64
           - target: aarch64-apple-darwin
             os: macos-latest
             name: overherdr-macos-aarch64
@@ -216,7 +213,7 @@ jobs:
           set -eu
           mkdir -p release
           for name in overherdr-linux-x86_64 overherdr-linux-aarch64 \
-                      overherdr-macos-x86_64 overherdr-macos-aarch64; do
+                      overherdr-macos-aarch64; do
             [ -f "artifacts/$name" ] || { echo "error: missing $name" >&2; exit 1; }
             cp "artifacts/$name" "release/$name"
             chmod 755 "release/$name"

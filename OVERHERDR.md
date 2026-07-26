@@ -22,7 +22,7 @@ Known rough edges at the time of writing:
 curl -fsSL https://raw.githubusercontent.com/thieso2/herdr/master/install.sh | sh
 ```
 
-Installs an `overherdr` binary into `~/.local/bin` (override with `OVERHERDR_INSTALL_DIR`). Linux and macOS, x86_64 and aarch64. Binaries are unsigned; a `curl` install is not quarantined, but if you download one through a browser on macOS you will need `xattr -d com.apple.quarantine`.
+Installs an `overherdr` binary into `~/.local/bin` (override with `OVERHERDR_INSTALL_DIR`). Built targets are Linux x86_64, Linux aarch64 and macOS aarch64 — **Apple Silicon only on macOS**, and no Windows build. Intel Macs and Windows have to build from source. Binaries are unsigned; a `curl` install is not quarantined, but if you download one through a browser on macOS you will need `xattr -d com.apple.quarantine`.
 
 Update in place with `overherdr update`, which reads this fork's own manifest.
 

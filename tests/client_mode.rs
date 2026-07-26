@@ -118,11 +118,13 @@ fn spawn_server(
     api_socket_path: &PathBuf,
     _client_socket_path: &PathBuf,
 ) -> SpawnedHerdr {
-    fs::create_dir_all(config_home.join("herdr")).unwrap();
+    fs::create_dir_all(config_home.join(support::app_dir_name())).unwrap();
     fs::create_dir_all(runtime_dir).unwrap();
     register_runtime_dir(runtime_dir);
     fs::write(
-        config_home.join("herdr/config.toml"),
+        config_home
+            .join(support::app_dir_name())
+            .join("config.toml"),
         "onboarding = false\n",
     )
     .unwrap();
@@ -195,14 +197,6 @@ fn first_pane_id_in_workspace(socket_path: &PathBuf, workspace_id: &str) -> Stri
         thread::sleep(Duration::from_millis(25));
     }
     panic!("pane.list did not return a pane for workspace {workspace_id} before timeout");
-}
-
-fn app_dir_name() -> &'static str {
-    if cfg!(debug_assertions) {
-        "overherdr-dev"
-    } else {
-        "overherdr"
-    }
 }
 
 #[allow(dead_code)]
@@ -339,11 +333,7 @@ fn client_sees_headless_startup_config_diagnostic() {
     let api_socket = runtime_dir.join("herdr.sock");
     let client_socket = runtime_dir.join("herdr-client.sock");
 
-    let app_dir = if cfg!(debug_assertions) {
-        "overherdr-dev"
-    } else {
-        "overherdr"
-    };
+    let app_dir = support::app_dir_name();
     fs::create_dir_all(config_home.join(app_dir)).unwrap();
     fs::write(
         config_home.join(app_dir).join("config.toml"),
@@ -421,20 +411,84 @@ fn client_sees_headless_startup_config_diagnostic() {
 }
 
 #[test]
-fn server_unreachable_shows_clear_error() {
-    // when server is unreachable, the client exits quickly
-    // with an actionable connection-failed message.
+fn a_client_without_a_terminal_says_so_instead_of_panicking() {
+    // The pure client is a TUI, so it cannot run with stdout redirected.
+    // It must say that plainly rather than panicking out of terminal init.
     let _lock = test_lock();
     let base = unique_test_dir();
     let config_home = base.join("config");
     let runtime_dir = base.join("runtime");
     let api_socket = runtime_dir.join("herdr.sock");
 
-    fs::create_dir_all(config_home.join("herdr")).unwrap();
+    fs::create_dir_all(&runtime_dir).unwrap();
+    register_runtime_dir(&runtime_dir);
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_herdr"))
+        .arg("client")
+        .env("HERDR_DISABLE_SOUND", "1")
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_RUNTIME_DIR", &runtime_dir)
+        .env("HERDR_SOCKET_PATH", &api_socket)
+        .env_remove("HERDR_PURE_CLIENT")
+        .env_remove("HERDR_CLIENT_SOCKET_PATH")
+        .env_remove("HERDR_ENV")
+        .env_remove("HERDR_STARTUP_CWD")
+        .output()
+        .expect("client command should run");
+
+    // The guard lives in the run loop both entry points share, so the
+    // `--remote` client answers the same way. That path cannot be driven
+    // here: it exits at ssh host resolution before reaching the TUI.
+    assert_no_terminal_refusal(&output);
+
+    cleanup_test_base(&base);
+}
+
+/// The refusal a TUI owes a caller with stdout redirected: plain lines, the
+/// fork's own binary name, no Rust error dump, and no raw panic.
+fn assert_no_terminal_refusal(output: &std::process::Output) {
+    assert!(
+        !output.status.success(),
+        "the client cannot succeed with nowhere to draw"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("needs a terminal"),
+        "stderr should name the real problem: {stderr}"
+    );
+    assert!(
+        !stderr.contains("failed to initialize terminal"),
+        "the raw terminal-init panic must not reach the user: {stderr}"
+    );
+    assert!(
+        !stderr.contains("Custom {") && !stderr.contains("\\n"),
+        "the message must be printed, not dumped as a Debug io::Error: {stderr}"
+    );
+    assert!(
+        stderr.contains("overherdr"),
+        "commands the user is told to type must name this fork: {stderr}"
+    );
+}
+
+#[test]
+fn legacy_client_server_unreachable_shows_clear_error() {
+    // when server is unreachable, the legacy client exits quickly
+    // with an actionable connection-failed message. The pure client shows
+    // connection state in the fleet view instead, so this pins the legacy
+    // path explicitly.
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let api_socket = runtime_dir.join("herdr.sock");
+
+    fs::create_dir_all(config_home.join(support::app_dir_name())).unwrap();
     fs::create_dir_all(&runtime_dir).unwrap();
     register_runtime_dir(&runtime_dir);
     fs::write(
-        config_home.join("herdr/config.toml"),
+        config_home
+            .join(support::app_dir_name())
+            .join("config.toml"),
         "onboarding = false\n",
     )
     .unwrap();
@@ -442,6 +496,7 @@ fn server_unreachable_shows_clear_error() {
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_herdr"))
         .arg("client")
         .env("HERDR_DISABLE_SOUND", "1")
+        .env("HERDR_PURE_CLIENT", "0")
         .env("XDG_CONFIG_HOME", &config_home)
         .env("XDG_RUNTIME_DIR", &runtime_dir)
         .env("HERDR_SOCKET_PATH", &api_socket)
@@ -654,7 +709,7 @@ fn pane_spawn_cwd_fallback_in_server() {
     let runtime_dir = base.join("runtime");
     let api_socket = runtime_dir.join("herdr.sock");
     let client_socket = runtime_dir.join("herdr-client.sock");
-    let data_dir = config_home.join(app_dir_name());
+    let data_dir = config_home.join(support::app_dir_name());
     let missing_cwd = base.join("missing-cwd-for-test");
     let missing_cwd = missing_cwd.to_str().expect("test cwd should be UTF-8");
     fs::create_dir_all(&data_dir).unwrap();
@@ -786,9 +841,11 @@ fn client_receives_notify_on_agent_state_change() {
     let client_socket = runtime_dir.join("herdr-client.sock");
 
     // Enable toast and sound in config so the server produces notifications.
-    fs::create_dir_all(config_home.join("herdr")).unwrap();
+    fs::create_dir_all(config_home.join(support::app_dir_name())).unwrap();
     fs::write(
-        config_home.join("herdr/config.toml"),
+        config_home
+            .join(support::app_dir_name())
+            .join("config.toml"),
         "onboarding = false\n[ui.toast]\nenabled = true\n[ui.sound]\nenabled = true\n",
     )
     .unwrap();

@@ -17,7 +17,7 @@
 #![cfg(unix)]
 
 use std::collections::{HashMap, HashSet};
-use std::io::{self, Write as _};
+use std::io::{self, IsTerminal as _, Write as _};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
@@ -651,6 +651,17 @@ fn run_pure_client_over(
     mut mirrors: RemoteMirrors,
     source: FleetSource,
 ) -> io::Result<bool> {
+    // A TUI has nowhere to draw with stdout redirected, and `ratatui::init`
+    // below answers that by panicking with a raw OS error. Say what is
+    // actually wrong instead. Guarded here rather than in either entry point
+    // so `--remote` gets the same answer as the plain client.
+    if !io::stdout().is_terminal() {
+        let brand = crate::identity::BRAND;
+        eprintln!("{brand} client needs a terminal: stdout is not a TTY.");
+        eprintln!("Run it from a terminal, or run `{brand} server` for a headless server.");
+        std::process::exit(1);
+    }
+
     // Terminal graphics respect the same [experimental] kitty_graphics gate
     // as the server render path: replicas ingest kitty APC data from the
     // pane DATA stream, and the pure client paints visible placements onto

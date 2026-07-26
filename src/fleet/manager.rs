@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 
 use tracing::{debug, info, warn};
 
-use super::bridge_child::BridgeChild;
+use super::bridge_child::{self, BridgeChild};
 use super::client;
 use super::config::{diff_remotes, sanitize_entries, RemoteChange, RemoteEntry};
 use super::connection::{
@@ -35,6 +35,12 @@ use crate::protocol::framed::{
 
 /// Fallback wait when a worker has no scheduled deadline.
 const IDLE_POLL: Duration = Duration::from_millis(500);
+
+/// Minimum spacing between [`FleetTransport::repair`] attempts for one remote.
+/// A repair can download and install a binary, so a host that keeps failing
+/// the same way must not turn the retry ladder into a download loop; a manual
+/// reset clears the cooldown for an impatient user.
+const REPAIR_COOLDOWN: Duration = Duration::from_secs(300);
 
 /// Timing knobs, injectable so tests run in milliseconds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -68,10 +74,35 @@ pub struct FleetIo {
     pub diagnostics: Option<Arc<Mutex<String>>>,
 }
 
+/// What a transport did about a failed connection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FleetRepair {
+    /// The cause of the failure was removed; reconnect now instead of waiting
+    /// out the backoff. The string says what changed.
+    Repaired(String),
+    /// The transport recognized the failure but could not fix it. The string
+    /// replaces the failure reason, because why the *repair* failed is more
+    /// actionable than the symptom that triggered it.
+    Failed(String),
+}
+
 /// Connection factory for one remote. Injected so the connection lifecycle is
 /// testable without SSH.
 pub trait FleetTransport: Send + Sync {
     fn connect(&self, entry: &RemoteEntry) -> io::Result<FleetIo>;
+
+    /// Given a failed connection's reason (diagnostics included), optionally
+    /// repair the remote so the next attempt can succeed. Called at most once
+    /// per [`REPAIR_COOLDOWN`] per remote, on a worker thread that is already
+    /// in backoff, so blocking here is fine.
+    ///
+    /// `None` — the default — means this transport has nothing to offer for
+    /// this failure, which is the common case: almost every bridge failure
+    /// (bad key, unreachable host, protocol skew) is not the transport's to
+    /// fix.
+    fn repair(&self, _entry: &RemoteEntry, _failure: &str) -> Option<FleetRepair> {
+        None
+    }
 }
 
 /// The production transport: a persistent SSH stdio bridge child per
@@ -88,6 +119,31 @@ impl FleetTransport for SshBridgeTransport {
             guard: Some(Box::new(child)),
             diagnostics,
         })
+    }
+
+    /// Bootstraps a saved remote that has no herdr at all.
+    ///
+    /// Scoped by the bridge resolver's own marker, so this only ever fires for
+    /// the one failure an install fixes — and the installer itself refuses to
+    /// overwrite an existing binary, keeping "upgrade a remote" explicit.
+    fn repair(&self, entry: &RemoteEntry, failure: &str) -> Option<FleetRepair> {
+        if !bridge_child::diagnostics_report_missing_binary(failure) {
+            return None;
+        }
+        let brand = crate::identity::BRAND;
+        info!(
+            remote = %entry.name,
+            target = %entry.target,
+            "remote has no {brand}; installing it"
+        );
+        match crate::remote::install_missing_remote_binary(&entry.target) {
+            Ok(version) => Some(FleetRepair::Repaired(format!(
+                "installed {brand} {version} on the remote"
+            ))),
+            Err(err) => Some(FleetRepair::Failed(format!(
+                "no {brand} on the remote and installing it failed: {err}"
+            ))),
+        }
     }
 }
 
@@ -402,9 +458,10 @@ enum SessionEnd {
 impl Worker {
     fn run(self, rx: mpsc::Receiver<WorkerMsg>) {
         let mut generation: u64 = 0;
+        let mut last_repair: Option<Instant> = None;
         loop {
             // Wait until the machine schedules a connection attempt.
-            match self.wait_until_ready(&rx) {
+            match self.wait_until_ready(&rx, &mut last_repair) {
                 Ok(()) => {}
                 Err(()) => return,
             }
@@ -448,6 +505,9 @@ impl Worker {
                     }
                 }
                 SessionEnd::ManualReset => {
+                    // An explicit reset also clears the repair cooldown: the
+                    // user asking for a retry is asking for the whole retry.
+                    last_repair = None;
                     let now = Instant::now();
                     if self.with_machine(|machine| machine.on_reset(now)).is_none() {
                         return;
@@ -456,8 +516,24 @@ impl Worker {
                 SessionEnd::Failed(reason) => {
                     let reason = append_diagnostics(reason, diagnostics.as_ref());
                     debug!(remote = %self.name, reason = %reason, "fleet remote disconnected");
-                    if !self.fail(reason) {
-                        return;
+                    match self.repair(&entry, &reason, &mut last_repair) {
+                        Some(FleetRepair::Repaired(note)) => {
+                            info!(remote = %self.name, note = %note, "fleet remote repaired; reconnecting now");
+                            let now = Instant::now();
+                            if self.with_machine(|machine| machine.on_reset(now)).is_none() {
+                                return;
+                            }
+                        }
+                        Some(FleetRepair::Failed(note)) => {
+                            if !self.fail(note) {
+                                return;
+                            }
+                        }
+                        None => {
+                            if !self.fail(reason) {
+                                return;
+                            }
+                        }
                     }
                 }
             }
@@ -468,7 +544,15 @@ impl Worker {
     }
 
     /// Blocks until the machine is ready to connect. Err means stop.
-    fn wait_until_ready(&self, rx: &mpsc::Receiver<WorkerMsg>) -> Result<(), ()> {
+    ///
+    /// Takes `last_repair` because a reset that lands here — the common one,
+    /// since a remote in backoff is exactly what a user resets — must clear
+    /// the repair cooldown just like a reset out of a live session does.
+    fn wait_until_ready(
+        &self,
+        rx: &mpsc::Receiver<WorkerMsg>,
+        last_repair: &mut Option<Instant>,
+    ) -> Result<(), ()> {
         loop {
             let now = Instant::now();
             let Some((ready, deadline)) = self
@@ -486,6 +570,7 @@ impl Worker {
             match rx.recv_timeout(timeout) {
                 Ok(WorkerMsg::Command(WorkerCommand::Stop)) => return Err(()),
                 Ok(WorkerMsg::Command(WorkerCommand::Reset)) => {
+                    *last_repair = None;
                     let now = Instant::now();
                     if self.with_machine(|machine| machine.on_reset(now)).is_none() {
                         return Err(());
@@ -637,6 +722,28 @@ impl Worker {
             .remotes
             .get_mut(&self.name)
             .map(|runtime| f(&mut runtime.machine))
+    }
+
+    /// Asks the transport to repair this failure, at most once per
+    /// [`REPAIR_COOLDOWN`]. `last_repair` is the worker's own cooldown clock,
+    /// so a permanently broken remote cannot turn its retry ladder into a
+    /// repeated install.
+    fn repair(
+        &self,
+        entry: &RemoteEntry,
+        failure: &str,
+        last_repair: &mut Option<Instant>,
+    ) -> Option<FleetRepair> {
+        let now = Instant::now();
+        if last_repair.is_some_and(|at| now.saturating_duration_since(at) < REPAIR_COOLDOWN) {
+            return None;
+        }
+        let outcome = self.transport.repair(entry, failure)?;
+        // Stamped only when the transport actually acted: a `None` above is a
+        // failure it does not handle, and must not start a cooldown that
+        // would then suppress a repair it does.
+        *last_repair = Some(Instant::now());
+        Some(outcome)
     }
 
     /// Records a failure with jittered backoff. Returns false when the remote
@@ -1163,6 +1270,159 @@ mod tests {
             "bridge closed: unexpected end of file \
              (ssh: can@gpu1.example: Permission denied (publickey).)"
         );
+    }
+
+    /// Transport standing in for a remote with no herdr on it: connections
+    /// die with the bridge resolver's missing-binary marker until `repair`
+    /// "installs" one, after which they handshake normally.
+    struct BootstrappingTransport {
+        installed: Mutex<bool>,
+        repair_outcome: fn() -> FleetRepair,
+        repairs: AtomicUsize,
+    }
+
+    impl BootstrappingTransport {
+        fn new(repair_outcome: fn() -> FleetRepair) -> Arc<Self> {
+            Arc::new(Self {
+                installed: Mutex::new(false),
+                repair_outcome,
+                repairs: AtomicUsize::new(0),
+            })
+        }
+    }
+
+    impl FleetTransport for BootstrappingTransport {
+        fn connect(&self, _entry: &RemoteEntry) -> io::Result<FleetIo> {
+            let (client_read, server_write) = io::pipe()?;
+            let (server_read, client_write) = io::pipe()?;
+            if *self.installed.lock().unwrap() {
+                std::thread::spawn(move || {
+                    fake_framed_server(
+                        server_read,
+                        server_write,
+                        FakeBehavior::ServeWelcomeAndPongs,
+                    )
+                });
+                return Ok(FleetIo {
+                    reader: Box::new(client_read),
+                    writer: Box::new(client_write),
+                    guard: None,
+                    diagnostics: None,
+                });
+            }
+
+            // No binary on the far side: the resolver printed the marker and
+            // the child exited, so the bridge stdio is already at EOF.
+            drop((server_read, server_write));
+            let diagnostics = Arc::new(Mutex::new(format!(
+                "{}: overherdr (searched PATH and $HOME/.local/bin)\n",
+                bridge_child::REMOTE_BINARY_MISSING_MARKER
+            )));
+            Ok(FleetIo {
+                reader: Box::new(client_read),
+                writer: Box::new(client_write),
+                guard: None,
+                diagnostics: Some(diagnostics),
+            })
+        }
+
+        fn repair(&self, _entry: &RemoteEntry, failure: &str) -> Option<FleetRepair> {
+            if !bridge_child::diagnostics_report_missing_binary(failure) {
+                return None;
+            }
+            self.repairs.fetch_add(1, Ordering::SeqCst);
+            let outcome = (self.repair_outcome)();
+            if matches!(outcome, FleetRepair::Repaired(_)) {
+                *self.installed.lock().unwrap() = true;
+            }
+            Some(outcome)
+        }
+    }
+
+    #[test]
+    fn a_remote_with_no_herdr_is_bootstrapped_and_reconnects_immediately() {
+        // Regression: a saved remote whose herdr lives in ~/.local/bin (off
+        // ssh's non-interactive PATH) stayed offline forever, retrying a
+        // bridge that could never resolve a binary.
+        let transport =
+            BootstrappingTransport::new(|| FleetRepair::Repaired("installed overherdr".into()));
+        // A backoff far longer than the test: only the repair's immediate
+        // reconnect can get this remote connected in time.
+        let mut manager = FleetManager::start(
+            vec![entry("gpu-1")],
+            Arc::clone(&transport) as Arc<dyn FleetTransport>,
+            tuning(Duration::from_secs(600)),
+            noop_hook(),
+        );
+
+        assert!(
+            wait_for(Duration::from_secs(5), || matches!(
+                kind_of(&manager, "gpu-1"),
+                Some(RemoteStatusKind::Connected)
+            )),
+            "the installed remote must connect without waiting out backoff: {:?}",
+            kind_of(&manager, "gpu-1")
+        );
+        assert_eq!(transport.repairs.load(Ordering::SeqCst), 1);
+        manager.stop();
+    }
+
+    #[test]
+    fn a_failed_bootstrap_reports_why_and_is_not_retried_every_attempt() {
+        let transport = BootstrappingTransport::new(|| {
+            FleetRepair::Failed(
+                "no overherdr on the remote and installing it failed: no network".into(),
+            )
+        });
+        let mut manager = FleetManager::start(
+            vec![entry("gpu-1")],
+            Arc::clone(&transport) as Arc<dyn FleetTransport>,
+            tuning(Duration::from_millis(10)),
+            noop_hook(),
+        );
+
+        // The install failure replaces the symptom: it is the actionable half.
+        assert!(
+            wait_for(Duration::from_secs(5), || matches!(
+                kind_of(&manager, "gpu-1"),
+                Some(RemoteStatusKind::Offline { last_error, .. }) if last_error.contains("installing it failed")
+            )),
+            "{:?}",
+            kind_of(&manager, "gpu-1")
+        );
+
+        // Many more failed attempts, but the cooldown holds the installer to
+        // one run: a download loop behind a broken remote is the whole risk.
+        assert!(wait_for(Duration::from_secs(5), || matches!(
+            kind_of(&manager, "gpu-1"),
+            Some(RemoteStatusKind::Offline { attempt, .. }) if attempt >= 5
+        )));
+        assert_eq!(transport.repairs.load(Ordering::SeqCst), 1);
+
+        // `herdr remote reset` is the impatient user's escape hatch from the
+        // cooldown, and it has to work from backoff — the state a remote that
+        // failed its bootstrap is always in.
+        manager.reset("gpu-1");
+        assert!(
+            wait_for(Duration::from_secs(5), || transport
+                .repairs
+                .load(Ordering::SeqCst)
+                > 1),
+            "a manual reset must clear the repair cooldown"
+        );
+        manager.stop();
+    }
+
+    #[test]
+    fn repair_is_never_offered_a_failure_the_transport_does_not_handle() {
+        // The default `repair` covers every transport that has nothing to
+        // fix, and `SshBridgeTransport` narrows to the marker alone, so an
+        // auth failure never triggers an install.
+        assert!(!bridge_child::diagnostics_report_missing_binary(
+            "bridge closed: unexpected end of file (ssh: Permission denied (publickey).)"
+        ));
+        let transport = ScriptedTransport::new(vec![FakeBehavior::RefuseConnect]);
+        assert_eq!(transport.repair(&entry("gpu-1"), "anything at all"), None);
     }
 
     #[test]

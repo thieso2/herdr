@@ -69,6 +69,14 @@ Connecting never installs or upgrades a remote as a side effect. Only a host wit
 
 A `--remote` launch is an ephemeral fleet of one: the target is not stored anywhere. After a session that worked, Herdr offers once to save it as a named remote in `remotes.toml`, so the next launch can use the name.
 
+### Saved fleet remotes
+
+A saved remote reconnects on its own in the background, so it resolves `herdr` on the far side each time rather than pinning a path. SSH runs your login shell non-interactively there, which often means a stripped `PATH` — under `zsh`, only `.zshenv` is read — so Herdr looks on `PATH` first and then at `~/.local/bin/herdr`, the directory it installs into. A remote whose Herdr lives in `~/.local/bin` connects whether or not that directory is on the non-interactive `PATH`.
+
+A saved remote with no `herdr` at all is bootstrapped in place: Herdr installs the current version to `~/.local/bin/herdr` and reconnects immediately, without waiting out the retry backoff. This is the one unattended install, and it is deliberately narrow — a host that already has a `herdr`, any version, is never overwritten by a reconnect, and rolling one forward stays an explicit [`herdr remote upgrade`](#upgrading-remotes). It runs over SSH in batch mode, so a host needing an interactive passphrase fails fast rather than hanging; load the key into ssh-agent first.
+
+A failed bootstrap is reported in the remote's `remote list` detail and retried at most once every five minutes. `herdr remote reset <name>` retries immediately.
+
 Native Windows `herdr --remote` is not part of the Windows beta. From Windows, SSH into the server and run `herdr` there.
 
 By default, `herdr --remote` runs remote setup and the bridge through a temporary SSH config that includes your SSH config first, then adds fallback keepalive settings and a private per-attach control socket for connection reuse. Existing user keepalive settings win. Set `[remote].manage_ssh_config = false` to use plain `ssh` without Herdr's generated config or control socket.

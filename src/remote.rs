@@ -397,6 +397,16 @@ pub(crate) fn run_remote_client_bridge() -> std::io::Result<()> {
     ))
 }
 
+/// See the unix implementation. The fleet manager builds on Windows, so its
+/// bridge repair path needs a symbol here; installing a remote binary needs
+/// the unix installer machinery, so it reports the gap instead.
+#[cfg(windows)]
+pub(crate) fn install_missing_remote_binary(_target: &str) -> std::io::Result<String> {
+    Err(std::io::Error::other(
+        "installing herdr on a remote is not supported on Windows yet",
+    ))
+}
+
 pub(crate) fn print_remote_error_hint(err: &std::io::Error, target: &str) {
     if is_remote_auth_error(err) {
         eprintln!(

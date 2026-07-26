@@ -419,7 +419,12 @@ fn remote_connect_and_read(
         let (child, mut stdout, mut stdin) = BridgeChild::spawn_program(
             target,
             &descriptor.session,
-            descriptor.program.as_deref().unwrap_or("herdr"),
+            // Same reason the fleet transport asks for the fork by name: a
+            // saved remote with no pinned path must not look up `herdr`.
+            descriptor
+                .program
+                .as_deref()
+                .unwrap_or(crate::identity::BRAND),
         )
         .map_err(|err| format!("ssh bridge spawn failed: {err}"))?;
         // Watchdog: the hello-answer read below is a blocking pipe read with

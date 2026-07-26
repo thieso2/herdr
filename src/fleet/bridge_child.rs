@@ -1,10 +1,18 @@
 //! Persistent SSH stdio bridge child.
 //!
-//! One child per enabled remote: `ssh -T <target> "exec herdr [--session S]
+//! One child per enabled remote: `ssh -T <target> "<resolve> [--session S]
 //! bridge"`. The child's stdin/stdout carry the framed protocol directly —
 //! no local socket hop and no install prompts (`BatchMode=yes` keeps ssh from
-//! ever blocking on interactive auth). If `herdr` is missing on the far side
-//! the child exits and the remote shows as offline.
+//! ever blocking on interactive auth).
+//!
+//! A bare binary name is *resolved* on the far side rather than execed
+//! blindly: ssh runs the login shell non-interactively, so a managed install
+//! under `~/.local/bin` is routinely off `PATH` (zsh reads only `.zshenv`
+//! there). The resolver tries `PATH` first, then the managed install path,
+//! and otherwise prints [`REMOTE_BINARY_MISSING_MARKER`] so the fleet manager
+//! can tell "no herdr on this host" apart from every other bridge failure and
+//! bootstrap one. An explicit path (from `--remote`, which already discovered
+//! or installed it) is execed as given.
 //!
 //! The child's stderr is captured into a bounded tail so connection failures
 //! surface ssh's own diagnosis (bad key, unknown host key, missing `herdr`)
@@ -18,6 +26,24 @@ use tracing::warn;
 
 /// Upper bound on the retained ssh stderr tail.
 const STDERR_TAIL_MAX: usize = 2048;
+
+/// Where the resolver looks after `PATH`: the one directory herdr installs
+/// into, so a managed install is always found even off a stripped `PATH`.
+const MANAGED_INSTALL_DIR: &str = "$HOME/.local/bin";
+
+/// Printed by the remote resolver when the host has no herdr at all.
+///
+/// This is a *contract*, not a heuristic: the string comes from the script
+/// this module sends, never from ssh or a shell, so
+/// [`diagnostics_report_missing_binary`] cannot confuse a missing binary with
+/// an unrelated failure that happens to mention one.
+pub const REMOTE_BINARY_MISSING_MARKER: &str = "herdr-bridge: remote binary not found";
+
+/// Whether a bridge failure's diagnostics say the far side has no herdr —
+/// the only failure a bootstrap install can fix.
+pub fn diagnostics_report_missing_binary(diagnostics: &str) -> bool {
+    diagnostics.contains(REMOTE_BINARY_MISSING_MARKER)
+}
 
 /// Pumps `reader` into `tail` until EOF, keeping only the newest
 /// [`STDERR_TAIL_MAX`] bytes so a chatty ssh cannot grow memory unboundedly.
@@ -46,17 +72,59 @@ fn pump_stderr_tail(mut reader: impl Read, tail: &Arc<Mutex<String>>) {
 
 /// Builds the far-side command string executed by ssh.
 ///
-/// Saved fleet remotes run `herdr` from the remote PATH; a `--remote` launch
-/// pins the binary it discovered (or installed), which need not be on the
-/// non-interactive PATH.
+/// A bare binary name (the saved-fleet case) is resolved on the far side;
+/// anything path-shaped is a binary a `--remote` launch already located, so it
+/// is execed verbatim.
 pub fn remote_bridge_command_for(program: &str, session: &str) -> String {
-    let mut command = format!("exec {program}");
-    if session != crate::session::DEFAULT_SESSION_NAME {
-        command.push_str(" --session ");
-        command.push_str(&crate::remote::shell_quote(session));
+    let args = bridge_args(session);
+    if !is_bare_binary_name(program) {
+        return format!("exec {program}{args}");
     }
-    command.push_str(" bridge");
-    command
+
+    // Wrapped in `/bin/sh` so the resolver's syntax does not depend on which
+    // login shell the remote account happens to use.
+    format!(
+        "exec /bin/sh -c {}",
+        crate::remote::shell_quote(&resolve_script(program, &args))
+    )
+}
+
+/// `--session S` (omitted for the default session) followed by the
+/// subcommand: the tail every form of the bridge command ends with.
+fn bridge_args(session: &str) -> String {
+    let mut args = String::new();
+    if session != crate::session::DEFAULT_SESSION_NAME {
+        args.push_str(" --session ");
+        args.push_str(&crate::remote::shell_quote(session));
+    }
+    args.push_str(" bridge");
+    args
+}
+
+/// Whether `program` is a plain command name to look up rather than a path to
+/// exec. Deliberately narrow: only names that need no shell quoting at all can
+/// be interpolated into the resolver script.
+fn is_bare_binary_name(program: &str) -> bool {
+    !program.is_empty()
+        && program
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.'))
+}
+
+/// The far-side lookup: `PATH`, then the managed install directory, then a
+/// machine-readable "not installed here" report.
+fn resolve_script(program: &str, args: &str) -> String {
+    let managed = format!("{MANAGED_INSTALL_DIR}/{program}");
+    let report = format!(
+        "{REMOTE_BINARY_MISSING_MARKER}: {program} (searched PATH and {MANAGED_INSTALL_DIR})"
+    );
+    format!(
+        "if command -v {program} >/dev/null 2>&1; then exec {program}{args}; fi\n\
+         if [ -x \"{managed}\" ]; then exec \"{managed}\"{args}; fi\n\
+         printf '%s\\n' {report} >&2\n\
+         exit 127\n",
+        report = crate::remote::shell_quote(&report)
+    )
 }
 
 /// A live SSH bridge child. Dropping it kills and reaps the child, which
@@ -181,22 +249,62 @@ mod tests {
         // Regression: the bridge used to exec bare `herdr`, which on a host
         // with no upstream install failed with "command not found: herdr".
         let brand = crate::identity::BRAND;
-        assert_eq!(
-            remote_bridge_command_for(brand, crate::session::DEFAULT_SESSION_NAME),
-            format!("exec {brand} bridge")
+        let command = remote_bridge_command_for(brand, crate::session::DEFAULT_SESSION_NAME);
+        assert!(
+            command.contains(&format!("command -v {brand}")),
+            "{command}"
         );
+        assert!(!command.contains("herdr bridge") || brand.ends_with("herdr"));
         assert_ne!(brand, "herdr");
     }
 
     #[test]
-    fn bridge_command_omits_default_session() {
-        assert_eq!(
-            remote_bridge_command_for("herdr", "default"),
-            "exec herdr bridge"
+    fn a_bare_name_is_resolved_through_path_then_the_managed_install_dir() {
+        // Regression: ssh runs the login shell non-interactively, so
+        // `~/.local/bin` is routinely off PATH and a bare `exec overherdr`
+        // died with "command not found" on a host that *had* it installed.
+        let command = remote_bridge_command_for("overherdr", "default");
+        assert!(
+            command.starts_with("exec /bin/sh -c "),
+            "the resolver must not depend on the remote login shell: {command}"
         );
+        assert!(command.contains("command -v overherdr"), "{command}");
+        assert!(
+            command.contains("$HOME/.local/bin/overherdr"),
+            "the managed install path must be searched: {command}"
+        );
+        // Both branches exec, so the bridge process is the shell's own.
+        assert_eq!(command.matches("exec").count(), 3, "{command}");
+    }
+
+    #[test]
+    fn an_unresolvable_bare_name_reports_the_missing_binary_marker() {
+        let command = remote_bridge_command_for("overherdr", "default");
+        assert!(
+            command.contains(REMOTE_BINARY_MISSING_MARKER),
+            "the fleet manager keys its bootstrap install off this marker: {command}"
+        );
+        assert!(command.contains("exit 127"), "{command}");
+        assert!(diagnostics_report_missing_binary(&format!(
+            "bridge closed: unexpected end of stream (ssh: {REMOTE_BINARY_MISSING_MARKER}: overherdr)"
+        )));
+        // Every other bridge failure must stay untouched by the installer.
+        assert!(!diagnostics_report_missing_binary(
+            "bridge closed: unexpected end of stream (ssh: Permission denied (publickey))"
+        ));
+    }
+
+    #[test]
+    fn a_pinned_path_is_execed_verbatim() {
+        // `--remote` already discovered or installed this exact binary;
+        // re-resolving could pick a different one.
         assert_eq!(
             remote_bridge_command_for("/home/can/.local/bin/herdr", "default"),
             "exec /home/can/.local/bin/herdr bridge"
+        );
+        assert_eq!(
+            remote_bridge_command_for("\"$HOME/.local/bin/herdr\"", "work"),
+            "exec \"$HOME/.local/bin/herdr\" --session work bridge"
         );
     }
 
@@ -220,13 +328,36 @@ mod tests {
 
     #[test]
     fn bridge_command_quotes_named_session() {
+        assert_eq!(bridge_args("default"), " bridge");
+        assert_eq!(bridge_args("work"), " --session work bridge");
         assert_eq!(
-            remote_bridge_command_for("herdr", "work"),
-            "exec herdr --session work bridge"
+            bridge_args("with'quote"),
+            " --session 'with'\\''quote' bridge"
         );
+        // Both resolver branches carry the same quoted session through.
+        let script = resolve_script("overherdr", &bridge_args("with'quote"));
         assert_eq!(
-            remote_bridge_command_for("herdr", "with'quote"),
-            "exec herdr --session 'with'\\''quote' bridge"
+            script.matches(" --session 'with'\\''quote' bridge").count(),
+            2,
+            "{script}"
         );
+    }
+
+    #[test]
+    fn only_plain_command_names_take_the_resolver_path() {
+        for bare in ["overherdr", "herdr-dev", "herdr.test", "a_b"] {
+            assert!(is_bare_binary_name(bare), "{bare}");
+        }
+        // Anything path-shaped or needing quoting is execed as given, so no
+        // caller-supplied text is ever interpolated into the script.
+        for path in [
+            "/usr/bin/herdr",
+            "./herdr",
+            "",
+            "\"$HOME/bin/herdr\"",
+            "a b",
+        ] {
+            assert!(!is_bare_binary_name(path), "{path}");
+        }
     }
 }

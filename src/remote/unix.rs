@@ -607,10 +607,23 @@ impl Drop for ManagedSshConfig {
 struct RemoteSsh {
     target: String,
     managed_config: Option<ManagedSshConfig>,
+    /// Refuse every interactive ssh prompt. Set for callers with no user
+    /// behind them (the fleet bootstrap), where a passphrase or host-key
+    /// prompt would wedge a background thread on a pipe nobody reads.
+    batch_mode: bool,
 }
 
 impl RemoteSsh {
     fn new(target: String, manage_ssh_config: bool) -> Self {
+        Self::with_batch_mode(target, manage_ssh_config, false)
+    }
+
+    /// A non-interactive [`RemoteSsh`]: ssh fails fast instead of prompting.
+    fn batch(target: String, manage_ssh_config: bool) -> Self {
+        Self::with_batch_mode(target, manage_ssh_config, true)
+    }
+
+    fn with_batch_mode(target: String, manage_ssh_config: bool, batch_mode: bool) -> Self {
         let managed_config = if manage_ssh_config {
             write_managed_ssh_config()
                 .inspect_err(|err| {
@@ -624,6 +637,7 @@ impl RemoteSsh {
         Self {
             target,
             managed_config,
+            batch_mode,
         }
     }
 
@@ -643,6 +657,9 @@ impl RemoteSsh {
 
     fn base_command(&self) -> Command {
         let mut command = Command::new("ssh");
+        if self.batch_mode {
+            command.arg("-o").arg("BatchMode=yes");
+        }
         apply_managed_ssh_options(&mut command, self.options());
         command
     }
@@ -931,6 +948,63 @@ fn prepare_remote_herdr(
             protocol: Some(CURRENT_PROTOCOL),
         },
     })
+}
+
+/// Bootstraps `target` with this build's herdr, unattended, and returns the
+/// version the installed binary reports.
+///
+/// This is the fleet bridge's repair path, so it is deliberately the *only*
+/// unattended install: it runs with no user at a prompt, and it therefore
+/// refuses to touch a host that already has a herdr. A host with a binary —
+/// any version — is left exactly as it is, and rolling it forward stays an
+/// explicit `herdr remote upgrade`. ssh runs in batch mode: a host that would
+/// prompt for a passphrase fails fast instead of wedging the caller.
+pub(crate) fn install_missing_remote_binary(target: &str) -> io::Result<String> {
+    let manage_ssh_config = crate::config::Config::load()
+        .config
+        .remote
+        .manage_ssh_config;
+    let ssh = RemoteSsh::batch(target.to_string(), manage_ssh_config);
+    let platform = detect_remote_platform(&ssh)?;
+    let remote_herdr = RemoteHerdr::for_platform(platform);
+
+    let candidates = remote_binary_candidates(&ssh, &remote_herdr)?;
+    if let Some((found, reported)) = discover_remote_herdr(&ssh, &remote_herdr, &candidates) {
+        // The bridge could not reach it, but something is installed. Report
+        // it and change nothing; overwriting here would be a silent upgrade.
+        debug!(
+            target,
+            path = %found.shell_path,
+            version = %reported.version,
+            "remote already has a herdr; skipping the unattended install"
+        );
+        return Ok(reported.version);
+    }
+
+    let target_version = current_version();
+    let override_binary = remote_binary_override_path()?;
+    debug!(
+        target,
+        version = %target_version,
+        source = %install_source_description(
+            &remote_herdr.platform,
+            override_binary.as_deref(),
+            &target_version,
+        ),
+        "installing herdr on a remote with none"
+    );
+    let source = resolve_install_source(&remote_herdr.platform, override_binary, &target_version)?;
+    let install_result = ssh.install_herdr(&remote_herdr, &source.path);
+    source.cleanup();
+    install_result?;
+
+    match remote_binary_version(&ssh, &remote_herdr)? {
+        Some(reported) => Ok(reported.version),
+        None => Err(io::Error::other(format!(
+            "installed herdr at {} on {target}, but it did not report a version",
+            remote_herdr.shell_path
+        ))),
+    }
 }
 
 /// Options for one `herdr remote upgrade` run.
@@ -2505,6 +2579,7 @@ mod tests {
         let ssh = RemoteSsh {
             target: "example".to_string(),
             managed_config: Some(managed_config),
+            batch_mode: false,
         };
 
         let command = ssh.command();
@@ -2535,6 +2610,7 @@ mod tests {
         let ssh = RemoteSsh {
             target: "example".to_string(),
             managed_config: None,
+            batch_mode: false,
         };
 
         let command = ssh.command();
@@ -2544,6 +2620,24 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(args, vec!["-T".to_string(), "example".to_string()]);
+
+        // The unattended bootstrap must never reach an ssh prompt: there is
+        // no user behind it and a prompt would wedge a fleet worker thread.
+        let batch = RemoteSsh::batch("example".to_string(), false);
+        let command = batch.command();
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            args,
+            vec![
+                "-o".to_string(),
+                "BatchMode=yes".to_string(),
+                "-T".to_string(),
+                "example".to_string(),
+            ]
+        );
     }
 
     #[test]

@@ -62,7 +62,10 @@ pub fn unregister_runtime_dir(path: &Path) {
     }
 }
 
-#[cfg(target_os = "linux")]
+/// Server pids sharing `runtime_dir`, for tests that must SIGKILL a server
+/// rather than shut it down. Pid discovery reads `/proc`, so this is empty
+/// off Linux - `iter_worktree_server_pids` already answers that way - and
+/// callers degrade to killing nothing rather than failing to compile.
 pub fn herdr_server_pids_for_runtime_dir(runtime_dir: &Path) -> std::io::Result<Vec<u32>> {
     let mut pids = Vec::new();
     for pid in iter_worktree_server_pids()? {

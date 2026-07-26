@@ -1057,6 +1057,26 @@ mod tests {
         );
         assert_eq!(app.remote_chips.len(), 3, "the strip stays for un-soloing");
         app.assert_invariants_for_test();
+
+        // Solo local: the local runtime filters exactly like any remote,
+        // and the resulting single-remote view collapses the attribution
+        // back to today's sidebar.
+        chrome.selection.solo(0, &descriptors);
+        compose_fleet_into(&mirrors, &descriptors, &chrome, &mut ids, &mut app);
+        let ids_in_order: Vec<&str> = app.workspaces.iter().map(|ws| ws.id.as_str()).collect();
+        assert_eq!(ids_in_order, vec!["ws_2", "ws_10"]);
+        assert!(
+            app.workspace_remote_tags.is_empty(),
+            "a solo'd local view carries no attribution"
+        );
+        assert_eq!(app.remote_chips.len(), 3, "the strip stays for un-soloing");
+        assert!(app.remote_chips[0].in_view);
+        assert_eq!(
+            chrome.selection.toggle(0, &descriptors),
+            Err("at least one remote stays in view"),
+            "the last remote in view is refused, local included"
+        );
+        app.assert_invariants_for_test();
     }
 
     #[tokio::test]

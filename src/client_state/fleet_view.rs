@@ -255,16 +255,16 @@ pub(crate) fn select_window_title(
     titles.get(&focused_remote).map(String::as_str)
 }
 
-/// Labels a notification message with its origin remote. With more than one
-/// remote configured, non-local notifications carry the remote name; local
-/// notifications and single-remote fleets stay exactly as today.
+/// Labels a notification message with its origin remote. With more than
+/// one remote configured every notification carries its remote's name -
+/// the local runtime is one fleet member among others. Single-remote
+/// clients stay exactly as today.
 pub(crate) fn labeled_notification_message(
-    remote_index: usize,
     remote_name: &str,
     configured_remotes: usize,
     message: &str,
 ) -> String {
-    if configured_remotes > 1 && remote_index != LOCAL_REMOTE_INDEX {
+    if configured_remotes > 1 {
         format!("[{remote_name}] {message}")
     } else {
         message.to_owned()
@@ -459,16 +459,16 @@ mod tests {
     #[test]
     fn notification_labels_name_the_remote_only_in_a_real_fleet() {
         assert_eq!(
-            labeled_notification_message(1, "gpu-01", 3, "agent done"),
+            labeled_notification_message("gpu-01", 3, "agent done"),
             "[gpu-01] agent done"
         );
         assert_eq!(
-            labeled_notification_message(0, "local", 3, "agent done"),
-            "agent done",
-            "local notifications stay bare"
+            labeled_notification_message("local", 3, "agent done"),
+            "[local] agent done",
+            "the local runtime is labeled like any other fleet member"
         );
         assert_eq!(
-            labeled_notification_message(1, "gpu-01", 1, "agent done"),
+            labeled_notification_message("gpu-01", 1, "agent done"),
             "agent done",
             "single-remote fleets stay exactly as today"
         );

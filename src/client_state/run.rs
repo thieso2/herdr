@@ -122,10 +122,17 @@ enum LoopEvent {
     Established(usize, u64, Box<RemoteEstablished>),
 }
 
-/// Outcome of a fleet remote's connect-plus-handshake thread. On success
-/// the thread keeps running as the session's frame reader; the writer half
-/// and the child guard travel here to the loop.
+/// Outcome of a remote's connect-plus-handshake thread. On success the
+/// thread keeps running as the session's frame reader; the writer half and
+/// the child guard travel here to the loop. The local runtime connects the
+/// same way, over the API socket instead of an SSH bridge child.
 enum RemoteEstablished {
+    /// The local API socket negotiated a session: the connect thread kept
+    /// the read half and the ready session travels here.
+    LocalConnected {
+        welcome: SessionWelcome,
+        session: Box<Session>,
+    },
     Connected {
         welcome: SessionWelcome,
         writer: std::process::ChildStdin,
@@ -794,7 +801,7 @@ fn run_loop(
     // local socket in a normal run and the ssh bridge in an ephemeral
     // `--remote` fleet-of-one.
     for descriptor in descriptors.iter() {
-        let link = establish_for(descriptor, mirrors, chrome, &mut ui, event_tx, should_quit);
+        let link = establish_for(descriptor, mirrors, &mut ui, event_tx, should_quit);
         links.insert(descriptor.index, link);
     }
     let mut ctx = LoopCtx {
@@ -848,7 +855,6 @@ fn run_loop(
             let link = establish_for(
                 &descriptor,
                 ctx.mirrors,
-                ctx.chrome,
                 ctx.ui,
                 ctx.event_tx,
                 ctx.should_quit,
@@ -984,11 +990,11 @@ fn apply_window_title(ctx: &mut LoopCtx<'_>) {
 
 /// Connects one remote through the transport its descriptor names: the
 /// local API socket when it has no ssh target, an ssh bridge child
-/// otherwise.
+/// otherwise. Every transport connects off the run-loop thread and reports
+/// back through [`LoopEvent::Established`].
 fn establish_for(
     descriptor: &RemoteDescriptor,
     mirrors: &mut RemoteMirrors,
-    chrome: &mut GlobalChrome,
     ui: &mut InteractionState,
     event_tx: &mpsc::SyncSender<LoopEvent>,
     should_quit: &Arc<AtomicBool>,
@@ -996,15 +1002,18 @@ fn establish_for(
     if descriptor.target.is_some() {
         establish_remote(descriptor, mirrors, ui, event_tx, should_quit)
     } else {
-        establish_local(mirrors, chrome, ui, event_tx, should_quit)
+        establish_local(mirrors, ui, event_tx, should_quit)
     }
 }
 
-/// Attempts the local connection and, on success, kicks off the catalog
-/// resync and the socket reader thread.
+/// Starts the local runtime's connect thread. The local API socket is one
+/// fleet transport among others: it connects off the run-loop thread so
+/// its chip can show (and spin through) `Connecting`, and so a local
+/// server that accepts the socket but never answers `session.hello` cannot
+/// block the loop - and with it every fleet remote - for the hello
+/// timeout.
 fn establish_local(
     mirrors: &mut RemoteMirrors,
-    chrome: &mut GlobalChrome,
     ui: &mut InteractionState,
     event_tx: &mpsc::SyncSender<LoopEvent>,
     should_quit: &Arc<AtomicBool>,
@@ -1014,76 +1023,54 @@ fn establish_local(
     mirror.connection.connect_started();
     ui.next_generation += 1;
     let generation = ui.next_generation;
-    match connect() {
+    let tx = event_tx.clone();
+    let quit = Arc::clone(should_quit);
+    std::thread::spawn(move || local_connect_and_read(generation, tx, quit));
+    Link::Pending { generation }
+}
+
+/// Connect-plus-handshake for the local API socket, run on its own thread.
+/// On success the same thread becomes the session's frame reader, so the
+/// socket's read half never crosses threads.
+fn local_connect_and_read(
+    generation: u64,
+    event_tx: mpsc::SyncSender<LoopEvent>,
+    should_quit: Arc<AtomicBool>,
+) {
+    let outcome = match connect() {
         ConnectOutcome::Connected(connected) => {
             let ConnectedLocal {
                 mut session,
                 reader,
                 welcome,
             } = *connected;
+            // Stamped before the session leaves this thread: frames the
+            // reader loop tags below must match the session's generation.
             session.generation = generation;
-            // The mirror holds what the server actually negotiated, not what
-            // this client asked for: capability gates (pane streams) and any
-            // protocol downgrade must reflect the welcome.
-            mirror
-                .connection
-                .connected(crate::protocol::framed::NegotiatedSession {
-                    protocol: welcome.protocol,
-                    capabilities: welcome.capabilities,
-                });
-            // Full resync: the fresh snapshot plus re-opened streams are the
-            // only source of truth for this connection.
-            mirror.begin_resync();
-            chrome.connection_status = None;
-            ui.ever_connected = true;
-
-            let id = session.request_id("snapshot");
-            session.pending.insert(id.clone(), Pending::Snapshot);
-            if let Err(err) = session.send_control(&session_snapshot_request(&id)) {
-                drop(session);
-                mirror.connection_lost(format!("snapshot request failed: {err}"));
-                chrome.connection_status = Some("local server unreachable; retrying".to_owned());
-                return Link::Down {
-                    retry_at: Instant::now() + Duration::from_secs(1),
-                };
+            let established = LoopEvent::Established(
+                LOCAL_REMOTE_INDEX,
+                generation,
+                Box::new(RemoteEstablished::LocalConnected {
+                    welcome,
+                    session: Box::new(session),
+                }),
+            );
+            if event_tx.send(established).is_err() {
+                return;
             }
-
-            let frame_tx = event_tx.clone();
-            let reader_quit = Arc::clone(should_quit);
-            std::thread::spawn(move || {
-                socket_reader_loop(reader, generation, frame_tx, &reader_quit)
-            });
-            Link::Up(Box::new(session))
+            socket_reader_loop(reader, generation, event_tx, &should_quit);
+            return;
         }
         ConnectOutcome::Incompatible { remedy, message } => {
-            let status = crate::fleet::connection::incompatible_status_line(
-                &mirror.name,
-                true,
-                remedy,
-                &message,
-            );
-            warn!(status = %status, "local server protocol incompatible");
-            mirror.connection.incompatible(remedy, message);
-            chrome.connection_status = Some(status);
-            Link::Incompatible
+            RemoteEstablished::Incompatible { remedy, message }
         }
-        ConnectOutcome::Failed(error) => {
-            let attempt = match mirror.connection {
-                super::ClientConnectionState::Connecting { attempt } => attempt,
-                _ => 1,
-            };
-            mirror.connection_lost(error.clone());
-            chrome.connection_status = Some(format!("local server unreachable; retrying: {error}"));
-            let delay = crate::fleet::connection::backoff_delay(
-                attempt,
-                crate::fleet::connection::BackoffTuning::default(),
-                0.5,
-            );
-            Link::Down {
-                retry_at: Instant::now() + delay,
-            }
-        }
-    }
+        ConnectOutcome::Failed(error) => RemoteEstablished::Failed(error),
+    };
+    let _ = event_tx.send(LoopEvent::Established(
+        LOCAL_REMOTE_INDEX,
+        generation,
+        Box::new(outcome),
+    ));
 }
 
 /// Starts a fleet remote's connect thread (SSH bridge child + handshake).
@@ -1139,6 +1126,46 @@ fn handle_established(
         return;
     };
     match outcome {
+        RemoteEstablished::LocalConnected { welcome, session } => {
+            info!(
+                remote,
+                name = %mirror.name,
+                protocol = welcome.protocol,
+                server_version = %welcome.server_version,
+                "pure client negotiated framed catalog session"
+            );
+            // The mirror holds what the server actually negotiated, not
+            // what this client asked for: capability gates (pane streams)
+            // and any protocol downgrade must reflect the welcome.
+            mirror
+                .connection
+                .connected(crate::protocol::framed::NegotiatedSession {
+                    protocol: welcome.protocol,
+                    capabilities: welcome.capabilities,
+                });
+            // Full resync: the fresh snapshot plus re-opened streams are
+            // the only source of truth for this connection.
+            mirror.begin_resync();
+            ctx.ui.ever_connected = true;
+            if local_status_line_is_the_only_channel(ctx.descriptors) {
+                ctx.chrome.connection_status = None;
+            }
+            let mut session = *session;
+            let id = session.request_id("snapshot");
+            session.pending.insert(id.clone(), Pending::Snapshot);
+            if let Err(err) = session.send_control(&session_snapshot_request(&id)) {
+                drop(session);
+                mirror.connection_lost(format!("snapshot request failed: {err}"));
+                ctx.links.insert(
+                    remote,
+                    Link::Down {
+                        retry_at: Instant::now() + Duration::from_secs(1),
+                    },
+                );
+                return;
+            }
+            ctx.links.insert(remote, Link::Up(Box::new(session)));
+        }
         RemoteEstablished::Connected {
             welcome,
             writer,
@@ -1219,7 +1246,11 @@ fn handle_established(
                 super::ClientConnectionState::Connecting { attempt } => attempt,
                 _ => 1,
             };
-            debug!(remote, error = %error, "fleet remote connect failed");
+            debug!(remote, error = %error, "remote connect failed");
+            if is_local && local_status_line_is_the_only_channel(ctx.descriptors) {
+                ctx.chrome.connection_status =
+                    Some(format!("local server unreachable; retrying: {error}"));
+            }
             mirror.connection_lost(error);
             let delay = crate::fleet::connection::backoff_delay(
                 attempt,
@@ -1327,6 +1358,14 @@ fn service_ui_ticks(ctx: &mut LoopCtx<'_>) -> bool {
 }
 
 /// Drops a remote's link after its transport died and schedules the retry.
+/// Whether the local transport's state has nowhere to go but the status
+/// line. A fleet shows every member's connection - the local runtime
+/// included - on its chip dot; the single-remote pure client renders no
+/// chip strip, so it keeps today's status line.
+fn local_status_line_is_the_only_channel(descriptors: &[RemoteDescriptor]) -> bool {
+    descriptors.len() < 2
+}
+
 fn drop_link(remote: usize, ctx: &mut LoopCtx<'_>, why: &str) {
     if matches!(ctx.links.get(&remote), Some(Link::Incompatible) | None) {
         return;
@@ -1336,7 +1375,7 @@ fn drop_link(remote: usize, ctx: &mut LoopCtx<'_>, why: &str) {
         return;
     };
     mirror.connection_lost(why);
-    if remote == LOCAL_REMOTE_INDEX {
+    if remote == LOCAL_REMOTE_INDEX && local_status_line_is_the_only_channel(ctx.descriptors) {
         ctx.chrome.connection_status = Some(format!("{why}; reconnecting"));
     }
     ctx.links.insert(
@@ -1524,7 +1563,6 @@ fn handle_server_frame(remote: usize, frame: Frame, ctx: &mut LoopCtx<'_>) {
                             .map(|descriptor| descriptor.name.as_str())
                             .unwrap_or("remote");
                         let message = super::fleet_view::labeled_notification_message(
-                            remote,
                             name,
                             ctx.descriptors.len(),
                             &message,
@@ -1612,7 +1650,9 @@ fn handle_server_frame(remote: usize, frame: Frame, ctx: &mut LoopCtx<'_>) {
                                     session.sent_sizes.remove(&stream_id);
                                     session.read_only.remove(&stream_id);
                                 }
-                                if remote == LOCAL_REMOTE_INDEX {
+                                if remote == LOCAL_REMOTE_INDEX
+                                    && local_status_line_is_the_only_channel(ctx.descriptors)
+                                {
                                     ctx.chrome.connection_status = None;
                                 }
                             }
@@ -2584,9 +2624,14 @@ fn handle_chip_click(
             }
         }
         crossterm::event::MouseButton::Right => {
-            // Edit the remote behind the chip; the implicit local runtime
-            // is not configurable.
+            // Edit the remote behind the chip. The implicit local runtime
+            // has no config entry to edit, and a chip that silently
+            // ignores the click reads as broken - it says so instead.
             if descriptor.index == LOCAL_REMOTE_INDEX {
+                ctx.ui.status_flash = Some((
+                    "the local runtime is not configurable".to_owned(),
+                    Instant::now(),
+                ));
                 return;
             }
             let Some(target) = descriptor.target.clone() else {
@@ -3068,6 +3113,143 @@ mod tests {
             fresh_session(SessionWriter::Threaded(tx), None, generation),
             rx,
         )
+    }
+
+    /// The local runtime is one fleet member among others: its connect
+    /// must run off the run-loop thread like every ssh remote's, so its
+    /// chip can show (and spin through) `Connecting`, and so a local
+    /// server that accepts the socket but never answers `session.hello`
+    /// cannot block the loop - and with it every other remote - for the
+    /// hello timeout.
+    #[tokio::test]
+    async fn local_connects_off_thread_so_its_chip_can_show_connecting() {
+        // The connect thread must never reach a real dev server.
+        std::env::set_var(
+            crate::api::SOCKET_PATH_ENV_VAR,
+            "/nonexistent/herdr-pure-client-test.sock",
+        );
+        with_test_ctx(three_descriptors(), |ctx| {
+            let descriptor = ctx.descriptors[0].clone();
+            assert_eq!(descriptor.target, None, "remote #0 is the local runtime");
+
+            let link = establish_for(
+                &descriptor,
+                ctx.mirrors,
+                ctx.ui,
+                ctx.event_tx,
+                ctx.should_quit,
+            );
+            assert!(
+                matches!(link, Link::Pending { .. }),
+                "local connects off the run-loop thread, like any remote"
+            );
+            let chips = super::super::fleet_view::remote_chip_states(
+                ctx.mirrors,
+                ctx.descriptors,
+                &ctx.chrome.selection,
+            );
+            assert_eq!(
+                chips[0].connection,
+                crate::app::state::RemoteChipConnection::Connecting,
+                "the local chip reports connecting like any remote"
+            );
+        });
+    }
+
+    /// The local session lands through the same `Established` path as any
+    /// remote's: link up, mirror connected and resyncing, snapshot
+    /// requested.
+    #[tokio::test]
+    async fn a_local_session_opens_its_link_and_resyncs_like_a_remote() {
+        with_test_ctx(three_descriptors(), |ctx| {
+            ctx.links
+                .insert(LOCAL_REMOTE_INDEX, Link::Pending { generation: 4 });
+            let (session, rx) = threaded_session(4, 8);
+            let welcome = SessionWelcome {
+                protocol: crate::protocol::PROTOCOL_VERSION,
+                min_protocol: 1,
+                capabilities: vec![CAPABILITY_CATALOG.to_owned()],
+                server_version: env!("CARGO_PKG_VERSION").to_owned(),
+            };
+
+            handle_established(
+                LOCAL_REMOTE_INDEX,
+                4,
+                RemoteEstablished::LocalConnected {
+                    welcome,
+                    session: Box::new(session),
+                },
+                ctx,
+            );
+
+            assert!(matches!(
+                ctx.links.get(&LOCAL_REMOTE_INDEX),
+                Some(Link::Up(_))
+            ));
+            let chips = super::super::fleet_view::remote_chip_states(
+                ctx.mirrors,
+                ctx.descriptors,
+                &ctx.chrome.selection,
+            );
+            assert_eq!(
+                chips[0].connection,
+                crate::app::state::RemoteChipConnection::Connected
+            );
+            assert!(rx.try_recv().is_ok(), "the snapshot request went out");
+        });
+    }
+
+    /// A fleet reads every member's transport state off its chip dot. The
+    /// local runtime is no exception: dropping its link must not raise a
+    /// status line no other remote gets.
+    #[tokio::test]
+    async fn a_fleet_reports_local_transport_loss_in_the_chip_not_a_toast() {
+        with_test_ctx(three_descriptors(), |ctx| {
+            let (session, _rx) = threaded_session(1, 8);
+            ctx.links
+                .insert(LOCAL_REMOTE_INDEX, Link::Up(Box::new(session)));
+
+            drop_link(LOCAL_REMOTE_INDEX, ctx, "connection closed");
+
+            assert!(matches!(
+                ctx.links.get(&LOCAL_REMOTE_INDEX),
+                Some(Link::Down { .. })
+            ));
+            let chips = super::super::fleet_view::remote_chip_states(
+                ctx.mirrors,
+                ctx.descriptors,
+                &ctx.chrome.selection,
+            );
+            assert_eq!(
+                chips[0].connection,
+                crate::app::state::RemoteChipConnection::Offline,
+                "the local chip goes hollow like any remote's"
+            );
+            assert_eq!(
+                ctx.chrome.connection_status, None,
+                "in a fleet the chip carries connection state, not a toast"
+            );
+        });
+    }
+
+    /// The single-remote pure client has no chip strip, so it keeps the
+    /// status line - this is the fence that the fleet symmetry above does
+    /// not change the flag-on, no-fleet view.
+    #[tokio::test]
+    async fn a_single_remote_client_still_reports_transport_loss_in_the_status_line() {
+        with_test_ctx(vec![RemoteDescriptor::local()], |ctx| {
+            let (session, _rx) = threaded_session(1, 8);
+            ctx.links
+                .insert(LOCAL_REMOTE_INDEX, Link::Up(Box::new(session)));
+
+            drop_link(LOCAL_REMOTE_INDEX, ctx, "connection closed");
+
+            assert_eq!(
+                ctx.chrome.connection_status.as_deref(),
+                Some("connection closed; reconnecting"),
+                "with no chip strip the status line is the only channel"
+            );
+        });
     }
 
     #[tokio::test]

@@ -794,7 +794,12 @@ fn run_loop(
             compose_fleet_into(ctx.mirrors, ctx.descriptors, ctx.chrome, ctx.ids, ctx.app);
             // Copy mode cannot outlive its pane: a catalog update that
             // removed the pane must drop copy-mode state before rendering.
-            if let Some(pane_id) = ctx.app.copy_mode.as_ref().map(|copy_mode| copy_mode.pane_id) {
+            if let Some(pane_id) = ctx
+                .app
+                .copy_mode
+                .as_ref()
+                .map(|copy_mode| copy_mode.pane_id)
+            {
                 let alive = ctx
                     .ids
                     .public_pane_id(pane_id)
@@ -1916,7 +1921,11 @@ fn handle_key(key: crate::input::TerminalKey, ctx: &mut LoopCtx<'_>) {
                 ctx.app.mode = Mode::Prefix;
                 return;
             }
-            let copy_pane = ctx.app.copy_mode.as_ref().map(|copy_mode| copy_mode.pane_id);
+            let copy_pane = ctx
+                .app
+                .copy_mode
+                .as_ref()
+                .map(|copy_mode| copy_mode.pane_id);
             {
                 // Copy mode runs entirely against the replica through the
                 // pane-content seam: search, motions, selection, scrolling.
@@ -2584,8 +2593,8 @@ pub(super) fn send_api_request(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::compose::compose_into;
+    use super::*;
     use crossterm::event::{KeyCode, KeyModifiers};
 
     fn key(code: KeyCode) -> crate::input::TerminalKey {
@@ -3068,8 +3077,7 @@ mod tests {
             // Positive control: a Terminal-mode press reaches the pane.
             ctx.app.mode = Mode::Terminal;
             handle_key(key(KeyCode::Char('a')), ctx);
-            let frame =
-                try_read_control(&mut server).expect("terminal press forwards to the pane");
+            let frame = try_read_control(&mut server).expect("terminal press forwards to the pane");
             assert_eq!(frame["method"], "pane.send_bytes");
 
             // A press typed into a rename modal edits the modal, not the
@@ -3140,8 +3148,7 @@ mod tests {
                 crate::input::TerminalKey::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
                 ctx,
             );
-            let frame =
-                try_read_control(&mut server).expect("ctrl-c forwards with copy_on_select");
+            let frame = try_read_control(&mut server).expect("ctrl-c forwards with copy_on_select");
             assert_eq!(frame["method"], "pane.send_bytes");
         });
     }
@@ -3248,11 +3255,7 @@ mod tests {
             assert!(selection.is_finalized());
             let source = MirrorPaneSource::new(ctx.mirrors.local());
             ctx.app.copy_selection(&source);
-            let copied = ctx
-                .app
-                .request_clipboard_write
-                .take()
-                .expect("copied word");
+            let copied = ctx.app.request_clipboard_write.take().expect("copied word");
             assert_eq!(String::from_utf8_lossy(&copied), "bravo");
         });
     }

@@ -255,7 +255,13 @@ pub(super) fn dispatch_mouse_intent(
     let mode_before = app.mode;
     let empty_runtimes = crate::terminal::TerminalRuntimeRegistry::new();
     let action = {
-        let source = super::compose::MirrorPaneSource::new(mirrors.local());
+        let in_view: Vec<usize> = chrome
+            .selection
+            .in_view(descriptors)
+            .iter()
+            .map(|descriptor| descriptor.index)
+            .collect();
+        let source = super::compose::MirrorPaneSource::for_view(mirrors, &in_view);
         app.handle_mouse_with_content(&empty_runtimes, &source, mouse)
     };
     // A mouse-driven copy (copy_on_select drag release, double-click word

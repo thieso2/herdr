@@ -651,13 +651,14 @@ mod tests {
         assert!(all.contains("RIGHT"), "rows: {all}");
         assert!(all.contains("characterization"), "rows: {all}");
         assert!(all.contains("char-branch"), "rows: {all}");
-        // Baselined with cached_git_branch pinned (the previous constants
-        // hashed the live checkout's branch name and only matched the
-        // authoring worktree). With the environment held constant this
-        // render is byte-identical to the fleet/integration base.
+        // Baselined with the git-derived fields pinned (the previous
+        // constants hashed the live checkout's branch name and only matched
+        // the authoring worktree). Re-verified after the fleet-tui merge:
+        // with "char-branch" pinned the merged render is byte-identical to
+        // the pure-client parity baseline.
         assert_eq!(
             digest,
-            "0009752514d8fdb85d5cc92f39f777554b9d520d5df598b458214df2d4f710b3"
+            "bb5e1667ff64404f378028b508414f278a06c0ee3c4ac26b775251ea0f858023"
         );
     }
 
@@ -743,7 +744,7 @@ mod tests {
         // Baselined together with the desktop digest; see the note there.
         assert_eq!(
             digest,
-            "70d9061b772c46493e7e6df1221a4b8dc0ba1f49c47950e512c6eee4ba871ad2"
+            "340bfea61b50d9c1eb018e12919bddb59b186838801fa8c103a1664cadb56256"
         );
     }
 

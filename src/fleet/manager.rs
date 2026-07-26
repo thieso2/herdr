@@ -25,7 +25,9 @@ use tracing::{debug, info, warn};
 use super::bridge_child::BridgeChild;
 use super::client;
 use super::config::{diff_remotes, sanitize_entries, RemoteChange, RemoteEntry};
-use super::connection::{BackoffTuning, ConnectionMachine, ConnectionState};
+use super::connection::{
+    incompatible_status_line, BackoffTuning, ConnectionMachine, ConnectionState,
+};
 use crate::protocol::framed::{
     parse_pong, parse_session_welcome, ping_request, read_frame, session_hello_request, Frame,
     FrameType, CONTROL_STREAM_ID, FRAMED_MAGIC,
@@ -529,8 +531,22 @@ impl Worker {
                         continue;
                     };
                     if let Some(error) = crate::protocol::framed::control_error(&value) {
-                        if error.code == "protocol_out_of_window" {
-                            return SessionEnd::Incompatible(error.message);
+                        if error.code
+                            == crate::protocol::framed::PROTOCOL_OUT_OF_WINDOW_CODE
+                        {
+                            // The remedy is the remote's own; a rejection
+                            // without one is read as "this side is too old",
+                            // the only side we can act on locally.
+                            let remedy = crate::protocol::framed::parse_hello_remedy(&error)
+                                .unwrap_or(
+                                    crate::protocol::framed::HelloRemedy::UpgradeClient,
+                                );
+                            return SessionEnd::Incompatible(incompatible_status_line(
+                                &self.name,
+                                false,
+                                remedy,
+                                &error.message,
+                            ));
                         }
                     }
                     match parse_session_welcome(&value) {
@@ -736,6 +752,9 @@ mod tests {
         ServeWelcomeAndPongs,
         ServeWelcomeNoPongs,
         ServeWelcomeThenClose,
+        /// Answers the hello with the server's out-of-window rejection: the
+        /// remote is older than this client's window.
+        RejectOutOfWindow,
     }
 
     /// Transport whose connections are scripted in-memory framed servers.
@@ -801,6 +820,22 @@ mod tests {
             };
             let id = request["id"].clone();
             match request["method"].as_str() {
+                Some("session.hello") if behavior == FakeBehavior::RejectOutOfWindow => {
+                    let rejection = serde_json::json!({
+                        "id": id,
+                        "error": {
+                            "code": crate::protocol::framed::PROTOCOL_OUT_OF_WINDOW_CODE,
+                            "message": "client minimum protocol 2 is newer than this server's protocol 1; upgrade this herdr server",
+                            "data": {
+                                "remedy": "upgrade_server",
+                                "server_protocol": 1,
+                                "server_min_protocol": 1,
+                            },
+                        },
+                    });
+                    let _ = client::send_control(&mut writer, &rejection);
+                    return;
+                }
                 Some("session.hello") => {
                     let welcome = serde_json::json!({
                         "id": id,
@@ -842,6 +877,42 @@ mod tests {
             .into_iter()
             .find(|status| status.entry.name == name)
             .map(|status| status.kind)
+    }
+
+    #[test]
+    fn out_of_window_remote_parks_incompatible_and_stops_the_retry_ladder() {
+        let transport = ScriptedTransport::new(vec![FakeBehavior::RejectOutOfWindow]);
+        let mut manager = FleetManager::start(
+            vec![entry("gpu-1")],
+            Arc::clone(&transport) as Arc<dyn FleetTransport>,
+            tuning(Duration::from_millis(10)),
+            noop_hook(),
+        );
+
+        assert!(
+            wait_for(Duration::from_secs(5), || matches!(
+                kind_of(&manager, "gpu-1"),
+                Some(RemoteStatusKind::Incompatible { .. })
+            )),
+            "an out-of-window remote must park incompatible, not retry as offline: {:?}",
+            kind_of(&manager, "gpu-1")
+        );
+        let Some(RemoteStatusKind::Incompatible { message }) = kind_of(&manager, "gpu-1") else {
+            panic!("expected an incompatible status");
+        };
+        // The greyed-out remote names the machine and the exact fix.
+        assert!(message.contains("remote gpu-1"), "{message}");
+        assert!(message.contains("herdr remote upgrade gpu-1"), "{message}");
+
+        // Terminal: the backoff ladder stops instead of reconnecting forever.
+        let connects = transport.connects();
+        std::thread::sleep(Duration::from_millis(150));
+        assert_eq!(
+            transport.connects(),
+            connects,
+            "incompatible must not schedule further connects"
+        );
+        manager.stop();
     }
 
     #[test]

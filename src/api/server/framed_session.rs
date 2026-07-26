@@ -38,7 +38,7 @@ use crate::pane::write_grant::WriteGrant;
 use crate::protocol::framed::{
     decode_frame_header, decode_history_cursor, encode_history_cursor,
     history_page_end_cut_mid_line, history_page_start, negotiate_session_hello,
-    parse_stream_opened, write_frame, Frame, FrameType, FramedCodecError, HelloError, HelloRemedy,
+    parse_stream_opened, write_frame, Frame, FrameType, FramedCodecError, HelloError,
     HistoryCursor, NegotiatedSession, PanePasteImageControlParams, PaneSendBytesControlParams,
     SessionHelloParams, StreamCloseParams, StreamHistoryParams, StreamOpenParams,
     StreamResizeParams, StreamScrollDirection, StreamScrollParams, StreamScrollSource,
@@ -524,10 +524,7 @@ fn negotiate_handshake(
         }
         Err(HelloError::OutOfWindow { remedy, message }) => {
             let data = serde_json::json!({
-                "remedy": match remedy {
-                    HelloRemedy::UpgradeClient => "upgrade_client",
-                    HelloRemedy::UpgradeServer => "upgrade_server",
-                },
+                "remedy": remedy.as_str(),
                 "server_protocol": FRAMED_PROTOCOL_VERSION,
                 "server_min_protocol": FRAMED_PROTOCOL_MIN_SUPPORTED,
                 "client_protocol": params.protocol,
@@ -535,7 +532,12 @@ fn negotiate_handshake(
             });
             write_control_allow_disconnect(
                 stream,
-                &error_response(&request.id, "protocol_out_of_window", &message, Some(data)),
+                &error_response(
+                    &request.id,
+                    crate::protocol::framed::PROTOCOL_OUT_OF_WINDOW_CODE,
+                    &message,
+                    Some(data),
+                ),
             )?;
             Ok(None)
         }

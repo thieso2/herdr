@@ -7,6 +7,8 @@
 
 use std::time::{Duration, Instant};
 
+use crate::protocol::framed::HelloRemedy;
+
 /// Default first-retry delay.
 pub const BACKOFF_BASE: Duration = Duration::from_secs(1);
 /// Default backoff ceiling (~30s per the fleet reconnect contract).
@@ -49,6 +51,44 @@ pub fn backoff_delay(attempt: u32, tuning: BackoffTuning, jitter: f64) -> Durati
         .min(tuning.cap);
     let factor = 0.5 + jitter.clamp(0.0, 1.0);
     raw.mul_f64(factor).min(tuning.cap)
+}
+
+/// The exact fix for an out-of-window peer, as a command the user can run.
+/// The remedy always comes from the peer's own rejection, never a guess: an
+/// older *server* must not be reported as "upgrade the client".
+pub fn incompatible_fix_command(name: &str, is_local: bool, remedy: HelloRemedy) -> String {
+    match remedy {
+        // This side is older than the peer's window: upgrade here.
+        HelloRemedy::UpgradeClient => "herdr update".to_string(),
+        // The peer is older. The local runtime ships with this install, so it
+        // upgrades with `herdr update`; a fleet remote is rolled forward
+        // explicitly, by name, and never automatically.
+        HelloRemedy::UpgradeServer if is_local => "herdr update".to_string(),
+        HelloRemedy::UpgradeServer => format!("herdr remote upgrade {name}"),
+    }
+}
+
+/// The greyed-out remote's status line: which machine is out of window, why,
+/// and the exact command that fixes it. Shared by the fleet manager and the
+/// pure client so both name the machine identically.
+pub fn incompatible_status_line(
+    name: &str,
+    is_local: bool,
+    remedy: HelloRemedy,
+    detail: &str,
+) -> String {
+    let subject = if is_local {
+        "the local herdr server".to_string()
+    } else {
+        format!("remote {name}")
+    };
+    let fix = incompatible_fix_command(name, is_local, remedy);
+    let detail = detail.trim();
+    if detail.is_empty() {
+        format!("{subject} is outside the supported protocol window; run `{fix}`")
+    } else {
+        format!("{subject} is outside the supported protocol window: {detail}; run `{fix}`")
+    }
 }
 
 /// Connection lifecycle of one remote. Plain data; renders directly into the
@@ -375,6 +415,30 @@ mod tests {
             machine.next_deadline(),
             Some(reset_at + Duration::from_secs(1))
         );
+    }
+
+    #[test]
+    fn incompatible_status_line_names_the_machine_and_the_exact_fix() {
+        // An older *remote* is rolled forward explicitly, by name.
+        let line = incompatible_status_line(
+            "gpu-1",
+            false,
+            HelloRemedy::UpgradeServer,
+            "client minimum protocol 2 is newer than this server's protocol 1",
+        );
+        assert!(line.contains("remote gpu-1"), "{line}");
+        assert!(line.contains("herdr remote upgrade gpu-1"), "{line}");
+
+        // An older *client* upgrades here, whichever peer reported it.
+        let line = incompatible_status_line("gpu-1", false, HelloRemedy::UpgradeClient, "");
+        assert!(line.contains("herdr update"), "{line}");
+        assert!(!line.contains("remote upgrade"), "{line}");
+
+        // The local runtime is this install: it upgrades with the client.
+        let line = incompatible_status_line("local", true, HelloRemedy::UpgradeServer, "detail");
+        assert!(line.contains("the local herdr server"), "{line}");
+        assert!(line.contains("herdr update"), "{line}");
+        assert!(!line.contains("remote upgrade"), "{line}");
     }
 
     #[test]

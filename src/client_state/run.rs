@@ -36,7 +36,7 @@ use crate::protocol::framed::{
     control_error, pane_send_bytes_request, parse_session_snapshot, parse_session_welcome,
     parse_stream_opened, read_frame, session_hello_request_with_capabilities,
     session_snapshot_request, stream_close_request, stream_open_request, stream_resize_request,
-    write_frame, Frame, FrameType, FramedCodecError, SessionWelcome, StreamMode,
+    write_frame, Frame, FrameType, FramedCodecError, HelloRemedy, SessionWelcome, StreamMode,
     CAPABILITY_CATALOG, CAPABILITY_PANE_STREAM, CATALOG_EVENT, CATALOG_RESYNC_EVENT,
     CONTROL_STREAM_ID, FRAMED_MAGIC, PANE_WRITE_LOCKED_ERROR, STREAM_CLOSED_EVENT,
     STREAM_REVOKED_EVENT,
@@ -132,6 +132,7 @@ enum RemoteEstablished {
         guard: BridgeChild,
     },
     Incompatible {
+        remedy: HelloRemedy,
         message: String,
     },
     Failed(String),
@@ -248,7 +249,7 @@ const SESSION_CAPABILITIES: &[&str] = &[
 /// Outcome of one local connect attempt.
 enum ConnectOutcome {
     Connected(Box<ConnectedLocal>),
-    Incompatible { message: String },
+    Incompatible { remedy: HelloRemedy, message: String },
     Failed(String),
 }
 
@@ -259,28 +260,50 @@ struct ConnectedLocal {
     welcome: SessionWelcome,
 }
 
-/// Interprets a `session.hello` answer. `Err(None)` means malformed.
-fn interpret_hello_answer(
-    response: &serde_json::Value,
-) -> Result<SessionWelcome, Result<String, String>> {
+/// Why a `session.hello` did not produce a session.
+enum HelloRejection {
+    /// Terminal for this pairing: the peer is outside the supported window
+    /// (or lacks a capability the client cannot run without). The remedy is
+    /// the server's own, never guessed.
+    Incompatible { remedy: HelloRemedy, message: String },
+    /// Retryable failure (transport, malformed answer, other rejections).
+    Failed(String),
+}
+
+/// Interprets a `session.hello` answer.
+fn interpret_hello_answer(response: &serde_json::Value) -> Result<SessionWelcome, HelloRejection> {
     if let Some(error) = control_error(response) {
-        if error.code == "protocol_out_of_window" {
-            // Err(Ok(_)) = incompatible with this message.
-            return Err(Ok(error.message));
+        if error.code == crate::protocol::framed::PROTOCOL_OUT_OF_WINDOW_CODE {
+            return Err(HelloRejection::Incompatible {
+                // The server names which side must upgrade; a rejection
+                // without a remedy is conservatively read as "this client is
+                // too old", the only side we can act on locally.
+                remedy: crate::protocol::framed::parse_hello_remedy(&error)
+                    .unwrap_or(HelloRemedy::UpgradeClient),
+                message: error.message,
+            });
         }
-        return Err(Err(format!("session.hello rejected: {}", error.message)));
+        return Err(HelloRejection::Failed(format!(
+            "session.hello rejected: {}",
+            error.message
+        )));
     }
     match parse_session_welcome(response) {
         Ok(welcome) => {
-            if !welcome.capabilities.iter().any(|c| c == CAPABILITY_CATALOG) {
-                return Err(Ok(format!(
-                    "server {} does not offer the catalog capability; upgrade that herdr server",
-                    welcome.server_version
-                )));
+            match crate::protocol::framed::check_required_capabilities(
+                &welcome,
+                crate::protocol::framed::REQUIRED_CATALOG_CAPABILITIES,
+            ) {
+                Ok(()) => Ok(welcome),
+                Err(crate::protocol::framed::HelloError::OutOfWindow { remedy, message }) => {
+                    Err(HelloRejection::Incompatible { remedy, message })
+                }
+                Err(crate::protocol::framed::HelloError::InvalidWindow { message }) => {
+                    Err(HelloRejection::Failed(message))
+                }
             }
-            Ok(welcome)
         }
-        Err(err) => Err(Err(err)),
+        Err(err) => Err(HelloRejection::Failed(err)),
     }
 }
 
@@ -358,8 +381,10 @@ fn connect() -> ConnectOutcome {
                 welcome,
             }))
         }
-        Err(Ok(message)) => ConnectOutcome::Incompatible { message },
-        Err(Err(err)) => ConnectOutcome::Failed(err),
+        Err(HelloRejection::Incompatible { remedy, message }) => {
+            ConnectOutcome::Incompatible { remedy, message }
+        }
+        Err(HelloRejection::Failed(err)) => ConnectOutcome::Failed(err),
     }
 }
 
@@ -463,15 +488,15 @@ fn remote_connect_and_read(
                 return;
             }
         }
-        Err(Ok(message)) => {
+        Err(HelloRejection::Incompatible { remedy, message }) => {
             let _ = event_tx.send(LoopEvent::Established(
                 remote,
                 generation,
-                Box::new(RemoteEstablished::Incompatible { message }),
+                Box::new(RemoteEstablished::Incompatible { remedy, message }),
             ));
             return;
         }
-        Err(Err(message)) => {
+        Err(HelloRejection::Failed(message)) => {
             let _ = event_tx.send(LoopEvent::Established(
                 remote,
                 generation,
@@ -960,12 +985,16 @@ fn establish_local(
             });
             Link::Up(Box::new(session))
         }
-        ConnectOutcome::Incompatible { message } => {
-            mirror.connection.incompatible(
-                crate::protocol::framed::HelloRemedy::UpgradeClient,
-                message.clone(),
+        ConnectOutcome::Incompatible { remedy, message } => {
+            let status = crate::fleet::connection::incompatible_status_line(
+                &mirror.name,
+                true,
+                remedy,
+                &message,
             );
-            chrome.connection_status = Some(message);
+            warn!(status = %status, "local server protocol incompatible");
+            mirror.connection.incompatible(remedy, message);
+            chrome.connection_status = Some(status);
             Link::Incompatible
         }
         ConnectOutcome::Failed(error) => {
@@ -1094,11 +1123,16 @@ fn handle_established(
             }
             ctx.links.insert(remote, Link::Up(Box::new(session)));
         }
-        RemoteEstablished::Incompatible { message } => {
-            warn!(remote, message = %message, "fleet remote protocol incompatible");
-            mirror
-                .connection
-                .incompatible(crate::protocol::framed::HelloRemedy::UpgradeClient, message);
+        RemoteEstablished::Incompatible { remedy, message } => {
+            let status = crate::fleet::connection::incompatible_status_line(
+                &mirror.name,
+                remote == LOCAL_REMOTE_INDEX,
+                remedy,
+                &message,
+            );
+            warn!(remote, status = %status, "fleet remote protocol incompatible");
+            mirror.connection.incompatible(remedy, message);
+            ctx.chrome.connection_status = Some(status);
             ctx.links.insert(remote, Link::Incompatible);
         }
         RemoteEstablished::Failed(error) => {
@@ -2771,6 +2805,46 @@ mod tests {
         });
     }
 
+    #[test]
+    fn hello_rejection_keeps_the_servers_own_remedy() {
+        // An older *server* must never be reported as "upgrade the client".
+        let rejection = serde_json::json!({
+            "id": "pure:hello:0",
+            "error": {
+                "code": crate::protocol::framed::PROTOCOL_OUT_OF_WINDOW_CODE,
+                "message": "client minimum protocol 2 is newer than this server's protocol 1",
+                "data": { "remedy": "upgrade_server" },
+            },
+        });
+        match interpret_hello_answer(&rejection) {
+            Err(HelloRejection::Incompatible { remedy, message }) => {
+                assert_eq!(remedy, HelloRemedy::UpgradeServer);
+                assert!(message.contains("protocol 1"), "{message}");
+            }
+            _ => panic!("expected an incompatible rejection"),
+        }
+
+        // A welcome without the catalog capability is equally terminal, and
+        // equally an upgrade-the-server situation.
+        let welcome = serde_json::json!({
+            "id": "pure:hello:0",
+            "result": {
+                "type": "session.welcome",
+                "protocol": 1,
+                "min_protocol": 1,
+                "capabilities": ["pane-stream"],
+                "server_version": "0.9.0",
+            },
+        });
+        match interpret_hello_answer(&welcome) {
+            Err(HelloRejection::Incompatible { remedy, message }) => {
+                assert_eq!(remedy, HelloRemedy::UpgradeServer);
+                assert!(message.contains("catalog"), "{message}");
+            }
+            _ => panic!("expected an incompatible rejection"),
+        }
+    }
+
     #[tokio::test]
     async fn established_outcomes_from_stale_generations_are_dropped() {
         with_test_ctx(three_descriptors(), |ctx| {
@@ -2785,6 +2859,7 @@ mod tests {
                 1,
                 2,
                 RemoteEstablished::Incompatible {
+                    remedy: HelloRemedy::UpgradeServer,
                     message: "windows do not overlap".into(),
                 },
                 ctx,
@@ -2792,8 +2867,19 @@ mod tests {
             assert!(matches!(ctx.links.get(&1), Some(Link::Incompatible)));
             assert!(matches!(
                 ctx.mirrors.get(1).map(|mirror| &mirror.connection),
-                Some(super::super::ClientConnectionState::Incompatible { .. })
+                Some(super::super::ClientConnectionState::Incompatible {
+                    remedy: HelloRemedy::UpgradeServer,
+                    ..
+                })
             ));
+            // The greyed-out remote names itself and the exact fix.
+            let status = ctx
+                .chrome
+                .connection_status
+                .clone()
+                .expect("an incompatible remote reports a remedy");
+            assert!(status.contains("buildbox"), "{status}");
+            assert!(status.contains("herdr remote upgrade buildbox"), "{status}");
         });
     }
 

@@ -20,6 +20,22 @@
 //!
 //! The legacy bincode client protocol in `wire.rs` is frozen; new runtime
 //! capabilities land here.
+//!
+//! # Version-skew policy (n/n-1)
+//!
+//! Bump [`FRAMED_PROTOCOL_VERSION`] **only** for breaking frame or control
+//! envelope changes. Additive features never bump the integer: they ride
+//! string capability flags negotiated in `session.hello` (the session's set
+//! is client capabilities ∩ server capabilities), so a peer that does not
+//! know a flag simply does not get the feature.
+//!
+//! When the integer is bumped, [`FRAMED_PROTOCOL_MIN_SUPPORTED`] must move to
+//! `FRAMED_PROTOCOL_VERSION - 1` in the same change so any two adjacent
+//! releases interoperate; `window_is_n_and_n_minus_one` enforces that
+//! invariant. The negotiated session speaks the older side's version. A peer
+//! outside the window is rejected with a `protocol_out_of_window` control
+//! error whose `data.remedy` names exactly which side must upgrade, so the
+//! client can render the exact fix instead of guessing.
 
 use std::io::{self, Read, Write};
 
@@ -44,8 +60,20 @@ pub const MAX_FRAME_PAYLOAD: usize = 32 * 1024 * 1024;
 pub const FRAMED_PROTOCOL_VERSION: u32 = 1;
 
 /// Oldest framed protocol version this build still speaks. Kept within an
-/// n/n-1 window of `FRAMED_PROTOCOL_VERSION` so adjacent releases interoperate.
+/// n/n-1 window of `FRAMED_PROTOCOL_VERSION` so adjacent releases
+/// interoperate: bumping the version without moving this constant collapses
+/// the window and breaks every n-1 peer.
 pub const FRAMED_PROTOCOL_MIN_SUPPORTED: u32 = 1;
+
+// The n/n-1 window is a compile-time invariant, not a convention: a version
+// bump that forgets the minimum fails the build here.
+const _: () = {
+    assert!(FRAMED_PROTOCOL_MIN_SUPPORTED <= FRAMED_PROTOCOL_VERSION);
+    assert!(FRAMED_PROTOCOL_MIN_SUPPORTED + 1 >= FRAMED_PROTOCOL_VERSION);
+};
+
+/// Control-error code of an out-of-window `session.hello` rejection.
+pub const PROTOCOL_OUT_OF_WINDOW_CODE: &str = "protocol_out_of_window";
 
 /// Stream id carrying control-plane frames. Data stream ids are
 /// server-allocated and never reuse this value.
@@ -374,6 +402,25 @@ pub enum HelloRemedy {
     UpgradeServer,
 }
 
+impl HelloRemedy {
+    /// Wire spelling carried in the rejection's `data.remedy`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::UpgradeClient => "upgrade_client",
+            Self::UpgradeServer => "upgrade_server",
+        }
+    }
+
+    /// Parses the wire spelling back into a remedy.
+    pub fn from_wire(value: &str) -> Option<Self> {
+        match value {
+            "upgrade_client" => Some(Self::UpgradeClient),
+            "upgrade_server" => Some(Self::UpgradeServer),
+            _ => None,
+        }
+    }
+}
+
 /// Why a `session.hello` was rejected.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HelloError {
@@ -693,6 +740,41 @@ pub(crate) fn negotiate_version_windows(
     Ok(client_max.min(server_max))
 }
 
+/// Capability flags a catalog-driving client cannot run without: without
+/// them the connection is functionally incompatible even though the version
+/// windows overlap. Checked with [`check_required_capabilities`].
+pub const REQUIRED_CATALOG_CAPABILITIES: &[&str] = &[CAPABILITY_CATALOG];
+
+/// Rejects a negotiated welcome that is missing a capability the client
+/// cannot run without. Shaped like the version-window rejection so callers
+/// treat "too old to speak my version" and "too old to offer what I need"
+/// identically: both are terminal, and both name the side to upgrade.
+pub fn check_required_capabilities(
+    welcome: &SessionWelcome,
+    required: &[&str],
+) -> Result<(), HelloError> {
+    let missing: Vec<&str> = required
+        .iter()
+        .copied()
+        .filter(|capability| !welcome.capabilities.iter().any(|have| have == capability))
+        .collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    let server_version = if welcome.server_version.is_empty() {
+        "unknown".to_string()
+    } else {
+        welcome.server_version.clone()
+    };
+    Err(HelloError::OutOfWindow {
+        remedy: HelloRemedy::UpgradeServer,
+        message: format!(
+            "herdr server {server_version} does not offer the {} capability",
+            missing.join(", ")
+        ),
+    })
+}
+
 /// Intersects client capability flags with the server's supported set,
 /// preserving client order and dropping duplicates.
 pub(crate) fn negotiate_capabilities(client: &[String], server: &[&str]) -> Vec<String> {
@@ -905,6 +987,22 @@ pub struct ControlError {
     pub code: String,
     pub message: String,
     pub data: Option<serde_json::Value>,
+}
+
+/// The remedy an out-of-window rejection carries in `data.remedy`, when the
+/// error is one. The server writes it; this is the client half of that round
+/// trip, so an out-of-window *server* is never reported as "upgrade the
+/// client".
+pub fn parse_hello_remedy(error: &ControlError) -> Option<HelloRemedy> {
+    if error.code != PROTOCOL_OUT_OF_WINDOW_CODE {
+        return None;
+    }
+    error
+        .data
+        .as_ref()
+        .and_then(|data| data.get("remedy"))
+        .and_then(|value| value.as_str())
+        .and_then(HelloRemedy::from_wire)
 }
 
 /// Extracts the error body of a control response, if it carries one.
@@ -1577,6 +1675,84 @@ mod tests {
             }
             other => panic!("expected invalid window rejection, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn window_is_n_and_n_minus_one() {
+        // The policy invariant: a version bump must move the minimum with
+        // it, or every n-1 peer stops interoperating. Kept as a runtime test
+        // next to the compile-time assertion so the failure names the rule.
+        assert!(
+            FRAMED_PROTOCOL_MIN_SUPPORTED <= FRAMED_PROTOCOL_VERSION,
+            "min supported protocol must not exceed the current protocol"
+        );
+        assert!(
+            FRAMED_PROTOCOL_MIN_SUPPORTED >= FRAMED_PROTOCOL_VERSION.saturating_sub(1),
+            "bumping FRAMED_PROTOCOL_VERSION requires FRAMED_PROTOCOL_MIN_SUPPORTED = version - 1"
+        );
+    }
+
+    #[test]
+    fn hello_remedy_round_trips_through_the_wire_spelling() {
+        for remedy in [HelloRemedy::UpgradeClient, HelloRemedy::UpgradeServer] {
+            assert_eq!(HelloRemedy::from_wire(remedy.as_str()), Some(remedy));
+        }
+        assert_eq!(HelloRemedy::from_wire("upgrade_everything"), None);
+    }
+
+    #[test]
+    fn parse_hello_remedy_reads_the_servers_remedy_back() {
+        let rejection = serde_json::json!({
+            "id": "h1",
+            "error": {
+                "code": PROTOCOL_OUT_OF_WINDOW_CODE,
+                "message": "client minimum protocol 4 is newer than this server's protocol 2",
+                "data": { "remedy": "upgrade_server", "server_protocol": 2 },
+            },
+        });
+        let error = control_error(&rejection).expect("rejection carries an error");
+        assert_eq!(parse_hello_remedy(&error), Some(HelloRemedy::UpgradeServer));
+
+        // Other rejections carry no remedy, and neither does a malformed one.
+        let other = ControlError {
+            code: "invalid_request".into(),
+            message: "nope".into(),
+            data: Some(serde_json::json!({ "remedy": "upgrade_server" })),
+        };
+        assert_eq!(parse_hello_remedy(&other), None);
+        let bare = ControlError {
+            code: PROTOCOL_OUT_OF_WINDOW_CODE.into(),
+            message: "nope".into(),
+            data: None,
+        };
+        assert_eq!(parse_hello_remedy(&bare), None);
+    }
+
+    #[test]
+    fn required_capabilities_reject_a_server_that_lacks_them() {
+        let welcome = SessionWelcome {
+            protocol: FRAMED_PROTOCOL_VERSION,
+            min_protocol: FRAMED_PROTOCOL_MIN_SUPPORTED,
+            capabilities: vec![CAPABILITY_PANE_STREAM.to_string()],
+            server_version: "0.9.0".to_string(),
+        };
+        match check_required_capabilities(&welcome, REQUIRED_CATALOG_CAPABILITIES) {
+            Err(HelloError::OutOfWindow { remedy, message }) => {
+                assert_eq!(remedy, HelloRemedy::UpgradeServer);
+                assert!(message.contains("0.9.0"), "{message}");
+                assert!(message.contains(CAPABILITY_CATALOG), "{message}");
+            }
+            other => panic!("expected an upgrade-server rejection, got {other:?}"),
+        }
+
+        let full = SessionWelcome {
+            capabilities: vec![
+                CAPABILITY_PANE_STREAM.to_string(),
+                CAPABILITY_CATALOG.to_string(),
+            ],
+            ..welcome
+        };
+        assert!(check_required_capabilities(&full, REQUIRED_CATALOG_CAPABILITIES).is_ok());
     }
 
     #[test]

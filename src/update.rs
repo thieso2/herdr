@@ -3458,12 +3458,8 @@ mod tests {
         assert_eq!(release.sha256.as_deref(), Some("deadbeef"));
     }
 
-    const FORK_MANIFEST_TARGETS: [&str; 4] = [
-        "linux-x86_64",
-        "linux-aarch64",
-        "macos-x86_64",
-        "macos-aarch64",
-    ];
+    // macOS x86_64 is deliberately not built; this fork ships Apple Silicon only.
+    const FORK_MANIFEST_TARGETS: [&str; 3] = ["linux-x86_64", "linux-aarch64", "macos-aarch64"];
 
     #[test]
     fn checked_in_fork_manifest_matches_update_schema() {

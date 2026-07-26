@@ -5,7 +5,6 @@
   "assets": {
     "linux-x86_64": "https://github.com/thieso2/herdr/releases/download/overherdr-v0.7.102/overherdr-linux-x86_64",
     "linux-aarch64": "https://github.com/thieso2/herdr/releases/download/overherdr-v0.7.102/overherdr-linux-aarch64",
-    "macos-x86_64": "https://github.com/thieso2/herdr/releases/download/overherdr-v0.7.102/overherdr-macos-x86_64",
     "macos-aarch64": "https://github.com/thieso2/herdr/releases/download/overherdr-v0.7.102/overherdr-macos-aarch64"
   },
   "releases": {
@@ -14,7 +13,6 @@
       "assets": {
         "linux-x86_64": "https://github.com/thieso2/herdr/releases/download/overherdr-v0.7.100/overherdr-linux-x86_64",
         "linux-aarch64": "https://github.com/thieso2/herdr/releases/download/overherdr-v0.7.100/overherdr-linux-aarch64",
-        "macos-x86_64": "https://github.com/thieso2/herdr/releases/download/overherdr-v0.7.100/overherdr-macos-x86_64",
         "macos-aarch64": "https://github.com/thieso2/herdr/releases/download/overherdr-v0.7.100/overherdr-macos-aarch64"
       },
       "protocol": 18
@@ -24,7 +22,6 @@
       "assets": {
         "linux-x86_64": "https://github.com/thieso2/herdr/releases/download/overherdr-v0.7.101/overherdr-linux-x86_64",
         "linux-aarch64": "https://github.com/thieso2/herdr/releases/download/overherdr-v0.7.101/overherdr-linux-aarch64",
-        "macos-x86_64": "https://github.com/thieso2/herdr/releases/download/overherdr-v0.7.101/overherdr-macos-x86_64",
         "macos-aarch64": "https://github.com/thieso2/herdr/releases/download/overherdr-v0.7.101/overherdr-macos-aarch64"
       },
       "protocol": 18
@@ -34,7 +31,6 @@
       "assets": {
         "linux-x86_64": "https://github.com/thieso2/herdr/releases/download/overherdr-v0.7.102/overherdr-linux-x86_64",
         "linux-aarch64": "https://github.com/thieso2/herdr/releases/download/overherdr-v0.7.102/overherdr-linux-aarch64",
-        "macos-x86_64": "https://github.com/thieso2/herdr/releases/download/overherdr-v0.7.102/overherdr-macos-x86_64",
         "macos-aarch64": "https://github.com/thieso2/herdr/releases/download/overherdr-v0.7.102/overherdr-macos-aarch64"
       },
       "protocol": 18

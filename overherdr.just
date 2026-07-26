@@ -3,10 +3,15 @@
 # Upstream has never seen this file, so it cannot conflict on a merge. Recipes
 # are prefixed `overherdr-` so they can never collide with upstream's.
 #
+# Remote topology: `origin` is this fork (thieso2/herdr). Upstream, if present
+# at all, is a fetch-only `upstream` remote. Set `overherdr_remote` if yours
+# differs.
+#
 # Two landmines these exist to avoid:
-#   1. In this clone `origin` is UPSTREAM and the fork is the `fork` remote, so
-#      upstream's `release-publish` aims the release commit and tag straight at
-#      ogulcancelik/herdr. These push to `fork`.
+#   1. Upstream's `release-publish` recipe pushes the release commit and tag to
+#      whatever `origin` is. In a clone that still has origin=upstream that
+#      aims straight at ogulcancelik/herdr, so these recipes always name the
+#      remote explicitly rather than inheriting it.
 #   2. Upstream's release.yml fires on `v*`. The fork tag prefix is
 #      `overherdr-v` so the two pipelines can never overlap.
 #
@@ -14,7 +19,7 @@
 # verbatim. The release-docs check is skipped: the fork does not publish docs.
 
 overherdr_tag_prefix := "overherdr-v"
-overherdr_remote := "fork"
+overherdr_remote := env_var_or_default("OVERHERDR_REMOTE", "origin")
 
 # Prepare the fork release commit without tagging or pushing (usage: just overherdr-release-prepare 0.7.100)
 overherdr-release-prepare version:

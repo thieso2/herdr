@@ -1,3 +1,5 @@
+> **You are looking at [`overherdr`](OVERHERDR.md)** — a vibecoded fork of herdr for experimenting with multi-remote fleets. A weekend experiment, not headed upstream. See [OVERHERDR.md](OVERHERDR.md) for what differs and how to install it. Everything below is upstream's README.
+
 # herdr
 
 

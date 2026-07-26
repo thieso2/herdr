@@ -25,3 +25,7 @@ __pycache__/
 
 /.wrangler/
 **/.wrangler/
+# Local release-binary builds from `mise run build:dist`. Matched by shape so
+# the tracked update manifest (dist/latest.json) can never be swallowed.
+/dist/herdr-*
+/dist/overherdr-*

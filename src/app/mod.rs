@@ -20,8 +20,8 @@ mod input;
 pub(crate) use input::MouseAction;
 #[cfg(unix)]
 pub(crate) use input::{
-    insert_rename_input_text, is_retained_selection_copy_key, pure_client_modal_key,
-    pure_client_modal_mouse, PureModalIds,
+    handle_global_menu_key, handle_keybind_help_key, insert_rename_input_text,
+    is_retained_selection_copy_key, pure_client_modal_key, pure_client_modal_mouse, PureModalIds,
 };
 mod popup;
 mod runtime;
@@ -567,6 +567,7 @@ impl App {
             should_quit: false,
             detach_exits: no_session,
             detach_requested: false,
+            pure_client: false,
             request_new_workspace: false,
             request_new_tab: false,
             request_new_linked_worktree: None,

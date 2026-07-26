@@ -82,11 +82,17 @@ pub(crate) enum GlobalMenuAction {
 }
 
 pub(super) fn global_menu_actions(state: &AppState) -> Vec<GlobalMenuAction> {
-    let mut actions = vec![
-        GlobalMenuAction::Settings,
-        GlobalMenuAction::Keybinds,
-        GlobalMenuAction::ReloadConfig,
-    ];
+    // Kept index-aligned with AppState::global_menu_labels: the menu rect
+    // is sized from the labels while clicks resolve through this list, so
+    // any gating must skip entries in both.
+    let mut actions = Vec::new();
+    if !state.pure_client {
+        actions.push(GlobalMenuAction::Settings);
+    }
+    actions.push(GlobalMenuAction::Keybinds);
+    if !state.pure_client {
+        actions.push(GlobalMenuAction::ReloadConfig);
+    }
     if state.update_available.is_some() || state.latest_release_notes_available {
         actions.push(GlobalMenuAction::WhatsNew);
     }
@@ -1893,6 +1899,37 @@ mod tests {
 
         assert!(state.detach_requested);
         assert!(!state.should_quit);
+    }
+
+    #[test]
+    fn pure_client_menu_actions_and_labels_stay_aligned() {
+        let mut state = AppState::test_new();
+        for pure_client in [false, true] {
+            state.pure_client = pure_client;
+            let actions = global_menu_actions(&state);
+            let labels = state.global_menu_labels();
+            assert_eq!(
+                actions.len(),
+                labels.len(),
+                "menu rects size from labels while clicks resolve through \
+                 actions; the lists must stay index-aligned (pure_client={pure_client})"
+            );
+            let expected: Vec<&str> = actions
+                .iter()
+                .map(|action| match action {
+                    GlobalMenuAction::Settings => "settings",
+                    GlobalMenuAction::Keybinds => "keybinds",
+                    GlobalMenuAction::ReloadConfig => "reload config",
+                    GlobalMenuAction::WhatsNew => "what's new",
+                    GlobalMenuAction::Detach => "detach",
+                })
+                .collect();
+            assert_eq!(labels, expected);
+            if pure_client {
+                assert!(!actions.contains(&GlobalMenuAction::Settings));
+                assert!(!actions.contains(&GlobalMenuAction::ReloadConfig));
+            }
+        }
     }
 
     #[test]

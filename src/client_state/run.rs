@@ -607,6 +607,11 @@ fn run_pure_client_over(
     apply_client_config(&mut app, config);
     chrome.sidebar_collapsed = app.sidebar_collapsed;
     app.mode = Mode::Navigate;
+    // Menu entries with no client-side effect (settings, reload config) are
+    // omitted from the global menu, and detach exits the fleet client while
+    // leaving every remote server running (same as prefix-d).
+    app.pure_client = true;
+    app.detach_exits = true;
 
     let should_quit = Arc::new(AtomicBool::new(false));
     let (event_tx, event_rx) = mpsc::sync_channel::<LoopEvent>(1024);
@@ -2085,8 +2090,16 @@ fn handle_key(key: crate::input::TerminalKey, ctx: &mut LoopCtx<'_>) {
                 fallback_remote,
             );
         }
+        Mode::GlobalMenu => {
+            // The global menu is a pure AppState modal: reuse the legacy
+            // key handler (Esc closes, arrows move, Enter applies).
+            crate::app::handle_global_menu_key(ctx.app, key.as_key_event());
+        }
+        Mode::KeybindHelp => {
+            crate::app::handle_keybind_help_key(ctx.app, key);
+        }
         _ => {
-            // Residual modal modes (Settings, Navigator, GlobalMenu,
+            // Residual modal modes (Settings, Navigator,
             // worktree dialogs) are unsupported under the flag: their
             // handlers live on App, coupled to config-file persistence and
             // live workspace runtimes (see the NOT CLOSED note in
@@ -2768,6 +2781,40 @@ mod tests {
                 enabled: true,
             },
         ])
+    }
+
+    #[tokio::test]
+    async fn global_menu_and_keybind_help_keys_are_handled_client_side() {
+        with_test_ctx(vec![RemoteDescriptor::local()], |ctx| {
+            ctx.app.pure_client = true;
+            ctx.app.detach_exits = true;
+
+            // Open the menu; q inside the menu must not quit the client.
+            ctx.app.mode = Mode::GlobalMenu;
+            ctx.app.global_menu = crate::app::state::MenuListState::new(0);
+            handle_key(key(KeyCode::Char('q')), ctx);
+            assert!(!ctx.app.should_quit, "q inside the menu must not quit");
+            assert_eq!(ctx.app.mode, Mode::GlobalMenu);
+
+            // Enter on the first entry (keybinds) opens the help overlay,
+            // and Esc walks back out to a base mode.
+            handle_key(key(KeyCode::Enter), ctx);
+            assert_eq!(ctx.app.mode, Mode::KeybindHelp);
+            handle_key(key(KeyCode::Esc), ctx);
+            assert_eq!(ctx.app.mode, Mode::Navigate);
+
+            // Esc closes the menu itself.
+            ctx.app.mode = Mode::GlobalMenu;
+            handle_key(key(KeyCode::Esc), ctx);
+            assert_eq!(ctx.app.mode, Mode::Navigate);
+            assert!(!ctx.app.should_quit);
+
+            // Enter on detach (last entry) exits the fleet client.
+            ctx.app.mode = Mode::GlobalMenu;
+            ctx.app.global_menu = crate::app::state::MenuListState::new(1);
+            handle_key(key(KeyCode::Enter), ctx);
+            assert!(ctx.app.should_quit, "detach exits the pure client");
+        });
     }
 
     #[tokio::test]

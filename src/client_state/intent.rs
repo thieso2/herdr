@@ -285,9 +285,8 @@ pub(super) fn dispatch_mouse_intent(
     // them needs either extracting those handlers into AppState-level
     // state machines like pure_client_modal_key, or a config surface on
     // the control plane; neither fits this change. What remains:
-    // interpret MouseAction::Settings plus Mode::Settings, Mode::Navigator,
-    // and Mode::GlobalMenu key handling client-side. The same applies to
-    // the worktree dialog modes, which additionally run git operations.
+    // interpret MouseAction::Settings plus Mode::Settings and Mode::Navigator
+    // client-side. The same applies to the worktree dialog modes, which additionally run git operations.
     if !matches!(
         app.mode,
         crate::app::Mode::Terminal
@@ -296,6 +295,8 @@ pub(super) fn dispatch_mouse_intent(
             | crate::app::Mode::Copy
             | crate::app::Mode::ContextMenu
             | crate::app::Mode::ConfirmClose
+            | crate::app::Mode::GlobalMenu
+            | crate::app::Mode::KeybindHelp
             | crate::app::Mode::RenameWorkspace
             | crate::app::Mode::RenameTab
             | crate::app::Mode::RenamePane
@@ -680,6 +681,91 @@ mod tests {
             panic!("expected tab.focus, got {method:?}");
         };
         assert_eq!(target.tab_id, "t_2_1");
+    }
+
+    #[tokio::test]
+    async fn launcher_click_opens_a_global_menu_that_survives_dispatch() {
+        let (mut mirrors, mut ids, mut app) = composed();
+        app.mode = crate::app::Mode::Terminal;
+        crate::ui::compute_view(&mut app, ratatui::layout::Rect::new(0, 0, 106, 20));
+        let launcher = app.global_launcher_rect();
+
+        let mut links = super::super::run::Links::new();
+        let mut chrome = super::super::chrome::GlobalChrome::new();
+        let mouse = MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: launcher.x,
+            row: launcher.y,
+            modifiers: KeyModifiers::empty(),
+        };
+        dispatch_mouse_intent(
+            mouse,
+            &mut links,
+            &mut mirrors,
+            &mut ids,
+            &[RemoteDescriptor::local()],
+            &mut app,
+            &mut chrome,
+        );
+
+        // The click opens the menu and the post-dispatch mode guard must
+        // let it live: a reverted mode means a silently dead menu button.
+        assert_eq!(app.mode, crate::app::Mode::GlobalMenu);
+    }
+
+    #[tokio::test]
+    async fn pure_client_global_menu_offers_keybinds_and_detach_only() {
+        let (mut mirrors, mut ids, mut app) = composed();
+        app.mode = crate::app::Mode::Terminal;
+        app.pure_client = true;
+        app.detach_exits = true;
+        crate::ui::compute_view(&mut app, ratatui::layout::Rect::new(0, 0, 106, 20));
+
+        let mut links = super::super::run::Links::new();
+        let mut chrome = super::super::chrome::GlobalChrome::new();
+        let click = |column: u16, row: u16| MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column,
+            row,
+            modifiers: KeyModifiers::empty(),
+        };
+
+        // Settings and reload config have no client-side effect; they are
+        // omitted so no menu row is silently dead.
+        assert_eq!(app.global_menu_labels(), vec!["keybinds", "detach"]);
+
+        let launcher = app.global_launcher_rect();
+        let mut dispatch = |mouse, app: &mut AppState, chrome: &mut _| {
+            dispatch_mouse_intent(
+                mouse,
+                &mut links,
+                &mut mirrors,
+                &mut ids,
+                &[RemoteDescriptor::local()],
+                app,
+                chrome,
+            );
+        };
+        dispatch(click(launcher.x, launcher.y), &mut app, &mut chrome);
+        assert_eq!(app.mode, crate::app::Mode::GlobalMenu);
+
+        // Row 1 is keybinds: the help overlay opens and survives dispatch.
+        let menu = app.global_menu_rect();
+        dispatch(click(menu.x + 2, menu.y + 1), &mut app, &mut chrome);
+        assert_eq!(app.mode, crate::app::Mode::KeybindHelp);
+
+        // Reopen and click outside: back to the base mode, nothing quits.
+        dispatch(click(launcher.x, launcher.y), &mut app, &mut chrome);
+        assert_eq!(app.mode, crate::app::Mode::GlobalMenu);
+        dispatch(click(0, 0), &mut app, &mut chrome);
+        assert_eq!(app.mode, crate::app::Mode::Terminal);
+        assert!(!app.should_quit);
+
+        // Row 2 is detach: the fleet client exits, remotes keep running.
+        dispatch(click(launcher.x, launcher.y), &mut app, &mut chrome);
+        let menu = app.global_menu_rect();
+        dispatch(click(menu.x + 2, menu.y + 2), &mut app, &mut chrome);
+        assert!(app.should_quit, "detach exits the pure client");
     }
 
     #[tokio::test]

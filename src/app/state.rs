@@ -1497,6 +1497,10 @@ pub struct AppState {
     pub selected: usize,
     pub mode: Mode,
     pub should_quit: bool,
+    /// True when this AppState is composed by the pure fleet client: menu
+    /// entries whose effects only exist server-side (settings, reload
+    /// config) are omitted, and detach means "exit the fleet client".
+    pub pure_client: bool,
     /// In monolithic --no-session mode, detach exits the app because there is no server to detach from.
     pub detach_exits: bool,
     /// Set when the current client should detach from the persistent session.
@@ -1986,6 +1990,7 @@ impl AppState {
             selected: 0,
             mode: Mode::Navigate,
             should_quit: false,
+            pure_client: false,
             detach_exits: false,
             detach_requested: false,
             request_new_workspace: false,

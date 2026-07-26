@@ -717,3 +717,215 @@ fn terminal_attach_blits_the_live_tail_and_detaches_on_the_escape_key() {
     drop(server);
     cleanup_test_base(&base);
 }
+
+/// The paging contract the client-side replica rests on: `stream.history`
+/// pages are byte-contiguous slices of one immutable capture, so walking the
+/// cursor backwards reconstructs the pane's scrollback with no gap, no
+/// duplicate, and no overlap. Everything the replica does with a page -
+/// prepending it, rebuilding the terminal, re-basing rows - assumes this, so
+/// it is worth asserting against a real server rather than a fixture.
+#[test]
+fn stream_history_pages_walk_the_panes_scrollback_gap_free() {
+    use base64::Engine as _;
+
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let api_socket = runtime_dir.join("herdr.sock");
+
+    let server = spawn_server(&config_home, &runtime_dir, &api_socket);
+    wait_for_api(&api_socket, Duration::from_secs(10));
+    let (pane_id, _terminal_id) = create_pane(&api_socket, &base);
+
+    // A short viewport so most of the output is scrollback rather than
+    // screen, which is the state history paging exists to serve.
+    let mut attach = FramedClient::connect(&api_socket, "hello:history");
+    let opened = attach.open_stream(
+        "open:history",
+        serde_json::json!({
+            "pane_id": pane_id,
+            "mode": "write",
+            "takeover": false,
+            "cols": 80,
+            "rows": 10,
+        }),
+    );
+    assert_eq!(opened["result"]["type"], "pane_stream_opened", "{opened}");
+    let stream = &opened["result"]["stream"];
+    let stream_id = stream["stream_id"].as_u64().unwrap() as u32;
+
+    // Numbered lines, so a gap or a duplicate in the reassembled history is
+    // visible as a missing or repeated number rather than a fuzzy diff.
+    const LINES: usize = 2000;
+    attach.send(serde_json::json!({
+        "id": "input:seq",
+        "method": "pane.send_bytes",
+        "params": {
+            "pane_id": pane_id,
+            "data_base64": base64::engine::general_purpose::STANDARD
+                .encode(format!("for i in $(seq 1 {LINES}); do echo \"hl-$i\"; done\r")),
+        },
+    }));
+
+    let mut tail = Vec::new();
+    let ack = attach.read_control_collecting(&mut tail);
+    assert_eq!(ack["id"], "input:seq");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !String::from_utf8_lossy(&tail).contains(&format!("hl-{LINES}")) {
+        assert!(
+            Instant::now() < deadline,
+            "the pane never produced all {LINES} lines"
+        );
+        let (frame_type, frame_stream_id, payload) = attach.read_frame();
+        if frame_type == DATA_FRAME && frame_stream_id == stream_id {
+            tail.extend_from_slice(&payload);
+        }
+    }
+
+    // Re-open to capture a history cursor taken after all the output landed.
+    drop(attach);
+    let mut reader = FramedClient::connect(&api_socket, "hello:history-read");
+    let reopened = reader.open_stream(
+        "open:history-read",
+        serde_json::json!({
+            "pane_id": pane_id,
+            "mode": "read",
+            "takeover": false,
+            "cols": 80,
+            "rows": 10,
+        }),
+    );
+    assert_eq!(
+        reopened["result"]["type"], "pane_stream_opened",
+        "{reopened}"
+    );
+    let reader_stream = &reopened["result"]["stream"];
+    let reader_stream_id = reader_stream["stream_id"].as_u64().unwrap() as u32;
+    let snapshot = reader_stream["snapshot"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    let mut cursor = reader_stream["history_cursor"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        !cursor.is_empty(),
+        "a scrolled pane offers a history cursor"
+    );
+
+    // Walk the cursor backwards, newest page first, exactly as the replica's
+    // paging policy does.
+    let mut pages: Vec<String> = Vec::new();
+    let mut at_top = false;
+    let mut scratch = Vec::new();
+    for step in 0..64 {
+        reader.send(serde_json::json!({
+            "id": format!("history:{step}"),
+            "method": "stream.history",
+            "params": {
+                "stream_id": reader_stream_id,
+                "cursor": cursor,
+                "max_bytes": 4096,
+            },
+        }));
+        let page = reader.read_control_collecting(&mut scratch);
+        assert_eq!(page["id"], format!("history:{step}"));
+        assert_eq!(page["result"]["type"], "stream_history", "{page}");
+        assert_eq!(
+            page["result"]["stream_id"],
+            serde_json::json!(reader_stream_id)
+        );
+
+        pages.push(
+            page["result"]["content"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
+        );
+        at_top = page["result"]["at_top"].as_bool().unwrap_or(false);
+        let next = page["result"]["next_cursor"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        if at_top || next.is_empty() {
+            break;
+        }
+        assert_ne!(next, cursor, "the cursor advances every page");
+        cursor = next;
+    }
+    assert!(at_top, "the walk reached the top of the capture");
+    assert!(
+        pages.len() > 1,
+        "4KiB pages cover {LINES} lines in several steps"
+    );
+
+    // Oldest first, then the live screen on the end: the whole pane.
+    pages.reverse();
+    let reassembled = format!("{}{snapshot}", pages.concat());
+
+    // Count whole markers, not newline-terminated ones: the snapshot renders
+    // the live screen with cursor positioning, so the row where history meets
+    // the screen need not carry a line break. The echoed command line holds
+    // the literal "hl-$i", which no numbered marker matches.
+    let marker_hits = |line: usize| {
+        let token = format!("hl-{line}");
+        let mut hits = 0;
+        let mut from = 0;
+        while let Some(at) = reassembled[from..].find(&token) {
+            let start = from + at;
+            let end = start + token.len();
+            if !reassembled[end..]
+                .chars()
+                .next()
+                .is_some_and(|next| next.is_ascii_digit())
+            {
+                hits += 1;
+            }
+            from = end;
+        }
+        hits
+    };
+
+    let mut missing = Vec::new();
+    let mut duplicated = Vec::new();
+    let mut positions = Vec::new();
+    for line in 1..=LINES {
+        match marker_hits(line) {
+            0 => missing.push(line),
+            1 => {
+                let at = reassembled
+                    .find(&format!("hl-{line}"))
+                    .expect("a counted marker is findable");
+                positions.push((line, at));
+            }
+            hits => duplicated.push((line, hits)),
+        }
+    }
+    assert!(
+        missing.is_empty(),
+        "history lost lines (a gap between pages): {missing:?}"
+    );
+    assert!(
+        duplicated.is_empty(),
+        "history repeated lines (pages overlap): {duplicated:?}"
+    );
+
+    // Present-exactly-once is not enough: pages stitched back in the wrong
+    // order would still satisfy it. The markers must also appear in the
+    // order the pane printed them.
+    let out_of_order: Vec<_> = positions
+        .windows(2)
+        .filter(|pair| pair[1].1 < pair[0].1)
+        .map(|pair| (pair[0].0, pair[1].0))
+        .collect();
+    assert!(
+        out_of_order.is_empty(),
+        "history came back out of order at these marker pairs: {out_of_order:?}"
+    );
+
+    drop(reader);
+    drop(server);
+    cleanup_test_base(&base);
+}

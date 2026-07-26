@@ -212,7 +212,7 @@ impl AppState {
         } else if self.latest_release_notes_available {
             labels.push("what's new");
         }
-        if self.pure_client {
+        if self.pure_client && self.fleet_config_backed {
             labels.push("add remote");
         }
         labels.push("detach");

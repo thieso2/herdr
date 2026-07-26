@@ -568,6 +568,7 @@ impl App {
             detach_exits: no_session,
             detach_requested: false,
             pure_client: false,
+            fleet_config_backed: false,
             request_new_workspace: false,
             request_new_tab: false,
             request_new_linked_worktree: None,

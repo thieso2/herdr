@@ -79,8 +79,9 @@ pub(crate) enum GlobalMenuAction {
     Keybinds,
     ReloadConfig,
     Settings,
-    /// Opens the pure client's add-remote dialog. Always offered there, so
-    /// the first remote can be added with no chip strip on screen.
+    /// Opens the pure client's add-remote dialog. Offered whenever the
+    /// pure client composes the config-backed fleet, so the first remote
+    /// can be added with no chip strip on screen.
     AddRemote,
 }
 
@@ -99,7 +100,11 @@ pub(super) fn global_menu_actions(state: &AppState) -> Vec<GlobalMenuAction> {
     if state.update_available.is_some() || state.latest_release_notes_available {
         actions.push(GlobalMenuAction::WhatsNew);
     }
-    if state.pure_client {
+    // Adding a remote rewrites the fleet config and reconciles the running
+    // fleet against it, which only describes a config-backed fleet. An
+    // ephemeral `--remote` fleet-of-one holds its live ssh remote at the
+    // index a reconcile hands to the local runtime, so it is not offered.
+    if state.pure_client && state.fleet_config_backed {
         actions.push(GlobalMenuAction::AddRemote);
     }
     actions.push(GlobalMenuAction::Detach);
@@ -1914,8 +1919,11 @@ mod tests {
     #[test]
     fn pure_client_menu_actions_and_labels_stay_aligned() {
         let mut state = AppState::test_new();
-        for pure_client in [false, true] {
+        for (pure_client, fleet_config_backed) in
+            [(false, false), (false, true), (true, false), (true, true)]
+        {
             state.pure_client = pure_client;
+            state.fleet_config_backed = fleet_config_backed;
             let actions = global_menu_actions(&state);
             let labels = state.global_menu_labels();
             assert_eq!(
@@ -1939,25 +1947,39 @@ mod tests {
             if pure_client {
                 assert!(!actions.contains(&GlobalMenuAction::Settings));
                 assert!(!actions.contains(&GlobalMenuAction::ReloadConfig));
-                assert!(actions.contains(&GlobalMenuAction::AddRemote));
-            } else {
-                assert!(!actions.contains(&GlobalMenuAction::AddRemote));
             }
+            assert_eq!(
+                actions.contains(&GlobalMenuAction::AddRemote),
+                pure_client && fleet_config_backed,
+                "add remote is offered exactly to a pure client composing \
+                 the config-backed fleet (pure_client={pure_client}, \
+                 fleet_config_backed={fleet_config_backed})"
+            );
         }
     }
 
     /// The add-remote dialog is pure-client chrome, so the entry that opens
     /// it is pure-client only: the legacy TUI has no such dialog and keeps
-    /// exactly the menu it has today.
+    /// exactly the menu it has today. It also needs a config-backed fleet,
+    /// because saving reconciles the running fleet against the config file.
     #[test]
     fn add_remote_is_a_pure_client_only_menu_entry() {
         let mut state = AppState::test_new();
 
         state.pure_client = false;
+        state.fleet_config_backed = true;
         assert!(!global_menu_actions(&state).contains(&GlobalMenuAction::AddRemote));
         assert!(!state.global_menu_labels().contains(&"add remote"));
 
         state.pure_client = true;
+        state.fleet_config_backed = false;
+        assert!(
+            !global_menu_actions(&state).contains(&GlobalMenuAction::AddRemote),
+            "an ephemeral --remote fleet-of-one has no config to add to"
+        );
+        assert!(!state.global_menu_labels().contains(&"add remote"));
+
+        state.fleet_config_backed = true;
         assert_eq!(
             global_menu_actions(&state),
             vec![
@@ -1982,6 +2004,7 @@ mod tests {
     fn add_remote_menu_action_requests_the_dialog_and_closes_the_menu() {
         let mut state = state_with_workspaces(&["test"]);
         state.pure_client = true;
+        state.fleet_config_backed = true;
         state.mode = Mode::GlobalMenu;
         assert!(!state.request_add_remote);
 

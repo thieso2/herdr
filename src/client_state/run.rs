@@ -561,7 +561,7 @@ pub(crate) fn run_pure_client(config: &crate::config::Config) -> io::Result<()> 
             descriptor.name.clone(),
         ));
     }
-    run_pure_client_over(config, descriptors, mirrors).map(|_| ())
+    run_pure_client_over(config, descriptors, mirrors, FleetSource::Config).map(|_| ())
 }
 
 /// Runs the pure client as an *ephemeral fleet-of-one* against one ssh
@@ -592,7 +592,18 @@ pub(crate) fn run_pure_client_fleet_of_one(
         descriptor.index,
         descriptor.name.clone(),
     ));
-    run_pure_client_over(config, vec![descriptor], mirrors)
+    run_pure_client_over(config, vec![descriptor], mirrors, FleetSource::Ephemeral)
+}
+
+/// Where the composed fleet came from. The config-backed fleet can be
+/// edited from the client (a save rewrites `remotes.toml` and the running
+/// fleet is reconciled against it); an ephemeral `--remote` fleet-of-one
+/// cannot, because its live remote sits at the index a reconcile hands to
+/// the local runtime. Saving that target is offered on the way out instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FleetSource {
+    Config,
+    Ephemeral,
 }
 
 /// The shared pure-client run: terminal setup, the loop, and teardown.
@@ -601,6 +612,7 @@ fn run_pure_client_over(
     config: &crate::config::Config,
     mut descriptors: Vec<RemoteDescriptor>,
     mut mirrors: RemoteMirrors,
+    source: FleetSource,
 ) -> io::Result<bool> {
     // Terminal graphics respect the same [experimental] kitty_graphics gate
     // as the server render path: replicas ingest kitty APC data from the
@@ -618,6 +630,7 @@ fn run_pure_client_over(
     // omitted from the global menu, and detach exits the fleet client while
     // leaving every remote server running (same as prefix-d).
     app.pure_client = true;
+    app.fleet_config_backed = source == FleetSource::Config;
     app.detach_exits = true;
 
     let should_quit = Arc::new(AtomicBool::new(false));
@@ -1992,7 +2005,13 @@ fn handle_raw_input(raw: crate::raw_input::RawInputEvent, ctx: &mut LoopCtx<'_>)
 fn drain_app_requests(ctx: &mut LoopCtx<'_>) {
     if ctx.app.request_add_remote {
         ctx.app.request_add_remote = false;
-        if ctx.chrome.remote_edit.is_none() {
+        // Saving reconciles the running fleet against `remotes.toml`,
+        // which does not describe an ephemeral `--remote` fleet-of-one:
+        // its live remote sits at the index a reconcile hands to the local
+        // runtime. The menu entry is gated on the same fact, and the chip
+        // strip's add affordance is not composed for a fleet of one; this
+        // is the seam that keeps the dialog itself out of reach there.
+        if ctx.chrome.remote_edit.is_none() && ctx.app.fleet_config_backed {
             debug!("opening the add-remote dialog from the global menu");
             ctx.chrome.remote_edit = Some(super::remote_edit::RemoteEditState::add());
         }
@@ -3055,6 +3074,7 @@ mod tests {
         use crossterm::event::MouseButton;
         with_test_ctx(vec![RemoteDescriptor::local()], |ctx| {
             ctx.app.pure_client = true;
+            ctx.app.fleet_config_backed = true;
             render_chip_strip(ctx, 106, 30);
             assert!(
                 ctx.app.remote_chips.is_empty(),
@@ -3100,6 +3120,7 @@ mod tests {
     async fn the_menu_adds_a_remote_from_the_keyboard_too() {
         with_test_ctx(vec![RemoteDescriptor::local()], |ctx| {
             ctx.app.pure_client = true;
+            ctx.app.fleet_config_backed = true;
             render_chip_strip(ctx, 106, 30);
 
             let row = ctx
@@ -3120,6 +3141,46 @@ mod tests {
                 Some(super::super::remote_edit::RemoteEditState::add())
             );
             assert!(!ctx.app.request_add_remote);
+        });
+    }
+
+    /// An ephemeral `--remote` fleet-of-one is not the config-backed fleet:
+    /// its live ssh remote *is* remote #0, the index `reconcile_fleet`
+    /// hands to the local runtime. Saving a remote there would leave the
+    /// ssh link and mirror at 0 under a descriptor describing the local
+    /// machine - the chip would read "local" and the next reconnect would
+    /// dial the local socket instead of the host. So the entry is not
+    /// offered, and the dialog stays out of reach even if the request flag
+    /// is set some other way.
+    #[tokio::test]
+    async fn an_ephemeral_fleet_of_one_cannot_add_remotes() {
+        let ephemeral = RemoteDescriptor::ephemeral("can@gpu1", "can@gpu1", "default", None);
+        with_test_ctx(vec![ephemeral.clone()], |ctx| {
+            ctx.app.pure_client = true;
+            render_chip_strip(ctx, 106, 30);
+            assert!(
+                ctx.app.remote_chips.is_empty(),
+                "a fleet of one composes no chips"
+            );
+
+            assert!(
+                !ctx.app.global_menu_labels().contains(&"add remote"),
+                "the menu offers no entry whose save would rewrite remote #0"
+            );
+
+            ctx.app.request_add_remote = true;
+            drain_app_requests(ctx);
+
+            assert!(
+                ctx.chrome.remote_edit.is_none(),
+                "the add-remote dialog never opens in a fleet of one"
+            );
+            assert!(!ctx.app.request_add_remote, "the request is still drained");
+            assert_eq!(
+                ctx.descriptors.first(),
+                Some(&ephemeral),
+                "the ephemeral remote keeps its identity"
+            );
         });
     }
 

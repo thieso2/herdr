@@ -1501,6 +1501,12 @@ pub struct AppState {
     /// entries whose effects only exist server-side (settings, reload
     /// config) are omitted, and detach means "exit the fleet client".
     pub pure_client: bool,
+    /// True when the composed fleet is the one described by the fleet config
+    /// file, so saving a remote is a config edit the running fleet can be
+    /// reconciled against. False for an ephemeral `--remote` fleet-of-one:
+    /// its single remote is not in the config and lives at index 0, where a
+    /// reconcile puts the local runtime, so remotes cannot be added there.
+    pub fleet_config_backed: bool,
     /// In monolithic --no-session mode, detach exits the app because there is no server to detach from.
     pub detach_exits: bool,
     /// Set when the current client should detach from the persistent session.
@@ -1996,6 +2002,7 @@ impl AppState {
             mode: Mode::Navigate,
             should_quit: false,
             pure_client: false,
+            fleet_config_backed: false,
             detach_exits: false,
             detach_requested: false,
             request_new_workspace: false,

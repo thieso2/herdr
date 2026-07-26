@@ -749,6 +749,7 @@ mod tests {
         let (mut mirrors, mut ids, mut app) = composed();
         app.mode = crate::app::Mode::Terminal;
         app.pure_client = true;
+        app.fleet_config_backed = true;
         app.detach_exits = true;
         crate::ui::compute_view(&mut app, ratatui::layout::Rect::new(0, 0, 106, 20));
 

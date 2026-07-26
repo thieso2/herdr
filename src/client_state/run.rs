@@ -2033,6 +2033,16 @@ fn handle_key(key: crate::input::TerminalKey, ctx: &mut LoopCtx<'_>) {
             forward_key(key, ctx);
         }
         Mode::Navigate => {
+            // Nothing focused is still a live client: the empty screen's
+            // own hint is "press prefix+shift+n to create one", so the
+            // prefix key opens prefix mode here exactly as it does in
+            // Terminal and Copy mode. Without this every binding is dead
+            // while the composed view has no workspace (a fresh server,
+            // the last space closed, or a solo'd remote with no spaces).
+            if ctx.app.is_prefix_key(key) {
+                ctx.app.mode = Mode::Prefix;
+                return;
+            }
             if key.code == KeyCode::Char('q') {
                 ctx.app.should_quit = true;
             }
@@ -2781,6 +2791,44 @@ mod tests {
                 enabled: true,
             },
         ])
+    }
+
+    /// With nothing focused - a fresh server, the last space closed, or a
+    /// solo'd remote that has no spaces yet - the composed view is empty
+    /// and `sync_mode` parks the client in `Mode::Navigate`. That screen's
+    /// own hint is "press prefix+shift+n to create one", so the prefix key
+    /// has to open prefix mode there exactly as it does in Terminal and
+    /// Copy mode; otherwise every binding is dead.
+    #[tokio::test]
+    async fn the_prefix_key_opens_prefix_mode_with_no_workspace_in_view() {
+        with_test_ctx(vec![RemoteDescriptor::local()], |ctx| {
+            compose_into(ctx.mirrors.local(), ctx.chrome, ctx.ids, ctx.app);
+            sync_mode(ctx.app);
+            assert_eq!(
+                ctx.app.mode,
+                Mode::Navigate,
+                "an empty catalog focuses nothing"
+            );
+
+            // The default prefix is ctrl+b.
+            handle_key(
+                crate::input::TerminalKey::new(KeyCode::Char('b'), KeyModifiers::CONTROL),
+                ctx,
+            );
+            assert_eq!(
+                ctx.app.mode,
+                Mode::Prefix,
+                "the empty screen tells the user to press prefix+shift+n"
+            );
+
+            // ...and the following key reaches intent dispatch instead of
+            // being swallowed: prefix mode is consumed by it.
+            handle_key(
+                crate::input::TerminalKey::new(KeyCode::Char('N'), KeyModifiers::SHIFT),
+                ctx,
+            );
+            assert_ne!(ctx.app.mode, Mode::Prefix, "prefix mode is consumed");
+        });
     }
 
     #[tokio::test]

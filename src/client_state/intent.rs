@@ -581,6 +581,37 @@ mod tests {
         TerminalKey::new(code, KeyModifiers::empty())
     }
 
+    /// The empty view is the state the "press prefix+shift+n" hint is
+    /// shown in, and it is reachable per remote (a solo'd remote with no
+    /// spaces). Creation must resolve there, on the in-view remote, for
+    /// every shape a real terminal reports shift+n as: legacy uppercase,
+    /// uppercase with shift, and the kitty base-key-plus-shifted-codepoint
+    /// pair.
+    #[test]
+    fn new_workspace_intent_targets_the_in_view_remote_with_an_empty_catalog() {
+        let mut mirrors = RemoteMirrors::with_local();
+        mirrors.insert(super::super::RemoteMirror::new(1, "buildbox"));
+        let ids = ComposeIds::new();
+        let mut app = AppState::test_new();
+        app.keybinds = crate::config::Config::default().keybinds();
+        assert!(app.active.is_none(), "nothing focused in an empty view");
+
+        for shape in [
+            TerminalKey::new(KeyCode::Char('N'), KeyModifiers::empty()),
+            TerminalKey::new(KeyCode::Char('N'), KeyModifiers::SHIFT),
+            TerminalKey::new(KeyCode::Char('n'), KeyModifiers::SHIFT)
+                .with_shifted_codepoint('N' as u32),
+        ] {
+            let (remote, method) =
+                prefix_intent_method(shape, &mirrors, &ids, &app, 1).expect("new workspace intent");
+            assert_eq!(remote, 1, "creation follows the effective focused remote");
+            assert!(
+                matches!(method, Method::WorkspaceCreate(_)),
+                "expected workspace.create, got {method:?}"
+            );
+        }
+    }
+
     #[test]
     fn prefix_keys_map_to_control_plane_methods() {
         let (mirrors, ids, app) = composed();

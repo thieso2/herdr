@@ -7,7 +7,7 @@ use crate::{
     },
     input::TerminalKey,
     selection::Selection,
-    terminal::TerminalRuntimeRegistry,
+    terminal::PaneContentSource,
 };
 
 impl App {
@@ -27,7 +27,7 @@ impl App {
 }
 
 impl AppState {
-    pub(crate) fn enter_copy_mode(&mut self, terminal_runtimes: &TerminalRuntimeRegistry) {
+    pub(crate) fn enter_copy_mode(&mut self, terminal_runtimes: &dyn PaneContentSource) {
         let Some(ws_idx) = self.active else {
             return;
         };
@@ -46,8 +46,8 @@ impl AppState {
         }
 
         let cursor = self
-            .runtime_for_pane_in_workspace(terminal_runtimes, ws_idx, pane_id)
-            .and_then(|rt| rt.cursor_state(info.inner_rect, true))
+            .content_for_pane_in_workspace(terminal_runtimes, ws_idx, pane_id)
+            .and_then(|content| content.cursor_state(info.inner_rect, true))
             .filter(|cursor| cursor.visible)
             .map(|cursor| {
                 (
@@ -77,7 +77,7 @@ impl AppState {
 
     pub(crate) fn handle_copy_mode_key(
         &mut self,
-        terminal_runtimes: &TerminalRuntimeRegistry,
+        terminal_runtimes: &dyn PaneContentSource,
         key: TerminalKey,
     ) {
         if self.handle_copy_mode_search_prompt_key(terminal_runtimes, key) {
@@ -196,7 +196,7 @@ impl AppState {
 
     fn handle_copy_mode_search_prompt_key(
         &mut self,
-        terminal_runtimes: &TerminalRuntimeRegistry,
+        terminal_runtimes: &dyn PaneContentSource,
         key: TerminalKey,
     ) -> bool {
         let Some(copy_mode) = self.copy_mode.as_mut() else {
@@ -242,7 +242,7 @@ impl AppState {
 
     fn repeat_copy_mode_search(
         &mut self,
-        terminal_runtimes: &TerminalRuntimeRegistry,
+        terminal_runtimes: &dyn PaneContentSource,
         reverse: bool,
     ) {
         let Some(copy_mode) = self.copy_mode.as_ref() else {
@@ -267,7 +267,7 @@ impl AppState {
 
     fn submit_copy_mode_search(
         &mut self,
-        terminal_runtimes: &TerminalRuntimeRegistry,
+        terminal_runtimes: &dyn PaneContentSource,
         query: String,
         direction: CopyModeSearchDirection,
         repeat: bool,
@@ -282,7 +282,7 @@ impl AppState {
         let Some(ws_idx) = self.active else {
             return;
         };
-        let Some(runtime) = self.runtime_for_pane_in_workspace(terminal_runtimes, ws_idx, pane_id)
+        let Some(runtime) = self.content_for_pane_in_workspace(terminal_runtimes, ws_idx, pane_id)
         else {
             return;
         };
@@ -328,7 +328,7 @@ impl AppState {
 
     fn move_copy_cursor_to_absolute(
         &mut self,
-        terminal_runtimes: &TerminalRuntimeRegistry,
+        terminal_runtimes: &dyn PaneContentSource,
         target: crate::pane::TerminalTextPoint,
         reserve_overlay_row: bool,
     ) {
@@ -373,11 +373,11 @@ impl AppState {
         self.sync_copy_mode_selection(terminal_runtimes);
     }
 
-    pub(crate) fn cancel_copy_mode(&mut self, terminal_runtimes: &TerminalRuntimeRegistry) {
+    pub(crate) fn cancel_copy_mode(&mut self, terminal_runtimes: &dyn PaneContentSource) {
         self.exit_copy_mode(terminal_runtimes, false);
     }
 
-    fn exit_copy_mode(&mut self, terminal_runtimes: &TerminalRuntimeRegistry, copy: bool) {
+    fn exit_copy_mode(&mut self, terminal_runtimes: &dyn PaneContentSource, copy: bool) {
         let restore_scroll = self
             .copy_mode
             .as_ref()
@@ -398,7 +398,7 @@ impl AppState {
         };
     }
 
-    fn begin_copy_mode_selection(&mut self, terminal_runtimes: &TerminalRuntimeRegistry) {
+    fn begin_copy_mode_selection(&mut self, terminal_runtimes: &dyn PaneContentSource) {
         let Some(copy_mode) = self.copy_mode.as_ref() else {
             return;
         };
@@ -423,7 +423,7 @@ impl AppState {
         }
     }
 
-    fn select_copy_mode_line(&mut self, terminal_runtimes: &TerminalRuntimeRegistry) {
+    fn select_copy_mode_line(&mut self, terminal_runtimes: &dyn PaneContentSource) {
         let Some(copy_mode) = self.copy_mode.as_ref() else {
             return;
         };
@@ -445,7 +445,7 @@ impl AppState {
 
     fn move_copy_cursor(
         &mut self,
-        terminal_runtimes: &TerminalRuntimeRegistry,
+        terminal_runtimes: &dyn PaneContentSource,
         row_delta: i16,
         col_delta: i16,
     ) {
@@ -496,7 +496,7 @@ impl AppState {
 
     fn scroll_copy_mode_page(
         &mut self,
-        terminal_runtimes: &TerminalRuntimeRegistry,
+        terminal_runtimes: &dyn PaneContentSource,
         direction: i16,
         half_page: bool,
     ) {
@@ -552,7 +552,7 @@ impl AppState {
         self.sync_copy_mode_selection(terminal_runtimes);
     }
 
-    fn copy_mode_history_top(&mut self, terminal_runtimes: &TerminalRuntimeRegistry) {
+    fn copy_mode_history_top(&mut self, terminal_runtimes: &dyn PaneContentSource) {
         let Some(copy_mode) = self.copy_mode.as_ref() else {
             return;
         };
@@ -567,7 +567,7 @@ impl AppState {
         self.sync_copy_mode_selection(terminal_runtimes);
     }
 
-    fn copy_mode_history_bottom(&mut self, terminal_runtimes: &TerminalRuntimeRegistry) {
+    fn copy_mode_history_bottom(&mut self, terminal_runtimes: &dyn PaneContentSource) {
         let Some(copy_mode) = self.copy_mode.as_ref() else {
             return;
         };
@@ -584,7 +584,7 @@ impl AppState {
         self.sync_copy_mode_selection(terminal_runtimes);
     }
 
-    fn copy_mode_line_edge(&mut self, terminal_runtimes: &TerminalRuntimeRegistry, end: bool) {
+    fn copy_mode_line_edge(&mut self, terminal_runtimes: &dyn PaneContentSource, end: bool) {
         let Some(copy_mode) = self.copy_mode.as_ref() else {
             return;
         };
@@ -610,7 +610,7 @@ impl AppState {
         self.sync_copy_mode_selection(terminal_runtimes);
     }
 
-    fn copy_mode_first_non_blank(&mut self, terminal_runtimes: &TerminalRuntimeRegistry) {
+    fn copy_mode_first_non_blank(&mut self, terminal_runtimes: &dyn PaneContentSource) {
         let Some(copy_mode) = self.copy_mode.as_ref() else {
             return;
         };
@@ -626,7 +626,7 @@ impl AppState {
 
     fn copy_mode_word_motion(
         &mut self,
-        terminal_runtimes: &TerminalRuntimeRegistry,
+        terminal_runtimes: &dyn PaneContentSource,
         motion: WordMotion,
     ) {
         let Some(copy_mode) = self.copy_mode.as_ref() else {
@@ -639,7 +639,7 @@ impl AppState {
             return;
         };
         let Some(runtime) =
-            self.runtime_for_pane_in_workspace(terminal_runtimes, ws_idx, copy_mode.pane_id)
+            self.content_for_pane_in_workspace(terminal_runtimes, ws_idx, copy_mode.pane_id)
         else {
             return;
         };
@@ -657,7 +657,7 @@ impl AppState {
         self.move_copy_cursor_to_absolute(terminal_runtimes, target, false);
     }
 
-    fn copy_mode_paragraph(&mut self, terminal_runtimes: &TerminalRuntimeRegistry, direction: i16) {
+    fn copy_mode_paragraph(&mut self, terminal_runtimes: &dyn PaneContentSource, direction: i16) {
         let Some(copy_mode) = self.copy_mode.as_ref() else {
             return;
         };
@@ -726,7 +726,7 @@ impl AppState {
 
     fn copy_mode_visible_row_text(
         &self,
-        terminal_runtimes: &TerminalRuntimeRegistry,
+        terminal_runtimes: &dyn PaneContentSource,
         viewport_row: u16,
     ) -> Option<String> {
         let copy_mode = self.copy_mode.as_ref()?;
@@ -743,7 +743,7 @@ impl AppState {
             info.inner_rect.width.saturating_sub(1),
             metrics,
         );
-        self.runtime_for_pane_in_workspace(terminal_runtimes, ws_idx, copy_mode.pane_id)?
+        self.content_for_pane_in_workspace(terminal_runtimes, ws_idx, copy_mode.pane_id)?
             .extract_selection(&row_selection)
     }
 
@@ -831,7 +831,7 @@ impl AppState {
         }
     }
 
-    fn sync_copy_mode_selection(&mut self, terminal_runtimes: &TerminalRuntimeRegistry) {
+    fn sync_copy_mode_selection(&mut self, terminal_runtimes: &dyn PaneContentSource) {
         let Some(copy_mode) = self.copy_mode.as_ref() else {
             return;
         };

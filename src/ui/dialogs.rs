@@ -12,7 +12,7 @@ use super::widgets::{
     render_modal_header, render_modal_shell, render_panel_shell, ActionButtonSpec,
 };
 use crate::app::{state::WorktreeOpenState, AppState, Mode};
-use crate::terminal::TerminalRuntimeRegistry;
+use crate::terminal::PaneContentSource;
 
 const NEW_LINKED_WORKTREE_POPUP_WIDTH: u16 = 68;
 const NEW_LINKED_WORKTREE_POPUP_HEIGHT: u16 = 12;
@@ -599,7 +599,7 @@ fn render_open_worktree_search(
 
 fn confirm_close_overlay_text(
     app: &AppState,
-    terminal_runtimes: &TerminalRuntimeRegistry,
+    terminal_runtimes: &dyn PaneContentSource,
 ) -> (String, String) {
     let ws_name = app
         .workspaces
@@ -665,7 +665,7 @@ fn confirm_close_overlay_text(
 
 pub(super) fn render_confirm_close_overlay(
     app: &AppState,
-    terminal_runtimes: &TerminalRuntimeRegistry,
+    terminal_runtimes: &dyn PaneContentSource,
     frame: &mut Frame,
     area: Rect,
 ) {

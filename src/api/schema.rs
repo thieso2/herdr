@@ -6,6 +6,7 @@ pub mod events;
 pub mod integrations;
 pub mod panes;
 pub mod plugins;
+pub mod remotes;
 pub mod response;
 pub mod server;
 pub mod session;
@@ -19,6 +20,7 @@ pub use events::*;
 pub use integrations::*;
 pub use panes::*;
 pub use plugins::*;
+pub use remotes::*;
 pub use response::*;
 pub use server::*;
 pub use session::*;
@@ -63,6 +65,12 @@ pub enum Method {
     ClientWindowTitleClear(EmptyParams),
     #[serde(rename = "session.snapshot")]
     SessionSnapshot(EmptyParams),
+    #[serde(rename = "remote.list")]
+    RemoteList(EmptyParams),
+    #[serde(rename = "remote.reset")]
+    RemoteReset(RemoteTargetParams),
+    #[serde(rename = "remote.reload")]
+    RemoteReload(EmptyParams),
     #[serde(rename = "workspace.create")]
     WorkspaceCreate(WorkspaceCreateParams),
     #[serde(rename = "workspace.list")]
@@ -187,6 +195,24 @@ pub enum Method {
     #[serde(skip)]
     #[schemars(skip)]
     PaneGraphicsStreamClose(PaneGraphicsStreamParams),
+    #[serde(skip)]
+    #[schemars(skip)]
+    PaneStreamOpen(PaneStreamOpenParams),
+    #[serde(skip)]
+    #[schemars(skip)]
+    PaneStreamClose(PaneStreamCloseParams),
+    #[serde(skip)]
+    #[schemars(skip)]
+    PaneStreamResize(PaneStreamResizeParams),
+    #[serde(skip)]
+    #[schemars(skip)]
+    PaneStreamScroll(PaneStreamScrollParams),
+    #[serde(skip)]
+    #[schemars(skip)]
+    PaneSendBytes(PaneSendBytesParams),
+    #[serde(skip)]
+    #[schemars(skip)]
+    PanePasteImage(PanePasteImageParams),
     #[serde(rename = "pane.report_agent")]
     PaneReportAgent(PaneReportAgentParams),
     #[serde(rename = "pane.report_agent_session")]

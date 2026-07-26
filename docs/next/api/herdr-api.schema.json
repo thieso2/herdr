@@ -678,6 +678,50 @@
             },
             {
               "properties": {
+                "body": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "kind": {
+                  "$ref": "#/schemas/event/$defs/NotificationEventKind"
+                },
+                "message": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "notification_posted",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "kind",
+                "message"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "title": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "type": {
+                  "const": "window_title_changed",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
                 "layout": {
                   "$ref": "#/schemas/event/$defs/PaneLayoutSnapshot"
                 },
@@ -720,7 +764,18 @@
             "pane_exited",
             "pane_agent_detected",
             "pane_agent_status_changed",
+            "notification_posted",
+            "window_title_changed",
             "layout_updated"
+          ],
+          "type": "string"
+        },
+        "NotificationEventKind": {
+          "description": "Delivery kind of a posted notification. Mirrors the legacy client\nprotocol's notify kinds without referencing the frozen wire types.",
+          "enum": [
+            "sound",
+            "toast",
+            "system_toast"
           ],
           "type": "string"
         },
@@ -1045,6 +1100,31 @@
             },
             "focused": {
               "type": "boolean"
+            },
+            "git_ahead": {
+              "description": "Commits ahead of the upstream branch, when known.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "git_behind": {
+              "description": "Commits behind the upstream branch, when known.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "git_branch": {
+              "description": "Current git branch of the workspace directory, when known.",
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "label": {
               "type": "string"
@@ -3568,6 +3648,18 @@
           ],
           "type": "string"
         },
+        "RemoteTargetParams": {
+          "description": "Names one fleet remote (for example for `remote.reset`).",
+          "properties": {
+            "name": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "name"
+          ],
+          "type": "object"
+        },
         "ServerLiveHandoffParams": {
           "properties": {
             "expected_protocol": {
@@ -4464,6 +4556,54 @@
           "properties": {
             "method": {
               "const": "session.snapshot",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/EmptyParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "remote.list",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/EmptyParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "remote.reset",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/RemoteTargetParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "remote.reload",
               "type": "string"
             },
             "params": {
@@ -6809,6 +6949,50 @@
             },
             {
               "properties": {
+                "body": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "kind": {
+                  "$ref": "#/schemas/success_response/$defs/NotificationEventKind"
+                },
+                "message": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "notification_posted",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "kind",
+                "message"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "title": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "type": {
+                  "const": "window_title_changed",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
                 "layout": {
                   "$ref": "#/schemas/success_response/$defs/PaneLayoutSnapshot"
                 },
@@ -6866,6 +7050,8 @@
             "pane_exited",
             "pane_agent_detected",
             "pane_agent_status_changed",
+            "notification_posted",
+            "window_title_changed",
             "layout_updated"
           ],
           "type": "string"
@@ -7121,6 +7307,15 @@
               "type": "object"
             }
           ]
+        },
+        "NotificationEventKind": {
+          "description": "Delivery kind of a posted notification. Mirrors the legacy client\nprotocol's notify kinds without referencing the frozen wire types.",
+          "enum": [
+            "sound",
+            "toast",
+            "system_toast"
+          ],
+          "type": "string"
         },
         "NotificationShowReason": {
           "enum": [
@@ -7757,6 +7952,62 @@
             "offset_from_bottom",
             "max_offset_from_bottom",
             "viewport_rows"
+          ],
+          "type": "object"
+        },
+        "PaneStreamOpenInfo": {
+          "description": "Result payload of a successful framed `stream.open`.",
+          "properties": {
+            "cols": {
+              "description": "Terminal width at the subscription point.",
+              "format": "uint16",
+              "maximum": 65535,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "history_cursor": {
+              "description": "Opaque cursor identifying the snapshot point in pane history. Feed it\nto `stream.history` to page scrollback backward; content-only pages\nnever re-assert modes.",
+              "type": "string"
+            },
+            "pane_id": {
+              "type": "string"
+            },
+            "rows": {
+              "description": "Terminal height at the subscription point.",
+              "format": "uint16",
+              "maximum": 65535,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "sequence": {
+              "description": "Pane output byte sequence captured with the snapshot. The stream's\nDATA tail begins at the byte after this sequence.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "snapshot": {
+              "description": "ANSI snapshot of the active screen area at the subscription point.\nCarries mode/cursor/style state so a replica seeded from it tracks\nthe live tail faithfully.",
+              "type": "string"
+            },
+            "stream_id": {
+              "description": "Server-allocated stream id; never reused within a server process.",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "workspace_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "pane_id",
+            "workspace_id",
+            "stream_id",
+            "sequence",
+            "snapshot",
+            "history_cursor",
+            "cols",
+            "rows"
           ],
           "type": "object"
         },
@@ -8443,6 +8694,108 @@
           ],
           "type": "string"
         },
+        "RemoteConnectionStateInfo": {
+          "description": "Connection state of one fleet remote as reported by `remote.list`.",
+          "oneOf": [
+            {
+              "const": "local",
+              "description": "The implicit local runtime (remote `#0`).",
+              "type": "string"
+            },
+            {
+              "const": "connecting",
+              "description": "A connect-plus-handshake attempt is in flight.",
+              "type": "string"
+            },
+            {
+              "const": "connected",
+              "description": "Live negotiated framed session.",
+              "type": "string"
+            },
+            {
+              "const": "offline",
+              "description": "Not connected; automatic reconnects continue until the remote is\nremoved or disabled.",
+              "type": "string"
+            },
+            {
+              "const": "disabled",
+              "description": "Disabled in the fleet config; no connection is attempted.",
+              "type": "string"
+            },
+            {
+              "const": "incompatible",
+              "description": "The protocol version windows do not overlap; no automatic reconnects\nuntil one side is upgraded.",
+              "type": "string"
+            },
+            {
+              "const": "unknown",
+              "description": "The fleet holds no live state for this remote (for example when the\nconfig is read without a running fleet).",
+              "type": "string"
+            }
+          ]
+        },
+        "RemoteInfo": {
+          "description": "One fleet remote with its live connection state. The local runtime is the\nimplicit entry at index 0.",
+          "properties": {
+            "attempt": {
+              "description": "Reconnect attempt counter while offline or connecting.",
+              "format": "uint32",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "enabled": {
+              "type": "boolean"
+            },
+            "index": {
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "last_error": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "name": {
+              "type": "string"
+            },
+            "retry_in_ms": {
+              "description": "Milliseconds until the next automatic reconnect while offline.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "session": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "state": {
+              "$ref": "#/schemas/success_response/$defs/RemoteConnectionStateInfo"
+            },
+            "target": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "index",
+            "name",
+            "enabled",
+            "state"
+          ],
+          "type": "object"
+        },
         "ResponseResult": {
           "oneOf": [
             {
@@ -8491,6 +8844,25 @@
               "required": [
                 "type",
                 "snapshot"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "remotes": {
+                  "items": {
+                    "$ref": "#/schemas/success_response/$defs/RemoteInfo"
+                  },
+                  "type": "array"
+                },
+                "type": {
+                  "const": "remote_list",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "remotes"
               ],
               "type": "object"
             },
@@ -9073,6 +9445,22 @@
               "required": [
                 "type",
                 "read"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "stream": {
+                  "$ref": "#/schemas/success_response/$defs/PaneStreamOpenInfo"
+                },
+                "type": {
+                  "const": "pane_stream_opened",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "stream"
               ],
               "type": "object"
             },
@@ -9681,6 +10069,31 @@
             },
             "focused": {
               "type": "boolean"
+            },
+            "git_ahead": {
+              "description": "Commits ahead of the upstream branch, when known.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "git_behind": {
+              "description": "Commits behind the upstream branch, when known.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "git_branch": {
+              "description": "Current git branch of the workspace directory, when known.",
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "label": {
               "type": "string"

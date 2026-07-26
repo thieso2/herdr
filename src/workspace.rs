@@ -12,7 +12,7 @@ use crate::layout::PaneId;
 #[cfg(test)]
 use crate::layout::TileLayout;
 use crate::pane::{PaneLaunchEnv, PaneState};
-use crate::terminal::{TerminalId, TerminalRuntime, TerminalRuntimeRegistry, TerminalState};
+use crate::terminal::{TerminalId, TerminalRuntime, TerminalState};
 
 mod aggregate;
 mod git;
@@ -198,6 +198,52 @@ pub struct Workspace {
     pub active_tab: usize,
     #[cfg(test)]
     pub(crate) test_runtimes: HashMap<PaneId, TerminalRuntime>,
+}
+
+impl Workspace {
+    /// Plain-data workspace projected from a remote session catalog: labels
+    /// and metadata are server facts, so no local git probing or cwd
+    /// resolution runs, and the id mirrors the server's workspace id.
+    // Consumed only by the unix-only pure-client run path (#20).
+    #[cfg_attr(windows, allow(dead_code))]
+    pub(crate) fn client_projection(
+        id: String,
+        label: String,
+        tabs: Vec<Tab>,
+        active_tab: usize,
+        public_pane_numbers: HashMap<PaneId, usize>,
+        git_branch: Option<String>,
+        git_ahead_behind: Option<(usize, usize)>,
+    ) -> Self {
+        let identity_cwd = PathBuf::from("/");
+        let next_public_pane_number = public_pane_numbers
+            .values()
+            .max()
+            .map_or(1, |max| max.saturating_add(1));
+        let next_public_tab_number = tabs.len().saturating_add(1);
+        let active_tab = active_tab.min(tabs.len().saturating_sub(1));
+        Self {
+            id,
+            custom_name: Some(label),
+            identity_cwd: identity_cwd.clone(),
+            cached_identity_cwd: identity_cwd.clone(),
+            cached_auto_label: String::new(),
+            cached_git_status_key: identity_cwd,
+            cached_git_branch: git_branch,
+            cached_git_ahead_behind: git_ahead_behind,
+            cached_git_space: None,
+            worktree_space: None,
+            metadata_tokens: crate::metadata_tokens::MetadataTokens::default(),
+            metadata_token_sequences: HashMap::new(),
+            public_pane_numbers,
+            next_public_pane_number,
+            next_public_tab_number,
+            tabs,
+            active_tab,
+            #[cfg(test)]
+            test_runtimes: HashMap::new(),
+        }
+    }
 }
 
 impl Deref for Workspace {
@@ -1085,7 +1131,7 @@ impl Workspace {
     pub fn resolved_identity_cwd_from(
         &self,
         terminals: &HashMap<TerminalId, TerminalState>,
-        terminal_runtimes: &TerminalRuntimeRegistry,
+        terminal_runtimes: &dyn crate::terminal::PaneContentSource,
     ) -> Option<PathBuf> {
         self.tabs
             .first()
@@ -1123,7 +1169,7 @@ impl Workspace {
     pub fn display_name_from(
         &self,
         terminals: &HashMap<TerminalId, TerminalState>,
-        terminal_runtimes: &TerminalRuntimeRegistry,
+        terminal_runtimes: &dyn crate::terminal::PaneContentSource,
     ) -> String {
         if let Some(name) = &self.custom_name {
             return name.clone();
@@ -1731,7 +1777,7 @@ mod tests {
             terminal_id.clone(),
             TerminalState::new(terminal_id, PathBuf::from("/herdr-test/pion")),
         );
-        let terminal_runtimes = TerminalRuntimeRegistry::new();
+        let terminal_runtimes = crate::terminal::TerminalRuntimeRegistry::new();
 
         assert_eq!(ws.display_name_from(&terminals, &terminal_runtimes), "pion");
         assert_eq!(

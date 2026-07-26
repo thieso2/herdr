@@ -15,7 +15,7 @@ use crate::ghostty::{
     KittyImageDescriptor, KittyImageFormat, KittyImagePlacement, KittyPlacementRenderInfo,
 };
 use crate::layout::{PaneId, PaneInfo};
-use crate::terminal::TerminalRuntimeRegistry;
+use crate::terminal::PaneContentSource;
 
 const KITTY_CHUNK_BYTES: usize = 3072;
 const HOST_IMAGE_ID_BASE: u32 = 10_000;
@@ -147,7 +147,7 @@ pub(crate) fn is_enabled() -> bool {
 
 pub(crate) fn paint_local_pane_graphics(
     app: &AppState,
-    terminal_runtimes: &TerminalRuntimeRegistry,
+    terminal_runtimes: &dyn PaneContentSource,
     cell_size: HostCellSize,
 ) -> io::Result<()> {
     let cache = LOCAL_HOST_GRAPHICS.get_or_init(|| Mutex::new(HostGraphicsCache::default()));
@@ -177,7 +177,7 @@ pub(crate) fn paint_local_pane_graphics(
 
 pub(crate) fn encode_local_pane_graphics(
     app: &AppState,
-    terminal_runtimes: &TerminalRuntimeRegistry,
+    terminal_runtimes: &dyn PaneContentSource,
     surface: crate::ui::TabSurfaceView<'_>,
     cell_size: HostCellSize,
     cache: &mut HostGraphicsCache,
@@ -235,7 +235,7 @@ pub(crate) fn encode_local_pane_graphics(
 
 pub(crate) fn has_visible_pane_graphics(
     app: &AppState,
-    terminal_runtimes: &TerminalRuntimeRegistry,
+    terminal_runtimes: &dyn PaneContentSource,
     surface: crate::ui::TabSurfaceView<'_>,
     cell_size: HostCellSize,
 ) -> bool {
@@ -265,13 +265,13 @@ pub(crate) fn has_visible_pane_graphics(
             return true;
         }
 
-        if let Some(runtime) = app.runtime_for_pane_in_workspace(terminal_runtimes, ws_idx, info.id)
+        if let Some(runtime) = app.content_for_pane_in_workspace(terminal_runtimes, ws_idx, info.id)
         {
             let scrollback_offset = runtime
                 .scroll_metrics()
                 .map(|m| m.offset_from_bottom as u32)
                 .unwrap_or(0);
-            for placement in runtime.kitty_image_placements_with_data_filter(|_| false) {
+            for placement in runtime.kitty_image_placements_with_data_filter(&mut |_| false) {
                 let host_placement = HostPlacement {
                     pane_id: info.id,
                     area: info.inner_rect,
@@ -523,7 +523,7 @@ fn active_view_key(app: &AppState) -> Option<HostViewKey> {
 
 fn collect_visible_placements(
     app: &AppState,
-    terminal_runtimes: &TerminalRuntimeRegistry,
+    terminal_runtimes: &dyn PaneContentSource,
     surface: crate::ui::TabSurfaceView<'_>,
     cell_size: HostCellSize,
     uploaded_images: &HashMap<u32, ImageSignature>,
@@ -547,7 +547,6 @@ fn collect_visible_placements(
 
     tracing::debug!(
         ws_idx,
-        terminal_runtimes_len = terminal_runtimes.len(),
         pane_infos_len = surface.pane_infos.len(),
         "collect_visible_placements: starting iteration"
     );
@@ -563,14 +562,14 @@ fn collect_visible_placements(
             ));
         }
 
-        let runtime = match app.runtime_for_pane_in_workspace(terminal_runtimes, ws_idx, info.id) {
+        let runtime = match app.content_for_pane_in_workspace(terminal_runtimes, ws_idx, info.id) {
             Some(rt) => rt,
             None => {
                 tracing::debug!(pane_id = ?info.id, "collect_visible_placements: runtime not found");
                 continue;
             }
         };
-        for placement in runtime.kitty_image_placements_with_data_filter(|descriptor| {
+        for placement in runtime.kitty_image_placements_with_data_filter(&mut |descriptor| {
             let format_code = kitty_format_code(descriptor.format);
             let signature = image_signature_from_descriptor(descriptor, format_code);
             let host_id = host_image_id_for_signature(info.id, signature);

@@ -251,3 +251,9 @@ Default five-label vocabulary (`needs-triage`, `needs-info`, `ready-for-agent`,
 ### Domain docs
 
 Single-context: `CONTEXT.md` and `docs/adr/` at the repo root. See `docs/agents/domain.md`.
+
+### E2E bug protocol
+
+Bugs found in live/e2e testing of the fleet/pure-client work get a red-first
+regression test at the narrowest seam plus a bug log entry. See
+`docs/agents/e2e-bug-protocol.md`.

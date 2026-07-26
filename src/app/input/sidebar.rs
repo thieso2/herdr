@@ -197,11 +197,23 @@ impl AppState {
     }
 
     pub(crate) fn global_menu_labels(&self) -> Vec<&'static str> {
-        let mut labels = vec!["settings", "keybinds", "reload config"];
+        // Index-aligned with input::modal::global_menu_actions; gate the
+        // two lists identically or click rows map to the wrong action.
+        let mut labels = Vec::new();
+        if !self.pure_client {
+            labels.push("settings");
+        }
+        labels.push("keybinds");
+        if !self.pure_client {
+            labels.push("reload config");
+        }
         if self.update_available.is_some() {
             labels.push("update ready");
         } else if self.latest_release_notes_available {
             labels.push("what's new");
+        }
+        if self.pure_client && self.fleet_config_backed {
+            labels.push("add remote");
         }
         labels.push("detach");
         labels

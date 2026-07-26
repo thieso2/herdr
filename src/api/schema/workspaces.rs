@@ -56,6 +56,15 @@ pub struct WorkspaceInfo {
     pub tokens: HashMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worktree: Option<WorkspaceWorktreeInfo>,
+    /// Current git branch of the workspace directory, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_branch: Option<String>,
+    /// Commits ahead of the upstream branch, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_ahead: Option<u64>,
+    /// Commits behind the upstream branch, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_behind: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]

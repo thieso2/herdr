@@ -502,6 +502,9 @@ impl App {
             }),
             agent_status: pane_agent_status(agg_state, seen),
             tokens: ws.metadata_tokens.values(),
+            git_branch: ws.branch(),
+            git_ahead: ws.git_ahead_behind().map(|(ahead, _)| ahead as u64),
+            git_behind: ws.git_ahead_behind().map(|(_, behind)| behind as u64),
             worktree: ws
                 .worktree_space()
                 .map(|space| crate::api::schema::WorkspaceWorktreeInfo {

@@ -40,6 +40,7 @@ pub(super) fn command() -> Command {
         .subcommand(pane_command())
         .subcommand(terminal_command())
         .subcommand(session_command())
+        .subcommand(remote_command())
         .subcommand(integration_command())
         .subcommand(plugin_command());
     configure_help(command, true)
@@ -730,6 +731,40 @@ fn session_command() -> Command {
             Command::new("delete")
                 .about("Delete a stopped session")
                 .arg(required("name", "NAME"))
+                .arg(json_flag()),
+        )
+}
+
+fn remote_command() -> Command {
+    Command::new("remote")
+        .about("Manage fleet remotes and their connections")
+        .subcommand(
+            Command::new("list")
+                .about("List fleet remotes and their connection state")
+                .arg(json_flag()),
+        )
+        .subcommand(
+            Command::new("reset")
+                .about("Drop a remote connection and reconnect now")
+                .arg(required("name", "NAME"))
+                .arg(json_flag()),
+        )
+        .subcommand(
+            Command::new("reload")
+                .about("Apply hand edits made to remotes.toml")
+                .arg(json_flag()),
+        )
+        .subcommand(
+            Command::new("upgrade")
+                .about("Roll remotes forward to the update channel's herdr")
+                .arg(Arg::new("name").value_name("NAME-OR-TARGET"))
+                .arg(flag("all"))
+                .arg(
+                    Arg::new("yes")
+                        .short('y')
+                        .long("yes")
+                        .action(ArgAction::SetTrue),
+                )
                 .arg(json_flag()),
         )
 }

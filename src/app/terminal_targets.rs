@@ -30,6 +30,14 @@ pub(crate) enum TerminalTargetError {
 }
 
 impl App {
+    /// Public pane id for a terminal target (terminal id, public pane id, or
+    /// agent name). The legacy attach path uses it to key the shared pane
+    /// write-grant table that framed pane streams use.
+    pub(crate) fn public_pane_id_for_terminal_target(&self, target: &str) -> Option<String> {
+        let resolved = self.resolve_terminal_target(target).ok()?;
+        self.public_pane_id(resolved.ws_idx, resolved.pane_id)
+    }
+
     pub(crate) fn resolve_terminal_target(
         &self,
         target: &str,

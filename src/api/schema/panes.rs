@@ -312,6 +312,121 @@ pub struct PaneGraphicsStreamParams {
     pub owner: String,
 }
 
+/// Internal params for the framed `stream.open` control method. The stream id
+/// is server-allocated by the framed session layer before dispatch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct PaneStreamOpenParams {
+    /// Pane target: public pane id, terminal id, or agent name.
+    pub pane_id: String,
+    pub stream_id: u32,
+    /// Whether the stream asks for the pane write grant.
+    #[serde(default)]
+    pub write: bool,
+    /// Whether a write-mode open may revoke a live write grant.
+    #[serde(default)]
+    pub takeover: bool,
+    /// Viewport the pane is resized to while the write grant is held.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cols: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rows: Option<u16>,
+}
+
+/// Internal params for releasing a framed pane stream's write grant state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct PaneStreamCloseParams {
+    pub pane_id: String,
+    pub stream_id: u32,
+}
+
+/// Internal params for the framed `stream.resize` control method.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct PaneStreamResizeParams {
+    pub pane_id: String,
+    pub stream_id: u32,
+    pub cols: u16,
+    pub rows: u16,
+    #[serde(default)]
+    pub cell_width_px: u32,
+    #[serde(default)]
+    pub cell_height_px: u32,
+}
+
+/// Scroll direction of the framed `stream.scroll` control method.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PaneStreamScrollDirection {
+    Up,
+    Down,
+}
+
+/// Origin of a framed `stream.scroll` request.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum PaneStreamScrollSource {
+    #[default]
+    Wheel,
+    PageKey,
+}
+
+/// Internal params for the framed `stream.scroll` control method.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct PaneStreamScrollParams {
+    pub pane_id: String,
+    pub stream_id: u32,
+    pub direction: PaneStreamScrollDirection,
+    pub lines: u16,
+    #[serde(default)]
+    pub source: PaneStreamScrollSource,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub column: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub row: Option<u16>,
+    #[serde(default)]
+    pub modifiers: u8,
+}
+
+/// Internal params for the framed `pane.send_bytes` control method.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct PaneSendBytesParams {
+    pub pane_id: String,
+    pub data_base64: String,
+}
+
+/// Internal params for the framed `pane.paste_image` control method.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct PanePasteImageParams {
+    pub pane_id: String,
+    pub extension: String,
+    pub data_base64: String,
+}
+
+/// Result payload of a successful framed `stream.open`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct PaneStreamOpenInfo {
+    pub pane_id: String,
+    pub workspace_id: String,
+    /// Server-allocated stream id; never reused within a server process.
+    pub stream_id: u32,
+    /// Pane output byte sequence captured with the snapshot. The stream's
+    /// DATA tail begins at the byte after this sequence.
+    pub sequence: u64,
+    /// ANSI snapshot of the active screen area at the subscription point.
+    /// Carries mode/cursor/style state so a replica seeded from it tracks
+    /// the live tail faithfully.
+    pub snapshot: String,
+    /// Opaque cursor identifying the snapshot point in pane history. Feed it
+    /// to `stream.history` to page scrollback backward; content-only pages
+    /// never re-assert modes.
+    pub history_cursor: String,
+    /// Terminal width at the subscription point.
+    pub cols: u16,
+    /// Terminal height at the subscription point.
+    pub rows: u16,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct PaneReportAgentParams {
     pub pane_id: String,

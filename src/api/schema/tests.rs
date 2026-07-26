@@ -701,6 +701,9 @@ fn worktree_request_and_response_round_trip() {
                 active_tab_id: "w_1:1".into(),
                 agent_status: AgentStatus::Unknown,
                 tokens: HashMap::new(),
+                git_branch: None,
+                git_ahead: None,
+                git_behind: None,
                 worktree: Some(WorkspaceWorktreeInfo {
                     repo_key: "/repo/herdr/.git".into(),
                     repo_name: "herdr".into(),
@@ -787,6 +790,9 @@ fn worktree_lifecycle_events_round_trip() {
         active_tab_id: "w_2:1".into(),
         agent_status: AgentStatus::Unknown,
         tokens: HashMap::new(),
+        git_branch: None,
+        git_ahead: None,
+        git_behind: None,
         worktree: Some(WorkspaceWorktreeInfo {
             repo_key: "/repo/herdr/.git".into(),
             repo_name: "herdr".into(),
@@ -1292,4 +1298,28 @@ fn popup_close_request_round_trips() {
 
     assert_eq!(json["method"], "popup.close");
     assert_eq!(json["params"], serde_json::json!({}));
+}
+
+#[test]
+fn workspace_info_without_git_fields_deserializes() {
+    // Additive-schema guard: payloads from servers predating the git
+    // fields must keep deserializing, with the fields defaulting to None.
+    let workspace: WorkspaceInfo = serde_json::from_value(serde_json::json!({
+        "workspace_id": "w_1",
+        "number": 1,
+        "label": "herdr",
+        "focused": true,
+        "pane_count": 1,
+        "tab_count": 1,
+        "active_tab_id": "w_1:1",
+        "agent_status": "idle"
+    }))
+    .expect("old workspace info payload deserializes");
+    assert_eq!(workspace.git_branch, None);
+    assert_eq!(workspace.git_ahead, None);
+    assert_eq!(workspace.git_behind, None);
+
+    // And the fields stay off the wire when absent.
+    let json = serde_json::to_string(&workspace).expect("serializes");
+    assert!(!json.contains("git_branch"));
 }

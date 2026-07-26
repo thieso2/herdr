@@ -15,6 +15,14 @@ mod creation;
 mod git_refresh;
 mod ids;
 mod input;
+// Re-exported for the unix-only pure-client intent interpreter (#20).
+#[cfg(unix)]
+pub(crate) use input::MouseAction;
+#[cfg(unix)]
+pub(crate) use input::{
+    handle_global_menu_key, handle_keybind_help_key, insert_rename_input_text,
+    is_retained_selection_copy_key, pure_client_modal_key, pure_client_modal_mouse, PureModalIds,
+};
 mod popup;
 mod runtime;
 mod runtime_mutations;
@@ -79,7 +87,7 @@ pub(crate) struct OverlayPaneState {
     temp_files: Vec<std::path::PathBuf>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PaneClickState {
     pane_id: crate::layout::PaneId,
     viewport_row: u16,
@@ -88,7 +96,20 @@ pub(crate) struct PaneClickState {
 }
 
 impl PaneClickState {
-    fn is_double_click_for(self, next: Self) -> bool {
+    /// A left-click candidate at a pane cell, stamped now. Shared with the
+    /// pure client's double-click word selection (unix-only run path, so
+    /// this constructor compiles out of Windows builds).
+    #[cfg(unix)]
+    pub(crate) fn new(pane_id: crate::layout::PaneId, viewport_row: u16, col: u16) -> Self {
+        Self {
+            pane_id,
+            viewport_row,
+            col,
+            at: Instant::now(),
+        }
+    }
+
+    pub(crate) fn is_double_click_for(self, next: Self) -> bool {
         self.pane_id == next.pane_id
             && next.at.duration_since(self.at) <= PANE_DOUBLE_CLICK_WINDOW
             && self.viewport_row.abs_diff(next.viewport_row) <= 1
@@ -153,6 +174,10 @@ pub struct App {
     /// even when an App-internal drain consumes the event before the forwarding drain.
     pub(crate) local_input_source_switch: bool,
     pub(crate) config_reloaded_from_disk: bool,
+    /// Live fleet of remote runtimes. Started explicitly by the production
+    /// server entry points via `start_fleet`; `None` until then so tests and
+    /// helper Apps never spawn SSH bridges.
+    pub(crate) fleet: Option<crate::fleet::FleetManager>,
     prefix_input_source: Box<dyn crate::platform::PrefixInputSource>,
 }
 
@@ -246,7 +271,7 @@ fn load_plugin_registry(no_session: bool) -> crate::app::state::InstalledPluginR
         .collect()
 }
 
-fn agent_panel_sort_from_config(
+pub(crate) fn agent_panel_sort_from_config(
     sort: crate::config::AgentPanelSortConfig,
 ) -> state::AgentPanelSort {
     match sort {
@@ -301,7 +326,7 @@ fn sibling_theme_names(name: &str) -> (String, String) {
     }
 }
 
-fn theme_runtime_config(
+pub(crate) fn theme_runtime_config(
     config: &crate::config::Config,
     use_legacy_ui_accent: bool,
 ) -> state::ThemeRuntimeConfig {
@@ -353,7 +378,7 @@ fn resolve_palette_for_theme_name(
     palette
 }
 
-fn resolve_effective_theme(
+pub(crate) fn resolve_effective_theme(
     runtime: &state::ThemeRuntimeConfig,
     appearance: Option<crate::terminal_theme::HostAppearance>,
 ) -> (state::Palette, String) {
@@ -542,6 +567,8 @@ impl App {
             should_quit: false,
             detach_exits: no_session,
             detach_requested: false,
+            pure_client: false,
+            fleet_config_backed: false,
             request_new_workspace: false,
             request_new_tab: false,
             request_new_linked_worktree: None,
@@ -552,6 +579,7 @@ impl App {
             request_submit_worktree_open: false,
             request_submit_worktree_remove: false,
             request_reload_config: false,
+            request_add_remote: false,
             request_client_config_reload: false,
             request_clipboard_write: None,
             creating_new_tab: false,
@@ -563,6 +591,8 @@ impl App {
             worktree_remove: None,
             worktree_directory,
             collapsed_space_keys,
+            remote_chips: Vec::new(),
+            workspace_remote_tags: Vec::new(),
             request_complete_onboarding: false,
             name_input: String::new(),
             name_input_replace_on_type: false,
@@ -588,6 +618,9 @@ impl App {
             view: state::ViewState {
                 layout: state::ViewLayout::Desktop,
                 sidebar_rect: Rect::default(),
+                remote_chip_strip_rect: Rect::default(),
+                remote_chip_hit_areas: Vec::new(),
+                remote_add_hit_area: Rect::default(),
                 workspace_card_areas: Vec::new(),
                 tab_bar_rect: Rect::default(),
                 tab_hit_areas: Vec::new(),
@@ -785,8 +818,26 @@ impl App {
             local_terminal_notifications: true,
             local_input_source_switch: true,
             config_reloaded_from_disk: false,
+            fleet: None,
             prefix_input_source: Box::new(crate::platform::RealPrefixInputSource::default()),
         }
+    }
+
+    /// Starts the fleet connection manager: loads `remotes.toml` and connects
+    /// all enabled remotes in parallel over SSH stdio bridges. Non-blocking —
+    /// only worker threads are spawned. The reseed hook is a no-op until VT
+    /// replay lands with the pane stream work.
+    pub fn start_fleet(&mut self) {
+        if self.fleet.is_some() {
+            return;
+        }
+        let entries = crate::fleet::config::load();
+        self.fleet = Some(crate::fleet::FleetManager::start(
+            entries,
+            std::sync::Arc::new(crate::fleet::manager::SshBridgeTransport),
+            crate::fleet::manager::FleetTuning::default(),
+            std::sync::Arc::new(|_remote: &str| {}),
+        ));
     }
 
     #[cfg(unix)]
@@ -1073,24 +1124,29 @@ impl App {
                         cell_size = observed_cell_size.unwrap_or_else(|| {
                             crate::kitty_graphics::HostCellSize::fallback_for_area(area)
                         });
-                        crate::ui::compute_view_with_cell_size(
+                        let resize_requests = crate::ui::compute_view_with_content(
                             &mut self.state,
                             &self.terminal_runtimes,
                             area,
+                        );
+                        self.state.apply_pane_resize_requests(
+                            &self.terminal_runtimes,
+                            &resize_requests,
                             cell_size,
                         );
                     } else {
-                        crate::ui::compute_view_with_runtime_registry(
+                        let resize_requests = crate::ui::compute_view_with_content(
                             &mut self.state,
                             &self.terminal_runtimes,
                             area,
                         );
+                        self.state.apply_pane_resize_requests(
+                            &self.terminal_runtimes,
+                            &resize_requests,
+                            crate::kitty_graphics::HostCellSize::default(),
+                        );
                     }
-                    crate::ui::render_with_runtime_registry(
-                        &self.state,
-                        &self.terminal_runtimes,
-                        frame,
-                    );
+                    crate::ui::render_with_content(&self.state, &self.terminal_runtimes, frame);
                 })?;
                 if kitty_graphics_enabled {
                     crate::kitty_graphics::paint_local_pane_graphics(
@@ -2191,6 +2247,96 @@ mod tests {
         });
 
         assert!(app.render_dirty.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn git_status_change_emits_workspace_updated_catalog_event() {
+        let mut app = test_app();
+        app.state.workspaces.push(Workspace::test_new("one"));
+        let workspace_id = app.state.workspaces[0].id.clone();
+        let resolved_identity_cwd = app.state.workspaces[0].resolved_identity_cwd().unwrap();
+        let sequence_before = app.event_hub.current_sequence();
+
+        app.handle_internal_event(AppEvent::GitStatusRefreshed {
+            results: vec![crate::workspace::WorkspaceGitStatus {
+                workspace_id,
+                resolved_identity_cwd: resolved_identity_cwd.clone(),
+                status_cache_key: resolved_identity_cwd,
+                demand: crate::workspace::GitStatusRefreshDemand::ALL,
+                auto_label: "one".into(),
+                branch: Some("feature/x".into()),
+                ahead_behind: Some((2, 1)),
+                space: None,
+            }],
+            cache_updates: Vec::new(),
+        });
+
+        // A pure client mirrors the session catalog: without a
+        // workspace.updated event the branch change never leaves the server.
+        let events = app.event_hub.events_after(sequence_before);
+        let workspace = events
+            .iter()
+            .find_map(|(_, envelope)| match &envelope.data {
+                crate::api::schema::EventData::WorkspaceUpdated { workspace } => Some(workspace),
+                _ => None,
+            })
+            .expect("git status change emits workspace.updated");
+        assert_eq!(workspace.git_branch.as_deref(), Some("feature/x"));
+        assert_eq!(workspace.git_ahead, Some(2));
+        assert_eq!(workspace.git_behind, Some(1));
+
+        // An unchanged refresh emits nothing.
+        let sequence_before = app.event_hub.current_sequence();
+        app.handle_internal_event(AppEvent::GitStatusRefreshed {
+            results: Vec::new(),
+            cache_updates: Vec::new(),
+        });
+        assert!(app.event_hub.events_after(sequence_before).is_empty());
+    }
+
+    #[test]
+    fn terminal_cwd_report_emits_pane_and_workspace_catalog_events() {
+        let mut app = test_app();
+        app.state.workspaces.push(Workspace::test_new("one"));
+        app.state.ensure_test_terminals();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let cwd = unique_temp_path("cwd-report-catalog");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let sequence_before = app.event_hub.current_sequence();
+
+        app.handle_internal_event(AppEvent::TerminalCwdReported {
+            pane_id,
+            cwd: cwd.clone(),
+        });
+
+        let events = app.event_hub.events_after(sequence_before);
+        let pane = events
+            .iter()
+            .find_map(|(_, envelope)| match &envelope.data {
+                crate::api::schema::EventData::PaneUpdated { pane } => Some(pane),
+                _ => None,
+            })
+            .expect("cwd change emits pane.updated");
+        assert_eq!(
+            pane.cwd.as_deref(),
+            Some(cwd.display().to_string().as_str())
+        );
+        assert!(
+            events.iter().any(|(_, envelope)| matches!(
+                &envelope.data,
+                crate::api::schema::EventData::WorkspaceUpdated { .. }
+            )),
+            "cwd change refreshes the cwd-derived workspace label"
+        );
+
+        // Re-reporting the same cwd emits nothing.
+        let sequence_before = app.event_hub.current_sequence();
+        app.handle_internal_event(AppEvent::TerminalCwdReported {
+            pane_id,
+            cwd: cwd.clone(),
+        });
+        assert!(app.event_hub.events_after(sequence_before).is_empty());
+        let _ = std::fs::remove_dir_all(cwd);
     }
 
     #[test]

@@ -13,6 +13,7 @@ mod navigator;
 mod onboarding;
 mod panes;
 mod release_notes;
+mod remote_chips;
 mod scrollbar;
 mod settings;
 mod sidebar;
@@ -40,13 +41,19 @@ use self::navigator::render_navigator_overlay;
 pub(crate) use self::onboarding::onboarding_welcome_continue_rect;
 use self::onboarding::render_onboarding_overlay;
 pub(crate) use self::panes::popup_pane_rects;
-use self::panes::{render_empty, render_popup_pane, resize_popup_pane};
+use self::panes::{plan_popup_pane_resize, render_empty, render_popup_pane};
 pub(crate) use self::release_notes::{
     product_announcement_display_lines, release_notes_close_button_rect,
     release_notes_display_lines, release_notes_wrapped_line_count, PRODUCT_ANNOUNCEMENT_MODAL_SIZE,
     RELEASE_NOTES_MODAL_SIZE,
 };
 use self::release_notes::{render_product_announcement_overlay, render_release_notes_overlay};
+// Consumed only by the unix-only pure-client run path (#20/#23).
+#[cfg_attr(windows, allow(unused_imports))]
+pub(crate) use self::remote_chips::{
+    remote_chip_at, remote_edit_button_rects, remote_edit_inner_rect, render_remote_edit_overlay,
+};
+use self::remote_chips::{render_remote_chip_strip, split_sidebar_for_chip_strip};
 pub(crate) use self::scrollbar::{
     pane_scrollbar_rect, release_notes_scrollbar_rect, scrollbar_offset_from_drag_row,
     scrollbar_offset_from_row, scrollbar_thumb_grab_offset, should_show_scrollbar,
@@ -58,7 +65,7 @@ use self::status::{
     toast_notification_rect,
 };
 pub(crate) use self::tab_surface::{
-    compute_tab_surface, render_tab_surface, resize_tab_surface, TabSurfaceLayout,
+    compute_tab_surface, plan_tab_surface_resizes, render_tab_surface, TabSurfaceLayout,
 };
 use self::tabs::render_tab_bar;
 pub(crate) use self::{
@@ -97,7 +104,7 @@ pub(crate) use self::{
 };
 use crate::app::state::ViewLayout;
 use crate::app::{AppState, Mode};
-use crate::terminal::TerminalRuntimeRegistry;
+use crate::terminal::{EmptyPaneContentSource, PaneContentSource, PaneResizeRequest};
 
 const COLLAPSED_WIDTH: u16 = 4; // num + space + dot + separator
 
@@ -110,77 +117,66 @@ pub(super) fn spinner_frame(tick: u32) -> &'static str {
     SPINNERS[(tick as usize / 8) % SPINNERS.len()]
 }
 
-/// Compute view geometry and reconcile pane sizes.
+/// Compute view geometry and, in tests, reconcile test-runtime pane sizes.
 /// Called before render to separate mutation from drawing.
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn compute_view(app: &mut AppState, area: Rect) {
-    let terminal_runtimes = TerminalRuntimeRegistry::new();
-    compute_view_with_runtime_registry(app, &terminal_runtimes, area);
+    let requests = compute_view_with_content(app, &EmptyPaneContentSource, area);
+    #[cfg(test)]
+    app.apply_pane_resize_requests_to_test_runtimes(&requests);
+    #[cfg(not(test))]
+    drop(requests);
 }
 
-pub fn compute_view_with_runtime_registry(
+/// Compute view geometry and plan the pane resizes it implies.
+///
+/// The returned requests are not applied here: the caller resizes live
+/// runtimes (server) or translates them into protocol messages (pure
+/// client), keeping this function free of runtime mutation.
+#[must_use]
+pub fn compute_view_with_content(
     app: &mut AppState,
-    terminal_runtimes: &TerminalRuntimeRegistry,
+    content: &dyn PaneContentSource,
     area: Rect,
-) {
-    compute_view_internal(
-        app,
-        terminal_runtimes,
-        area,
-        true,
-        crate::kitty_graphics::HostCellSize::default(),
-    );
+) -> Vec<PaneResizeRequest> {
+    compute_view_internal(app, content, area, true)
 }
 
-pub fn compute_view_with_cell_size(
-    app: &mut AppState,
-    terminal_runtimes: &TerminalRuntimeRegistry,
-    area: Rect,
-    cell_size: crate::kitty_graphics::HostCellSize,
-) {
-    compute_view_internal(app, terminal_runtimes, area, true, cell_size);
-}
-
-/// Compute view geometry for a client-sized render without resizing pane runtimes.
+/// Compute view geometry for a client-sized render without planning pane
+/// resizes.
 ///
 /// This is used by the headless server when a non-foreground client needs its
 /// own frame size while the shared pane runtimes stay pinned to the foreground
 /// client.
 pub(crate) fn compute_view_without_resizing_panes(
     app: &mut AppState,
-    terminal_runtimes: &TerminalRuntimeRegistry,
+    content: &dyn PaneContentSource,
     area: Rect,
 ) {
-    compute_view_internal(
-        app,
-        terminal_runtimes,
-        area,
-        false,
-        crate::kitty_graphics::HostCellSize::default(),
-    );
+    let _ = compute_view_internal(app, content, area, false);
 }
 
-fn resize_background_tab_panes_to_area(
+fn plan_background_tab_resizes_to_area(
     app: &AppState,
-    terminal_runtimes: &TerminalRuntimeRegistry,
+    content: &dyn PaneContentSource,
     terminal_area: Rect,
-    cell_size: crate::kitty_graphics::HostCellSize,
+    requests: &mut Vec<PaneResizeRequest>,
 ) {
     for (ws_idx, ws) in app.workspaces.iter().enumerate() {
         for (tab_idx, tab) in ws.tabs.iter().enumerate() {
             if app.active == Some(ws_idx) && tab_idx == ws.active_tab_index() {
                 continue;
             }
-            resize_tab_surface(app, terminal_runtimes, tab, terminal_area, cell_size);
+            plan_tab_surface_resizes(app, content, tab, terminal_area, requests);
         }
     }
 }
 
-fn resize_background_tab_panes_for_desktop(
+fn plan_background_tab_resizes_for_desktop(
     app: &AppState,
-    terminal_runtimes: &TerminalRuntimeRegistry,
+    content: &dyn PaneContentSource,
     main_area: Rect,
-    cell_size: crate::kitty_graphics::HostCellSize,
+    requests: &mut Vec<PaneResizeRequest>,
 ) {
     for (ws_idx, ws) in app.workspaces.iter().enumerate() {
         let (_, terminal_area) = desktop_tab_bar_and_terminal_area(app, ws, main_area);
@@ -188,7 +184,7 @@ fn resize_background_tab_panes_for_desktop(
             if app.active == Some(ws_idx) && tab_idx == ws.active_tab_index() {
                 continue;
             }
-            resize_tab_surface(app, terminal_runtimes, tab, terminal_area, cell_size);
+            plan_tab_surface_resizes(app, content, tab, terminal_area, requests);
         }
     }
 }
@@ -210,14 +206,12 @@ fn desktop_tab_bar_and_terminal_area(
 
 fn compute_view_internal(
     app: &mut AppState,
-    terminal_runtimes: &TerminalRuntimeRegistry,
+    content: &dyn PaneContentSource,
     area: Rect,
     resize_panes: bool,
-    cell_size: crate::kitty_graphics::HostCellSize,
-) {
+) -> Vec<PaneResizeRequest> {
     if is_mobile_width(area, app.mobile_width_threshold) {
-        compute_mobile_view(app, terminal_runtimes, area, resize_panes, cell_size);
-        return;
+        return compute_mobile_view(app, content, area, resize_panes);
     }
 
     let sidebar_w = if app.sidebar_collapsed {
@@ -232,6 +226,12 @@ fn compute_view_internal(
 
     let [sidebar_area, main_area] =
         Layout::horizontal([Constraint::Length(sidebar_w), Constraint::Min(1)]).areas(area);
+
+    // Fleet chip strip: reserve rows atop the sidebar. `remote_chips` is
+    // only populated by the pure client's fleet composition, so every other
+    // path keeps today's geometry untouched.
+    let (chip_strip, sidebar_area) =
+        split_sidebar_for_chip_strip(&app.remote_chips, sidebar_area, app.sidebar_collapsed);
 
     let (tab_bar_rect, terminal_area) = app
         .active
@@ -275,16 +275,11 @@ fn compute_view_internal(
     let TabSurfaceLayout {
         pane_infos,
         split_borders,
-    } = compute_tab_surface(
-        app,
-        terminal_runtimes,
-        terminal_area,
-        resize_panes,
-        cell_size,
-    );
+        mut resize_requests,
+    } = compute_tab_surface(app, content, terminal_area, resize_panes);
     if resize_panes {
-        resize_background_tab_panes_for_desktop(app, terminal_runtimes, main_area, cell_size);
-        resize_popup_pane(app, terminal_runtimes, terminal_area, cell_size);
+        plan_background_tab_resizes_for_desktop(app, content, main_area, &mut resize_requests);
+        plan_popup_pane_resize(app, content, terminal_area, &mut resize_requests);
     }
 
     let toast_hit_area = app
@@ -303,6 +298,9 @@ fn compute_view_internal(
     app.view = crate::app::ViewState {
         layout: ViewLayout::Desktop,
         sidebar_rect: sidebar_area,
+        remote_chip_strip_rect: chip_strip.strip_rect,
+        remote_chip_hit_areas: chip_strip.chip_hit_areas,
+        remote_add_hit_area: chip_strip.add_hit_area,
         workspace_card_areas,
         tab_bar_rect,
         tab_hit_areas: tab_bar_view.tab_hit_areas,
@@ -317,15 +315,15 @@ fn compute_view_internal(
         split_borders,
     };
     app.sync_copy_mode_search_geometry();
+    resize_requests
 }
 
 fn compute_mobile_view(
     app: &mut AppState,
-    terminal_runtimes: &TerminalRuntimeRegistry,
+    content: &dyn PaneContentSource,
     area: Rect,
     resize_panes: bool,
-    cell_size: crate::kitty_graphics::HostCellSize,
-) {
+) -> Vec<PaneResizeRequest> {
     let header_h = area.height.min(2);
     let (header_rect, terminal_area) = if area.height > header_h {
         let [header_rect, terminal_area] =
@@ -344,16 +342,11 @@ fn compute_mobile_view(
     let TabSurfaceLayout {
         pane_infos,
         split_borders,
-    } = compute_tab_surface(
-        app,
-        terminal_runtimes,
-        terminal_area,
-        resize_panes,
-        cell_size,
-    );
+        mut resize_requests,
+    } = compute_tab_surface(app, content, terminal_area, resize_panes);
     if resize_panes {
-        resize_background_tab_panes_to_area(app, terminal_runtimes, terminal_area, cell_size);
-        resize_popup_pane(app, terminal_runtimes, terminal_area, cell_size);
+        plan_background_tab_resizes_to_area(app, content, terminal_area, &mut resize_requests);
+        plan_popup_pane_resize(app, content, terminal_area, &mut resize_requests);
     }
     let header_hits = compute_mobile_header_hit_areas(app, header_rect);
 
@@ -366,6 +359,9 @@ fn compute_mobile_view(
     app.view = crate::app::ViewState {
         layout: ViewLayout::Mobile,
         sidebar_rect: Rect::default(),
+        remote_chip_strip_rect: Rect::default(),
+        remote_chip_hit_areas: Vec::new(),
+        remote_add_hit_area: Rect::default(),
         workspace_card_areas: Vec::new(),
         tab_bar_rect: Rect::default(),
         tab_hit_areas: Vec::new(),
@@ -380,31 +376,28 @@ fn compute_mobile_view(
         split_borders,
     };
     app.sync_copy_mode_search_geometry();
+    resize_requests
 }
 
 /// Render the UI — reads AppState but does not mutate it.
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn render(app: &AppState, frame: &mut Frame) {
-    let terminal_runtimes = TerminalRuntimeRegistry::new();
-    render_with_runtime_registry(app, &terminal_runtimes, frame);
+    render_with_content(app, &EmptyPaneContentSource, frame);
 }
 
-pub fn render_with_runtime_registry(
-    app: &AppState,
-    terminal_runtimes: &TerminalRuntimeRegistry,
-    frame: &mut Frame,
-) {
+pub fn render_with_content(app: &AppState, content: &dyn PaneContentSource, frame: &mut Frame) {
     let sidebar_area = app.view.sidebar_rect;
     let tab_bar_area = app.view.tab_bar_rect;
     let terminal_area = app.view.terminal_area;
 
     if app.view.layout == ViewLayout::Mobile {
-        render_mobile_header(app, terminal_runtimes, frame, app.view.mobile_header_rect);
+        render_mobile_header(app, content, frame, app.view.mobile_header_rect);
     } else if sidebar_area.width > 0 {
+        render_remote_chip_strip(app, frame);
         if app.sidebar_collapsed {
             render_sidebar_collapsed(app, frame, sidebar_area);
         } else {
-            render_sidebar(app, terminal_runtimes, frame, sidebar_area);
+            render_sidebar(app, content, frame, sidebar_area);
         }
     }
     if app.view.layout != ViewLayout::Mobile {
@@ -415,29 +408,27 @@ pub fn render_with_runtime_registry(
         .and_then(|ws_idx| app.workspaces.get(ws_idx))
         .is_some()
     {
-        render_tab_surface(app, terminal_runtimes, app.view.tab_surface(), frame);
+        render_tab_surface(app, content, app.view.tab_surface(), frame);
     } else {
         render_empty(app, frame, terminal_area);
     }
 
     // Ambient notifications sit above panes, but below interactive overlays.
     render_notifications(app, frame, terminal_area);
-    render_popup_pane(app, terminal_runtimes, frame, terminal_area);
+    render_popup_pane(app, content, frame, terminal_area);
 
     match app.mode {
         Mode::Onboarding => render_onboarding_overlay(app, frame, frame.area()),
         Mode::ReleaseNotes => render_release_notes_overlay(app, frame, frame.area()),
         Mode::ProductAnnouncement => render_product_announcement_overlay(app, frame, frame.area()),
         Mode::Navigate if app.view.layout == ViewLayout::Mobile => {
-            render_mobile_panel(app, terminal_runtimes, frame, frame.area())
+            render_mobile_panel(app, content, frame, frame.area())
         }
         Mode::Navigate => render_navigate_overlay(app, frame, terminal_area),
         Mode::Prefix => render_prefix_overlay(app, frame, terminal_area),
         Mode::Copy => render_copy_mode_overlay(app, frame, terminal_area),
         Mode::Resize => render_resize_overlay(app, frame, terminal_area),
-        Mode::ConfirmClose => {
-            render_confirm_close_overlay(app, terminal_runtimes, frame, terminal_area)
-        }
+        Mode::ConfirmClose => render_confirm_close_overlay(app, content, frame, terminal_area),
         Mode::ContextMenu => {
             render_context_menu(app, frame);
         }
@@ -452,7 +443,7 @@ pub fn render_with_runtime_registry(
         Mode::ConfirmRemoveWorktree => render_remove_worktree_overlay(app, frame, frame.area()),
         Mode::GlobalMenu => render_global_launcher_menu(app, frame),
         Mode::KeybindHelp => render_keybind_help_overlay(app, frame),
-        Mode::Navigator => render_navigator_overlay(app, terminal_runtimes, frame),
+        Mode::Navigator => render_navigator_overlay(app, content, frame),
         Mode::Terminal => {}
     }
 }
@@ -581,6 +572,191 @@ mod tests {
     use crate::{app::state::ViewLayout, layout::PaneInfo, workspace::Workspace};
     use ratatui::style::Color;
     use ratatui::{backend::TestBackend, Terminal};
+
+    /// Renders `app` at `area` through the public compute_view + render pair
+    /// and returns the rows of symbols plus a style-exact digest of every
+    /// buffer cell. Used to characterize the flag-off render byte for byte.
+    fn compute_and_render_digest(app: &mut AppState, area: Rect) -> (Vec<String>, String) {
+        use sha2::{Digest as _, Sha256};
+
+        compute_view(app, area);
+        let mut terminal =
+            Terminal::new(TestBackend::new(area.width, area.height)).expect("test backend");
+        terminal
+            .draw(|frame| render(app, frame))
+            .expect("render to test backend");
+        let buffer = terminal.backend().buffer();
+        let mut rows = Vec::new();
+        let mut hasher = Sha256::new();
+        for y in 0..area.height {
+            let mut row = String::new();
+            for x in 0..area.width {
+                let cell = &buffer[(x, y)];
+                row.push_str(cell.symbol());
+                hasher.update(cell.symbol().as_bytes());
+                hasher.update(format!("{:?}|{:?}|{:?};", cell.fg, cell.bg, cell.modifier));
+            }
+            rows.push(row);
+        }
+        (rows, format!("{:x}", hasher.finalize()))
+    }
+
+    fn characterization_app_state() -> AppState {
+        let mut workspace = Workspace::test_new("characterization");
+        workspace.identity_cwd = std::path::PathBuf::from("characterization");
+        // Pin the git-derived fields: `Workspace::test_new` probes the
+        // checkout the tests run in (std::env::current_dir), so the branch
+        // name of the developer's worktree would otherwise leak into the
+        // characterized pixels. Pin them so the digests are identical on
+        // every branch, worktree, and detached checkout.
+        workspace.cached_git_branch = Some("char-branch".to_owned());
+        workspace.cached_git_ahead_behind = None;
+        workspace.cached_git_space = None;
+        workspace.test_add_tab(Some("logs"));
+        workspace.switch_tab(0);
+        let left = workspace.tabs[0].root_pane;
+        let right = workspace.test_split(ratatui::layout::Direction::Horizontal);
+        workspace.insert_test_runtime(
+            left,
+            crate::terminal::TerminalRuntime::test_with_screen_bytes(40, 10, b"LEFT PANE"),
+        );
+        workspace.insert_test_runtime(
+            right,
+            crate::terminal::TerminalRuntime::test_with_screen_bytes(40, 10, b"RIGHT\r\nPANE"),
+        );
+
+        let mut app = AppState::test_new();
+        app.workspaces = vec![workspace];
+        app.active = Some(0);
+        app.selected = 0;
+        app.mode = Mode::Terminal;
+        app
+    }
+
+    /// Characterizes the full desktop compute_view + render output so the
+    /// flag-off TUI render path stays byte-for-byte identical while the
+    /// pure-client seam work proceeds. If this digest changes, the change
+    /// altered what every existing user sees; do not update the constant
+    /// without meaning to change the rendered output.
+    #[tokio::test]
+    async fn desktop_compute_view_render_is_characterized() {
+        let mut app = characterization_app_state();
+        let (rows, digest) = compute_and_render_digest(&mut app, Rect::new(0, 0, 106, 20));
+
+        assert_eq!(app.view.sidebar_rect, Rect::new(0, 0, 26, 20));
+        assert_eq!(app.view.tab_bar_rect, Rect::new(26, 0, 80, 1));
+        assert_eq!(app.view.terminal_area, Rect::new(26, 1, 80, 19));
+        let all = rows.join("\n");
+        assert!(all.contains("LEFT PANE"), "rows: {all}");
+        assert!(all.contains("RIGHT"), "rows: {all}");
+        assert!(all.contains("characterization"), "rows: {all}");
+        assert!(all.contains("char-branch"), "rows: {all}");
+        // Baselined with the git-derived fields pinned (the previous
+        // constants hashed the live checkout's branch name and only matched
+        // the authoring worktree). Re-verified after the fleet-tui merge:
+        // with "char-branch" pinned the merged render is byte-identical to
+        // the pure-client parity baseline.
+        assert_eq!(
+            digest,
+            "bb5e1667ff64404f378028b508414f278a06c0ee3c4ac26b775251ea0f858023"
+        );
+    }
+
+    /// The planned pane resizes are part of the flag-off contract the render
+    /// digest cannot see: they must match the composed pane geometry, honor
+    /// the direct-attach resize locks, and actually reach the runtimes.
+    #[tokio::test]
+    async fn compute_view_plans_pane_resizes_matching_composed_geometry() {
+        let mut app = characterization_app_state();
+        let area = Rect::new(0, 0, 106, 20);
+        let requests = compute_view_with_content(&mut app, &EmptyPaneContentSource, area);
+
+        // One request per visible pane, targeting its inner rect geometry.
+        let ws = &app.workspaces[0];
+        let mut expected: Vec<(crate::terminal::TerminalId, u16, u16)> = app
+            .view
+            .pane_infos
+            .iter()
+            .map(|info| {
+                let terminal_id = ws.terminal_id(info.id).expect("pane terminal id").clone();
+                (terminal_id, info.inner_rect.width, info.inner_rect.height)
+            })
+            .collect();
+        assert_eq!(expected.len(), 2, "both visible panes plan a resize");
+        for (terminal_id, cols, rows) in expected.drain(..) {
+            assert!(
+                requests
+                    .iter()
+                    .any(|request| request.terminal_id == terminal_id
+                        && request.cols == cols
+                        && request.rows == rows),
+                "missing planned resize for {terminal_id:?} to {cols}x{rows}; got {requests:?}"
+            );
+        }
+
+        // Applying the plan reaches the pane runtimes through the registry
+        // lookup seam.
+        app.apply_pane_resize_requests_to_test_runtimes(&requests);
+        let focused = app.workspaces[0].focused_pane_id().expect("focused pane");
+        let focused_info = app
+            .view
+            .pane_infos
+            .iter()
+            .find(|info| info.id == focused)
+            .expect("focused pane info");
+        let runtime = app.workspaces[0]
+            .test_runtimes
+            .get(&focused)
+            .expect("test runtime");
+        let metrics = runtime.scroll_metrics().expect("scroll metrics");
+        assert_eq!(
+            metrics.viewport_rows as u16, focused_info.inner_rect.height,
+            "planned resize was applied to the runtime"
+        );
+
+        // A direct-attach resize lock excludes exactly that pane from the plan.
+        let locked = app.workspaces[0]
+            .terminal_id(focused)
+            .expect("terminal id")
+            .clone();
+        app.direct_attach_resize_locks.insert(locked.clone());
+        let requests = compute_view_with_content(&mut app, &EmptyPaneContentSource, area);
+        assert!(
+            requests.iter().all(|request| request.terminal_id != locked),
+            "locked pane must not be resized: {requests:?}"
+        );
+        assert!(
+            !requests.is_empty(),
+            "the unlocked pane still plans its resize"
+        );
+    }
+
+    /// Same characterization for the mobile layout and its navigate panel.
+    #[tokio::test]
+    async fn mobile_compute_view_render_is_characterized() {
+        let mut app = characterization_app_state();
+        app.mode = Mode::Navigate;
+        let (rows, digest) = compute_and_render_digest(&mut app, Rect::new(0, 0, 44, 20));
+
+        assert_eq!(app.view.layout, ViewLayout::Mobile);
+        let all = rows.join("\n");
+        assert!(all.contains("characterization"), "rows: {all}");
+        // Baselined together with the desktop digest; see the note there.
+        assert_eq!(
+            digest,
+            "340bfea61b50d9c1eb018e12919bddb59b186838801fa8c103a1664cadb56256"
+        );
+    }
+
+    /// Adversarial identity state must render without panicking and keep the
+    /// state invariants intact through compute_view + render.
+    #[tokio::test]
+    async fn adversarial_identity_state_renders_and_keeps_invariants() {
+        let mut app = AppState::test_with_adversarial_identity_state();
+        let (_, digest) = compute_and_render_digest(&mut app, Rect::new(0, 0, 106, 20));
+        assert!(!digest.is_empty());
+        app.assert_invariants_for_test();
+    }
 
     #[test]
     fn copy_feedback_offset_only_increases_when_toast_rect_overlaps() {

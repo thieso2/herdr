@@ -17,7 +17,7 @@ use crate::app::state::{Palette, ToastKind, ToastNotification};
 use crate::app::AppState;
 use crate::detect::AgentState;
 use crate::layout::PaneId;
-use crate::terminal::TerminalRuntimeRegistry;
+use crate::terminal::PaneContentSource;
 
 const SWITCH_BUTTON_WIDTH: u16 = 10;
 
@@ -202,7 +202,7 @@ pub(crate) fn mobile_switcher_target_at(
 
 pub(crate) fn render_mobile_header(
     app: &AppState,
-    terminal_runtimes: &TerminalRuntimeRegistry,
+    terminal_runtimes: &dyn PaneContentSource,
     frame: &mut Frame,
     area: Rect,
 ) {
@@ -275,7 +275,7 @@ pub(crate) fn render_mobile_toast_banner(
 
 pub(crate) fn render_mobile_panel(
     app: &AppState,
-    terminal_runtimes: &TerminalRuntimeRegistry,
+    terminal_runtimes: &dyn PaneContentSource,
     frame: &mut Frame,
     area: Rect,
 ) {
@@ -312,7 +312,7 @@ pub(crate) fn render_mobile_panel(
 
 fn render_header_status(
     app: &AppState,
-    terminal_runtimes: &TerminalRuntimeRegistry,
+    terminal_runtimes: &dyn PaneContentSource,
     frame: &mut Frame,
     area: Rect,
 ) {
@@ -472,7 +472,7 @@ fn mobile_switcher_content_height(app: &AppState) -> usize {
 
 fn render_mobile_switcher_content(
     app: &AppState,
-    terminal_runtimes: &TerminalRuntimeRegistry,
+    terminal_runtimes: &dyn PaneContentSource,
     frame: &mut Frame,
     viewport: Rect,
 ) {
@@ -1424,7 +1424,7 @@ mod tests {
             .draw(|frame| {
                 render_mobile_panel(
                     &app,
-                    &TerminalRuntimeRegistry::new(),
+                    &crate::terminal::TerminalRuntimeRegistry::new(),
                     frame,
                     Rect::new(0, 0, 40, 20),
                 )
@@ -1493,7 +1493,7 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
 
-        let mut runtime_registry = TerminalRuntimeRegistry::new();
+        let mut runtime_registry = crate::terminal::TerminalRuntimeRegistry::new();
         runtime_registry.insert(terminal_id, runtime);
         let backend = ratatui::backend::TestBackend::new(40, 2);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();

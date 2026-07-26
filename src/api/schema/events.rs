@@ -214,6 +214,8 @@ pub enum EventKind {
     PaneExited,
     PaneAgentDetected,
     PaneAgentStatusChanged,
+    NotificationPosted,
+    WindowTitleChanged,
     LayoutUpdated,
 }
 
@@ -244,6 +246,8 @@ impl EventKind {
             EventKind::PaneExited => "pane.exited",
             EventKind::PaneAgentDetected => "pane.agent_detected",
             EventKind::PaneAgentStatusChanged => "pane.agent_status_changed",
+            EventKind::NotificationPosted => "notification.posted",
+            EventKind::WindowTitleChanged => "window_title.changed",
             EventKind::LayoutUpdated => "layout.updated",
         }
     }
@@ -275,6 +279,8 @@ pub const KNOWN_EVENT_KINDS: &[EventKind] = &[
     EventKind::PaneExited,
     EventKind::PaneAgentDetected,
     EventKind::PaneAgentStatusChanged,
+    EventKind::NotificationPosted,
+    EventKind::WindowTitleChanged,
     EventKind::LayoutUpdated,
 ];
 
@@ -538,7 +544,27 @@ pub enum EventData {
         #[serde(default, skip_serializing_if = "HashMap::is_empty")]
         state_labels: HashMap<String, String>,
     },
+    NotificationPosted {
+        kind: NotificationEventKind,
+        message: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        body: Option<String>,
+    },
+    WindowTitleChanged {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+    },
     LayoutUpdated {
         layout: super::panes::PaneLayoutSnapshot,
     },
+}
+
+/// Delivery kind of a posted notification. Mirrors the legacy client
+/// protocol's notify kinds without referencing the frozen wire types.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum NotificationEventKind {
+    Sound,
+    Toast,
+    SystemToast,
 }

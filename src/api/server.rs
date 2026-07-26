@@ -22,7 +22,9 @@ use crate::ipc::{
     socket_file_identity, LocalStream, LocalStreamRead, SocketFileIdentity,
 };
 
+mod framed_session;
 mod pane_graphics_stream;
+pub(crate) use framed_session::allocate_stream_id as allocate_pane_stream_id;
 pub(crate) use pane_graphics_stream::cancel_inactive_streams as cancel_inactive_pane_graphics_streams;
 
 const SOCKET_PERMISSION_MODE: u32 = 0o600;
@@ -147,8 +149,16 @@ fn handle_connection(
         debug!(err = %err, "api connection write timeout unavailable");
     }
 
-    let Some(line) = read_initial_request_line(&mut stream)? else {
+    let Some(preamble) = read_connection_preamble(&mut stream)? else {
         return Ok(());
+    };
+
+    let line = match preamble {
+        ConnectionPreamble::FramedSession => {
+            debug!("framed session opened on api socket");
+            return framed_session::serve(stream, api_tx, event_hub, running);
+        }
+        ConnectionPreamble::RequestLine(line) => line,
     };
 
     let line = line.trim();
@@ -353,6 +363,9 @@ fn api_method_name(method: &Method) -> &'static str {
         Method::ClientWindowTitleSet(_) => "client.window_title.set",
         Method::ClientWindowTitleClear(_) => "client.window_title.clear",
         Method::SessionSnapshot(_) => "session.snapshot",
+        Method::RemoteList(_) => "remote.list",
+        Method::RemoteReset(_) => "remote.reset",
+        Method::RemoteReload(_) => "remote.reload",
         Method::WorkspaceCreate(_) => "workspace.create",
         Method::WorkspaceList(_) => "workspace.list",
         Method::WorkspaceGet(_) => "workspace.get",
@@ -413,6 +426,12 @@ fn api_method_name(method: &Method) -> &'static str {
         Method::PaneGraphicsStreamSet(_) => "pane.graphics.stream.set",
         Method::PaneGraphicsStreamOpen(_) => "pane.graphics.stream.open",
         Method::PaneGraphicsStreamClose(_) => "pane.graphics.stream.close",
+        Method::PaneStreamOpen(_) => "stream.open",
+        Method::PaneStreamClose(_) => "stream.close",
+        Method::PaneStreamResize(_) => "stream.resize",
+        Method::PaneStreamScroll(_) => "stream.scroll",
+        Method::PaneSendBytes(_) => "pane.send_bytes",
+        Method::PanePasteImage(_) => "pane.paste_image",
         Method::PaneReportAgent(_) => "pane.report_agent",
         Method::PaneReportAgentSession(_) => "pane.report_agent_session",
         Method::PaneReportMetadata(_) => "pane.report_metadata",
@@ -455,22 +474,33 @@ fn api_response_outcome(response: &str) -> &'static str {
     }
 }
 
-fn read_initial_request_line(stream: &mut LocalStream) -> std::io::Result<Option<String>> {
-    read_initial_request_line_with_timeout(stream, INITIAL_REQUEST_TIMEOUT)
+/// What a new connection's first bytes announce: the `HRDR` magic opening a
+/// framed unified-protocol session, or the first NDJSON request line.
+enum ConnectionPreamble {
+    FramedSession,
+    RequestLine(String),
 }
 
-fn read_initial_request_line_with_timeout(
+fn read_connection_preamble(
+    stream: &mut LocalStream,
+) -> std::io::Result<Option<ConnectionPreamble>> {
+    read_connection_preamble_with_timeout(stream, INITIAL_REQUEST_TIMEOUT)
+}
+
+fn read_connection_preamble_with_timeout(
     stream: &mut LocalStream,
     timeout: Duration,
-) -> std::io::Result<Option<String>> {
-    read_initial_request_line_with_limits(stream, timeout, MAX_INITIAL_REQUEST_BYTES)
+) -> std::io::Result<Option<ConnectionPreamble>> {
+    read_connection_preamble_with_limits(stream, timeout, MAX_INITIAL_REQUEST_BYTES)
 }
 
-fn read_initial_request_line_with_limits(
+fn read_connection_preamble_with_limits(
     stream: &mut LocalStream,
     timeout: Duration,
     max_bytes: usize,
-) -> std::io::Result<Option<String>> {
+) -> std::io::Result<Option<ConnectionPreamble>> {
+    use crate::protocol::framed::FRAMED_MAGIC;
+
     set_local_stream_polling(stream, true)?;
     let deadline = Instant::now() + timeout;
     let mut bytes = Vec::new();
@@ -485,9 +515,15 @@ fn read_initial_request_line_with_limits(
             LocalStreamRead::Closed => break Ok(None),
             LocalStreamRead::Data => {
                 bytes.push(byte[0]);
+                if bytes.len() <= FRAMED_MAGIC.len() && FRAMED_MAGIC.starts_with(&bytes) {
+                    if bytes.len() == FRAMED_MAGIC.len() {
+                        break Ok(Some(ConnectionPreamble::FramedSession));
+                    }
+                    continue;
+                }
                 if byte[0] == b'\n' {
                     break String::from_utf8(bytes)
-                        .map(Some)
+                        .map(|line| Some(ConnectionPreamble::RequestLine(line)))
                         .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err));
                 }
                 if bytes.len() > max_bytes {
@@ -607,7 +643,7 @@ mod windows_tests {
     fn windows_idle_initial_request_honors_timeout() {
         let (_client, mut server, path) = local_stream_pair("request-timeout");
 
-        let err = read_initial_request_line_with_timeout(&mut server, Duration::from_millis(50))
+        let err = read_connection_preamble_with_timeout(&mut server, Duration::from_millis(50))
             .unwrap_err();
 
         assert_eq!(err.kind(), io::ErrorKind::TimedOut);
@@ -620,7 +656,7 @@ mod windows_tests {
         client.write_all(b"12345").unwrap();
         client.flush().unwrap();
 
-        let err = read_initial_request_line_with_limits(&mut server, Duration::from_secs(1), 4)
+        let err = read_connection_preamble_with_limits(&mut server, Duration::from_secs(1), 4)
             .unwrap_err();
 
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
@@ -634,8 +670,8 @@ mod windows_tests {
         client.write_all(&[0xff, b'\n']).unwrap();
         client.flush().unwrap();
 
-        let err = read_initial_request_line_with_timeout(&mut server, Duration::from_secs(1))
-            .unwrap_err();
+        let err =
+            read_connection_preamble_with_timeout(&mut server, Duration::from_secs(1)).unwrap_err();
 
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         let _ = std::fs::remove_file(path);

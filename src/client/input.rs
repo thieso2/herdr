@@ -26,6 +26,12 @@ use super::ClientLoopEvent;
 #[cfg(any(windows, test))]
 mod windows_vti;
 
+/// How long the Unix stdin reader waits in each readiness poll before
+/// re-checking `should_quit`. Bounds how long the thread can keep the stdin
+/// lock after the run loop exits.
+#[cfg(unix)]
+const STDIN_QUIT_POLL_TIMEOUT_MS: i32 = 100;
+
 // ---------------------------------------------------------------------------
 // Stdin reader thread
 // ---------------------------------------------------------------------------
@@ -74,6 +80,14 @@ fn unix_stdin_reader_loop(
     let mut pending_palette = Vec::new();
 
     while !should_quit.load(Ordering::Acquire) {
+        // Poll before blocking: a read that parks on the locked stdin would
+        // outlive the TUI and swallow the first line typed at any post-run
+        // prompt (for example the `--remote` save-this-target offer). The
+        // bounded poll lets this thread observe `should_quit` and release
+        // the stdin lock instead of stealing that answer.
+        if stdin_read_ready(&reader, STDIN_QUIT_POLL_TIMEOUT_MS) == Some(false) {
+            continue;
+        }
         match reader.read(&mut scratch) {
             Ok(0) => break,
             Ok(n) => {

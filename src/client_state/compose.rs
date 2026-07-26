@@ -955,15 +955,23 @@ mod tests {
         offline.connection_lost("bridge closed");
         mirrors.insert(offline);
         let descriptors = crate::client_state::fleet_view::remote_descriptors(&[
+            // Index 0 is the local runtime the fixture mirrors seed, spelled
+            // out as an ordinary target-less entry now that none is implicit.
+            crate::fleet::config::RemoteEntry {
+                name: "local".into(),
+                target: None,
+                session: "default".into(),
+                enabled: true,
+            },
             crate::fleet::config::RemoteEntry {
                 name: "buildbox".into(),
-                target: "can@buildbox.example".into(),
+                target: Some("can@buildbox.example".into()),
                 session: "default".into(),
                 enabled: true,
             },
             crate::fleet::config::RemoteEntry {
                 name: "gpu-01".into(),
-                target: "can@gpu-01.example".into(),
+                target: Some("can@gpu-01.example".into()),
                 session: "default".into(),
                 enabled: true,
             },
@@ -1086,7 +1094,14 @@ mod tests {
         // gutter, no tokens.
         let mut mirrors = crate::client_state::RemoteMirrors::with_local();
         *mirrors.local_mut() = crate::client_state::RemoteMirror::test_with_adversarial_catalog();
-        let descriptors = crate::client_state::fleet_view::remote_descriptors(&[]);
+        let descriptors = crate::client_state::fleet_view::remote_descriptors(&[
+            crate::fleet::config::RemoteEntry {
+                name: "local".into(),
+                target: None,
+                session: "default".into(),
+                enabled: true,
+            },
+        ]);
         let chrome = GlobalChrome::new();
 
         let mut fleet_ids = ComposeIds::new();

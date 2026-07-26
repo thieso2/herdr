@@ -104,7 +104,9 @@ impl AppState {
         // forwarding to reporting panes and pane content for selection,
         // scrollbars, and copy.
         let runtimes: &TerminalRuntimeRegistry = terminal_runtimes;
-        self.handle_mouse_with_content(runtimes, runtimes, mouse)
+        let action = self.handle_mouse_with_content(runtimes, runtimes, mouse);
+        self.discard_history_backfill_requests();
+        action
     }
 
     /// Mouse handling split along the runtime/content seam: `terminal_runtimes`
@@ -487,6 +489,7 @@ impl AppState {
                             }
                             ScrollbarClickTarget::Track { offset_from_bottom } => {
                                 self.set_pane_scroll_offset(content, pane_id, offset_from_bottom);
+                                self.request_history_backfill_pane = Some(pane_id);
                             }
                         }
                         if self.mode != Mode::Terminal {
@@ -720,6 +723,8 @@ impl AppState {
                     }
                 }
 
+                // Recorded while `self` is borrowed by the drag match below.
+                let mut scrolled_pane = None;
                 if let Some(DragState {
                     target: DragTarget::WorkspaceReorder { insert_idx, .. },
                 }) = &mut self.drag
@@ -791,6 +796,7 @@ impl AppState {
                                 *grab_row_offset,
                             ) {
                                 self.set_pane_scroll_offset(content, *pane_id, offset_from_bottom);
+                                scrolled_pane = Some(*pane_id);
                             }
                         }
                         DragTarget::SidebarDivider => {
@@ -803,6 +809,9 @@ impl AppState {
                         | DragTarget::ProductAnnouncementScrollbar { .. }
                         | DragTarget::KeybindHelpScrollbar { .. } => {}
                     }
+                }
+                if let Some(pane_id) = scrolled_pane {
+                    self.request_history_backfill_pane = Some(pane_id);
                 }
             }
 
@@ -1919,6 +1928,41 @@ mod tests {
             .and_then(crate::terminal::TerminalRuntime::scroll_metrics)
             .expect("scroll metrics after wheel");
         assert_eq!(metrics.offset_from_bottom, 7);
+    }
+
+    #[tokio::test]
+    async fn the_in_process_path_never_leaves_a_history_backfill_request_pending() {
+        let mut app = app_for_mouse_test();
+        let mut ws = Workspace::test_new("test");
+        let pane_id = ws.tabs[0].root_pane;
+        let pane_infos = ws.tabs[0].layout.panes(Rect::new(26, 2, 80, 18));
+        let info = pane_infos[0].clone();
+        ws.tabs[0].runtimes.insert(
+            pane_id,
+            crate::terminal::TerminalRuntime::test_with_scrollback_bytes(
+                info.inner_rect.width,
+                info.inner_rect.height,
+                16 * 1024,
+                &numbered_lines_bytes(64),
+            ),
+        );
+
+        app.state.workspaces = vec![ws];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::Terminal;
+        app.state.view.pane_infos = pane_infos;
+
+        // This client's panes own their scrollback, so a recorded request
+        // has nobody to serve it and must not survive the event.
+        app.state.request_history_backfill_pane = Some(pane_id);
+        app.handle_mouse(mouse(
+            MouseEventKind::ScrollUp,
+            info.inner_rect.x + 1,
+            info.inner_rect.y + 1,
+        ));
+
+        assert!(app.state.request_history_backfill_pane.is_none());
     }
 
     #[tokio::test]

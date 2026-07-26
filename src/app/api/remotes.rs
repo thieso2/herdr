@@ -4,17 +4,13 @@
 use super::responses;
 use crate::api::schema::{RemoteInfo, RemoteTargetParams, ResponseResult};
 use crate::app::App;
-use crate::fleet::config::LOCAL_REMOTE_NAME;
 use crate::fleet::status::{remote_infos_from_entries, remote_infos_from_statuses};
 
 impl App {
     fn current_remote_infos(&self) -> Vec<RemoteInfo> {
-        let local_session = crate::session::active_name();
         match &self.fleet {
-            Some(fleet) => remote_infos_from_statuses(&fleet.snapshot(), local_session.as_deref()),
-            None => {
-                remote_infos_from_entries(&crate::fleet::config::load(), local_session.as_deref())
-            }
+            Some(fleet) => remote_infos_from_statuses(&fleet.snapshot()),
+            None => remote_infos_from_entries(&crate::fleet::config::load()),
         }
     }
 
@@ -28,13 +24,6 @@ impl App {
     }
 
     pub(crate) fn handle_remote_reset(&mut self, id: String, params: RemoteTargetParams) -> String {
-        if params.name == LOCAL_REMOTE_NAME {
-            return responses::encode_error(
-                id,
-                "invalid_remote",
-                "the local runtime has no connection to reset",
-            );
-        }
         let Some(fleet) = self.fleet.as_mut() else {
             return responses::encode_error(
                 id,

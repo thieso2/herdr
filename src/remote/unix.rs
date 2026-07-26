@@ -306,7 +306,7 @@ fn offer_to_save_remote(target: &str, session: &str) {
     let entries = crate::fleet::config::load();
     if entries
         .iter()
-        .any(|entry| entry.target == target && entry.session == session)
+        .any(|entry| entry.target.as_deref() == Some(target) && entry.session == session)
     {
         return;
     }
@@ -325,7 +325,7 @@ fn offer_to_save_remote(target: &str, session: &str) {
 
     let entry = crate::fleet::config::RemoteEntry {
         name: name.clone(),
-        target: target.to_string(),
+        target: Some(target.to_string()),
         session: session.to_string(),
         enabled: true,
     };
@@ -2934,7 +2934,7 @@ mod tests {
     fn saved_remote_names_avoid_collisions() {
         let entries = vec![crate::fleet::config::RemoteEntry {
             name: "buildbox.example".into(),
-            target: "someone@buildbox.example".into(),
+            target: Some("someone@buildbox.example".into()),
             session: "default".into(),
             enabled: true,
         }];
@@ -2950,7 +2950,7 @@ mod tests {
         assert_eq!(taken, "buildbox.example-2");
         assert!(crate::fleet::config::validate_remote_name(&taken).is_ok());
         // Nothing legal to derive: no offer at all.
-        assert_eq!(available_remote_name("local", &entries), None);
+        assert_eq!(available_remote_name("@", &entries), None);
     }
 
     #[test]

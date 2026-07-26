@@ -334,8 +334,16 @@ fn fresh_session(writer: SessionWriter, guard: Option<BridgeChild>, generation: 
 }
 
 /// Connects to the local API socket and negotiates a catalog session.
-fn connect() -> ConnectOutcome {
-    let socket_path = crate::api::socket_path();
+fn connect(session: &str) -> ConnectOutcome {
+    // A local runtime names its session like any other fleet entry, so two
+    // local entries differing only by session are two independent servers.
+    // The default session still resolves through the environment overrides
+    // `active_api_socket_path` honors.
+    let socket_path = if session == crate::session::DEFAULT_SESSION_NAME {
+        crate::api::socket_path()
+    } else {
+        crate::session::api_socket_path_for(Some(session))
+    };
     let mut stream = match crate::ipc::connect_local_stream(&socket_path) {
         Ok(stream) => stream,
         Err(err) => return ConnectOutcome::Failed(format!("api socket unreachable: {err}")),
@@ -554,11 +562,12 @@ pub(crate) fn run_pure_client(config: &crate::config::Config) -> io::Result<()> 
     crate::logging::startup("client");
     info!("running pure client of the local server (remote #0)");
 
-    let mut mirrors = RemoteMirrors::with_local();
-    // The fleet config defines the remotes; every enabled remote gets a
-    // mirror and a connection regardless of view membership.
+    // The fleet config defines the whole fleet - local runtimes included -
+    // so every enabled entry gets a mirror and a connection regardless of
+    // view membership. No entry is implicit, so none is skipped here.
+    let mut mirrors = RemoteMirrors::new();
     let descriptors = remote_descriptors(&crate::fleet::config::load());
-    for descriptor in descriptors.iter().skip(1) {
+    for descriptor in &descriptors {
         mirrors.insert(super::RemoteMirror::new(
             descriptor.index,
             descriptor.name.clone(),
@@ -589,8 +598,8 @@ pub(crate) fn run_pure_client_fleet_of_one(
     );
 
     let descriptor = RemoteDescriptor::ephemeral(name, target, session, program);
-    let mut mirrors = RemoteMirrors::with_local();
-    // The ephemeral remote *is* remote #0: there is no local runtime here.
+    let mut mirrors = RemoteMirrors::new();
+    // The ephemeral remote *is* remote #0: it is the whole fleet.
     mirrors.insert(super::RemoteMirror::new(
         descriptor.index,
         descriptor.name.clone(),
@@ -1037,7 +1046,7 @@ fn establish_for(
     if descriptor.target.is_some() {
         establish_remote(descriptor, mirrors, ui, event_tx, should_quit)
     } else {
-        establish_local(mirrors, ui, event_tx, should_quit)
+        establish_local(descriptor, mirrors, ui, event_tx, should_quit)
     }
 }
 
@@ -1048,19 +1057,30 @@ fn establish_for(
 /// block the loop - and with it every fleet remote - for the hello
 /// timeout.
 fn establish_local(
+    descriptor: &RemoteDescriptor,
     mirrors: &mut RemoteMirrors,
     ui: &mut InteractionState,
     event_tx: &mpsc::SyncSender<LoopEvent>,
     should_quit: &Arc<AtomicBool>,
 ) -> Link {
-    let mirror = mirrors.local_mut();
+    // Unreachable: every descriptor gets a mirror before any connect. A
+    // retry-later link keeps this total without inventing a session.
+    let Some(mirror) = mirrors.get_mut(descriptor.index) else {
+        return Link::Down {
+            retry_at: Instant::now() + Duration::from_secs(1),
+        };
+    };
     debug!(remote = mirror.remote_index, name = %mirror.name, "connecting");
     mirror.connection.connect_started();
     ui.next_generation += 1;
     let generation = ui.next_generation;
     let tx = event_tx.clone();
     let quit = Arc::clone(should_quit);
-    std::thread::spawn(move || local_connect_and_read(generation, tx, quit));
+    // A local runtime is no longer pinned to remote #0: it sits wherever
+    // config puts it, and carries its own session.
+    let remote = descriptor.index;
+    let session = descriptor.session.clone();
+    std::thread::spawn(move || local_connect_and_read(remote, &session, generation, tx, quit));
     Link::Pending { generation }
 }
 
@@ -1068,11 +1088,13 @@ fn establish_local(
 /// On success the same thread becomes the session's frame reader, so the
 /// socket's read half never crosses threads.
 fn local_connect_and_read(
+    remote: usize,
+    session_name: &str,
     generation: u64,
     event_tx: mpsc::SyncSender<LoopEvent>,
     should_quit: Arc<AtomicBool>,
 ) {
-    let outcome = match connect() {
+    let outcome = match connect(session_name) {
         ConnectOutcome::Connected(connected) => {
             let ConnectedLocal {
                 mut session,
@@ -1083,7 +1105,7 @@ fn local_connect_and_read(
             // reader loop tags below must match the session's generation.
             session.generation = generation;
             let established = LoopEvent::Established(
-                LOCAL_REMOTE_INDEX,
+                remote,
                 generation,
                 Box::new(RemoteEstablished::LocalConnected {
                     welcome,
@@ -1093,7 +1115,7 @@ fn local_connect_and_read(
             if event_tx.send(established).is_err() {
                 return;
             }
-            socket_reader_loop(reader, generation, event_tx, &should_quit);
+            socket_reader_loop(remote, reader, generation, event_tx, &should_quit);
             return;
         }
         ConnectOutcome::Incompatible { remedy, message } => {
@@ -1102,7 +1124,7 @@ fn local_connect_and_read(
         ConnectOutcome::Failed(error) => RemoteEstablished::Failed(error),
     };
     let _ = event_tx.send(LoopEvent::Established(
-        LOCAL_REMOTE_INDEX,
+        remote,
         generation,
         Box::new(outcome),
     ));
@@ -1487,18 +1509,38 @@ fn scroll_focused_replica_page(code: crossterm::event::KeyCode, ctx: &mut LoopCt
         rows
     };
     replica.scroll_delta(delta);
-    request_backfill_if_needed(ctx.links, ctx.mirrors, remote, stream_id);
+    request_backfill(
+        ctx.links,
+        ctx.mirrors,
+        remote,
+        stream_id,
+        crate::terminal::replica::BackfillTrigger::Scroll,
+    );
     true
 }
 
-/// Issues a lazy scrollback backfill for a stream whose viewport approaches
-/// the top of loaded history. The response prepends through the replica's
-/// rebuild path.
-fn request_backfill_if_needed(
+/// The remote and stream serving a composed pane, if that pane is streamed.
+pub(super) fn stream_for_composed_pane(
+    mirrors: &RemoteMirrors,
+    ids: &ComposeIds,
+    pane_id: crate::layout::PaneId,
+) -> Option<(usize, u32)> {
+    let (remote, public) = ids.public_pane_id(pane_id)?;
+    let stream_id = mirrors.get(remote)?.stream_for_pane(public)?;
+    Some((remote, stream_id))
+}
+
+/// Asks the replica's paging policy for a scrollback backfill and sends the
+/// `stream.history` request it plans, if any. The response prepends through
+/// the replica's rebuild path. The trigger says why the client is asking:
+/// attach warms one page, scrolling pages lazily ahead of the loaded top, and
+/// a jump to the top takes one large fetch instead of a page-by-page crawl.
+pub(super) fn request_backfill(
     links: &mut Links,
     mirrors: &mut RemoteMirrors,
     remote: usize,
     stream_id: u32,
+    trigger: crate::terminal::replica::BackfillTrigger,
 ) {
     let Some(session) = session_for(links, remote) else {
         return;
@@ -1510,7 +1552,7 @@ fn request_backfill_if_needed(
         return;
     };
     let id = session.request_id("history");
-    match replica.take_backfill_request(&id, crate::terminal::replica::BackfillTrigger::Scroll) {
+    match replica.take_backfill_request(&id, trigger) {
         Ok(Some(request)) => {
             session.pending.insert(id, Pending::History { stream_id });
             if let Err(err) = session.send_control(&request) {
@@ -1524,20 +1566,21 @@ fn request_backfill_if_needed(
 
 /// Reads frames off the session socket into the loop channel.
 fn socket_reader_loop(
+    remote: usize,
     mut stream: LocalStream,
     generation: u64,
     event_tx: mpsc::SyncSender<LoopEvent>,
     should_quit: &Arc<AtomicBool>,
 ) {
     if stream.set_nonblocking(false).is_err() {
-        let _ = event_tx.send(LoopEvent::Disconnected(LOCAL_REMOTE_INDEX, generation));
+        let _ = event_tx.send(LoopEvent::Disconnected(remote, generation));
         return;
     }
     while !should_quit.load(Ordering::Acquire) {
         match read_frame(&mut stream) {
             Ok(frame) => {
                 if event_tx
-                    .send(LoopEvent::Frame(LOCAL_REMOTE_INDEX, generation, frame))
+                    .send(LoopEvent::Frame(remote, generation, frame))
                     .is_err()
                 {
                     return;
@@ -1545,7 +1588,7 @@ fn socket_reader_loop(
             }
             Err(err) => {
                 debug!(err = %err, "pure client session read ended");
-                let _ = event_tx.send(LoopEvent::Disconnected(LOCAL_REMOTE_INDEX, generation));
+                let _ = event_tx.send(LoopEvent::Disconnected(remote, generation));
                 return;
             }
         }
@@ -1758,7 +1801,35 @@ fn handle_server_frame(remote: usize, frame: Frame, ctx: &mut LoopCtx<'_>) {
                                     if mode == StreamMode::Read {
                                         session.read_only.insert(opened.stream_id);
                                     }
-                                    mirror.stream_opened(pane_id, opened.stream_id, replica);
+                                    // Not `focused_public_pane`: that borrows
+                                    // the mirrors this arm already holds
+                                    // mutably, and its catalog check is
+                                    // redundant here - the pane was vouched
+                                    // for above - so focus is a pure id
+                                    // comparison.
+                                    let focused = ctx
+                                        .app
+                                        .active
+                                        .and_then(|idx| ctx.app.workspaces.get(idx))
+                                        .and_then(|ws| ws.focused_pane_id())
+                                        .and_then(|local| ctx.ids.public_pane_id(local))
+                                        .is_some_and(|(focus_remote, focus_public)| {
+                                            focus_remote == remote && focus_public == pane_id
+                                        });
+                                    let stream_id = opened.stream_id;
+                                    mirror.stream_opened(pane_id, stream_id, replica);
+                                    // Warm one page for the pane the user is
+                                    // looking at, so its first scroll tick
+                                    // already has history behind it.
+                                    request_backfill(
+                                        ctx.links,
+                                        ctx.mirrors,
+                                        remote,
+                                        stream_id,
+                                        crate::terminal::replica::BackfillTrigger::Attach {
+                                            focused,
+                                        },
+                                    );
                                 }
                                 Err(err) => warn!(err = %err, "replica open failed"),
                             }
@@ -2217,17 +2288,18 @@ fn handle_key(key: crate::input::TerminalKey, ctx: &mut LoopCtx<'_>) {
             if let Some(content) = ctx.app.request_clipboard_write.take() {
                 crate::selection::write_osc52_bytes(&content);
             }
-            // Scrolling near the top of loaded history pages more in.
+            // Scrolling near the top of loaded history pages more in; a jump
+            // to the top of history takes one large fetch instead of crawling
+            // there a page per keypress.
+            let trigger = if std::mem::take(&mut ctx.app.request_history_top_backfill) {
+                crate::terminal::replica::BackfillTrigger::JumpToTop
+            } else {
+                crate::terminal::replica::BackfillTrigger::Scroll
+            };
             if let Some((remote, stream_id)) = copy_pane
-                .and_then(|pane_id| ctx.ids.public_pane_id(pane_id))
-                .and_then(|(remote, public)| {
-                    ctx.mirrors
-                        .get(remote)
-                        .and_then(|mirror| mirror.stream_for_pane(public))
-                        .map(|stream_id| (remote, stream_id))
-                })
+                .and_then(|pane_id| stream_for_composed_pane(ctx.mirrors, ctx.ids, pane_id))
             {
-                request_backfill_if_needed(ctx.links, ctx.mirrors, remote, stream_id);
+                request_backfill(ctx.links, ctx.mirrors, remote, stream_id, trigger);
             }
         }
         Mode::RenameWorkspace
@@ -2603,7 +2675,13 @@ fn handle_mouse(mouse: MouseEvent, ctx: &mut LoopCtx<'_>) {
                 lines
             };
             replica.scroll_delta(delta);
-            request_backfill_if_needed(ctx.links, ctx.mirrors, remote, stream_id);
+            request_backfill(
+                ctx.links,
+                ctx.mirrors,
+                remote,
+                stream_id,
+                crate::terminal::replica::BackfillTrigger::Scroll,
+            );
         }
         MouseEventKind::Down(_) | MouseEventKind::Up(_) | MouseEventKind::Drag(_)
             if forward_reported_mouse_button(mouse, ctx) => {}
@@ -2732,23 +2810,12 @@ fn handle_chip_click(
             }
         }
         crossterm::event::MouseButton::Right => {
-            // Edit the remote behind the chip. The implicit local runtime
-            // has no config entry to edit, and a chip that silently
-            // ignores the click reads as broken - it says so instead.
-            if descriptor.index == LOCAL_REMOTE_INDEX {
-                ctx.ui.status_flash = Some((
-                    "the local runtime is not configurable".to_owned(),
-                    Instant::now(),
-                ));
-                return;
-            }
-            let Some(target) = descriptor.target.clone() else {
-                return;
-            };
+            // Edit the remote behind the chip. Every chip is now a config
+            // entry - local runtimes included - so every chip is editable.
             ctx.chrome.remote_edit = Some(super::remote_edit::RemoteEditState::edit(
                 &crate::fleet::config::RemoteEntry {
                     name: descriptor.name.clone(),
-                    target,
+                    target: descriptor.target.clone(),
                     session: descriptor.session.clone(),
                     enabled: true,
                 },
@@ -2931,15 +2998,24 @@ mod tests {
 
     fn three_descriptors() -> Vec<RemoteDescriptor> {
         remote_descriptors(&[
+            // Remote #0 is a local runtime - an ordinary target-less entry
+            // now that no runtime is implicit. `with_test_ctx` seeds its
+            // mirror, so index 0 still means "the local one" in these tests.
+            crate::fleet::config::RemoteEntry {
+                name: "local".into(),
+                target: None,
+                session: "default".into(),
+                enabled: true,
+            },
             crate::fleet::config::RemoteEntry {
                 name: "buildbox".into(),
-                target: "can@buildbox.example".into(),
+                target: Some("can@buildbox.example".into()),
                 session: "default".into(),
                 enabled: true,
             },
             crate::fleet::config::RemoteEntry {
                 name: "gpu-01".into(),
-                target: "can@gpu-01.example".into(),
+                target: Some("can@gpu-01.example".into()),
                 session: "default".into(),
                 enabled: true,
             },
@@ -3253,13 +3329,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn right_click_opens_the_edit_dialog_for_fleet_remotes_only() {
+    async fn right_click_opens_the_edit_dialog_for_every_remote() {
         with_test_ctx(three_descriptors(), |ctx| {
+            // Regression: remote #0 used to be an implicit runtime with no
+            // config entry, so right-clicking it refused. Every chip is a
+            // config entry now, local ones included, so every chip edits -
+            // and a local runtime shows an empty target field.
             handle_chip_click(0, crossterm::event::MouseButton::Right, ctx);
-            assert!(
-                ctx.chrome.remote_edit.is_none(),
-                "the implicit local runtime is not configurable"
-            );
+            let local = ctx.chrome.remote_edit.as_ref().expect("edit dialog");
+            assert_eq!(local.original_name.as_deref(), Some("local"));
+            assert_eq!(local.target, "", "a local runtime has no ssh target");
+            ctx.chrome.remote_edit = None;
 
             handle_chip_click(2, crossterm::event::MouseButton::Right, ctx);
             let dialog = ctx.chrome.remote_edit.as_ref().expect("edit dialog");
@@ -3282,12 +3362,20 @@ mod tests {
             ctx.chrome.selection.solo(2, ctx.descriptors);
 
             // gpu-01 is removed; buildbox changes target (identity change).
-            let entries = vec![crate::fleet::config::RemoteEntry {
-                name: "buildbox".into(),
-                target: "can@buildbox2.example".into(),
-                session: "default".into(),
-                enabled: true,
-            }];
+            let entries = vec![
+                crate::fleet::config::RemoteEntry {
+                    name: "local".into(),
+                    target: None,
+                    session: "default".into(),
+                    enabled: true,
+                },
+                crate::fleet::config::RemoteEntry {
+                    name: "buildbox".into(),
+                    target: Some("can@buildbox2.example".into()),
+                    session: "default".into(),
+                    enabled: true,
+                },
+            ];
             reconcile_fleet(&entries, ctx);
 
             assert_eq!(ctx.descriptors.len(), 2);
@@ -3812,6 +3900,39 @@ mod tests {
     /// A mirror whose catalog holds one focused pane (`p_1_1`) served by a
     /// replica seeded with `screen`.
     fn mirror_with_replica(screen: &str) -> super::super::RemoteMirror {
+        let mut mirror = mirror_with_catalog();
+        let replica =
+            crate::terminal::replica::PaneReplica::open(screen, 10, None, 80, 24, 64 * 1024)
+                .expect("replica opens");
+        mirror.stream_opened("p_1_1", 3, replica);
+        mirror
+    }
+
+    /// Same, but the replica knows there is older history behind an opaque
+    /// cursor and has room in its budget to fetch it.
+    fn mirror_with_history(screen: &str, cursor: &str) -> super::super::RemoteMirror {
+        let mut mirror = mirror_with_catalog();
+        let replica = crate::terminal::replica::PaneReplica::open(
+            screen,
+            10,
+            Some(cursor.to_owned()),
+            80,
+            24,
+            1024 * 1024,
+        )
+        .expect("replica opens");
+        mirror.stream_opened("p_1_1", 3, replica);
+        mirror
+    }
+
+    /// A mirror holding the same catalog with no pane stream open yet.
+    fn mirror_with_catalog() -> super::super::RemoteMirror {
+        mirror_with_panes(1)
+    }
+
+    /// The same catalog split across `panes` panes in one tab, the first of
+    /// which is the focused one.
+    fn mirror_with_panes(panes: usize) -> super::super::RemoteMirror {
         let mut mirror = super::super::RemoteMirror::test_new();
         let snapshot: crate::api::schema::session::SessionSnapshot =
             serde_json::from_value(serde_json::json!({
@@ -3822,29 +3943,83 @@ mod tests {
                 "focused_pane_id": "p_1_1",
                 "workspaces": [{
                     "workspace_id": "ws_1", "number": 1, "label": "repo",
-                    "focused": true, "pane_count": 1, "tab_count": 1,
+                    "focused": true, "pane_count": panes, "tab_count": 1,
                     "active_tab_id": "t_1_1", "agent_status": "idle"
                 }],
                 "tabs": [{
                     "tab_id": "t_1_1", "workspace_id": "ws_1", "number": 1,
-                    "label": "shell", "focused": true, "pane_count": 1,
+                    "label": "shell", "focused": true, "pane_count": panes,
                     "agent_status": "idle"
                 }],
-                "panes": [{
-                    "pane_id": "p_1_1", "terminal_id": "term_1",
-                    "workspace_id": "ws_1", "tab_id": "t_1_1", "focused": true,
+                "panes": (1..=panes).map(|number| serde_json::json!({
+                    "pane_id": format!("p_1_{number}"),
+                    "terminal_id": format!("term_{number}"),
+                    "workspace_id": "ws_1", "tab_id": "t_1_1",
+                    // The catalog's pane flags are focus authority.
+                    "focused": number == 1,
                     "agent_status": "idle", "revision": 1
-                }],
+                })).collect::<Vec<_>>(),
                 "layouts": [],
                 "agents": []
             }))
             .expect("snapshot deserializes");
         mirror.catalog.resync(&snapshot, 1);
-        let replica =
-            crate::terminal::replica::PaneReplica::open(screen, 10, None, 80, 24, 64 * 1024)
-                .expect("replica opens");
-        mirror.stream_opened("p_1_1", 3, replica);
         mirror
+    }
+
+    /// More rows than a 24-row replica can show, so its pane has scrollback
+    /// to page through and renders a scrollbar.
+    fn tall_screen(rows: usize) -> String {
+        (0..rows).map(|row| format!("line {row}\r\n")).collect()
+    }
+
+    /// The pure client's view of a mirror with one pane, laid out.
+    fn compose_and_lay_out(ctx: &mut LoopCtx<'_>) {
+        compose_into(ctx.mirrors.local(), ctx.chrome, ctx.ids, ctx.app);
+        ctx.app.mode = Mode::Terminal;
+        let source = MirrorPaneSource::new(ctx.mirrors.local());
+        let _requests = crate::ui::compute_view_with_content(
+            ctx.app,
+            &source,
+            ratatui::layout::Rect::new(0, 0, 106, 26),
+        );
+    }
+
+    fn mouse_at(
+        kind: crossterm::event::MouseEventKind,
+        column: u16,
+        row: u16,
+    ) -> crossterm::event::MouseEvent {
+        crossterm::event::MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::empty(),
+        }
+    }
+
+    /// The server's `stream.opened` answer to our own open request.
+    fn stream_opened_frame(request_id: &str, pane_id: &str, stream_id: u32) -> Frame {
+        let payload = serde_json::json!({
+            "id": request_id,
+            "result": {
+                "type": "pane_stream_opened",
+                "stream": {
+                    "pane_id": pane_id,
+                    "stream_id": stream_id,
+                    "sequence": 0,
+                    "snapshot": "hello",
+                    "history_cursor": "cursor-1",
+                    "cols": 80,
+                    "rows": 24,
+                },
+            },
+        });
+        Frame {
+            frame_type: FrameType::Control,
+            stream_id: 0,
+            payload: serde_json::to_vec(&payload).expect("payload serializes"),
+        }
     }
 
     /// A connected [`Session`] whose peer end the test reads frames from.
@@ -3874,6 +4049,237 @@ mod tests {
             Ok(frame) => serde_json::from_slice(&frame.payload).ok(),
             Err(_) => None,
         }
+    }
+
+    #[tokio::test]
+    async fn attaching_warms_one_history_page_for_the_focused_pane_only() {
+        with_test_ctx(vec![RemoteDescriptor::local()], |ctx| {
+            // Two panes in one tab, p_1_1 focused. Both stream; only the
+            // focused one may pay for history at attach.
+            *ctx.mirrors.local_mut() = mirror_with_panes(2);
+            compose_into(ctx.mirrors.local(), ctx.chrome, ctx.ids, ctx.app);
+            assert_eq!(
+                ctx.app.workspaces[0]
+                    .focused_pane_id()
+                    .and_then(|pane| ctx.ids.public_pane_id(pane))
+                    .map(|(_, public)| public),
+                Some("p_1_1"),
+                "the composed view focuses the pane the catalog flagged"
+            );
+
+            let (mut session, mut server) = session_pair();
+            for (id, pane_id) in [("o1", "p_1_2"), ("o2", "p_1_1")] {
+                session.pending.insert(
+                    id.to_owned(),
+                    Pending::StreamOpen {
+                        pane_id: pane_id.to_owned(),
+                        mode: StreamMode::Write,
+                    },
+                );
+            }
+            ctx.links
+                .insert(LOCAL_REMOTE_INDEX, Link::Up(Box::new(session)));
+
+            // The unfocused pane attaches first and pays nothing.
+            handle_server_frame(
+                LOCAL_REMOTE_INDEX,
+                stream_opened_frame("o1", "p_1_2", 4),
+                ctx,
+            );
+            assert!(
+                try_read_control(&mut server).is_none(),
+                "a pane nobody is looking at must not fetch history at attach"
+            );
+
+            // The focused pane gets one eager page, so its first scroll tick
+            // already has history behind it.
+            handle_server_frame(
+                LOCAL_REMOTE_INDEX,
+                stream_opened_frame("o2", "p_1_1", 3),
+                ctx,
+            );
+            let request = try_read_control(&mut server).expect("attach warms the focused pane");
+            assert_eq!(
+                request["method"],
+                crate::protocol::framed::STREAM_HISTORY_METHOD
+            );
+            assert_eq!(request["params"]["cursor"], "cursor-1");
+        });
+    }
+
+    #[tokio::test]
+    async fn clicking_the_pane_scrollbar_track_pages_in_more_history() {
+        use crossterm::event::{MouseButton, MouseEventKind};
+
+        with_test_ctx(vec![RemoteDescriptor::local()], |ctx| {
+            *ctx.mirrors.local_mut() = mirror_with_history(&tall_screen(60), "cursor-1");
+            compose_and_lay_out(ctx);
+            let track = ctx
+                .app
+                .view
+                .pane_infos
+                .first()
+                .and_then(crate::ui::pane_scrollbar_rect)
+                .expect("a pane with scrollback shows a scrollbar");
+
+            let (session, mut server) = session_pair();
+            ctx.links
+                .insert(LOCAL_REMOTE_INDEX, Link::Up(Box::new(session)));
+
+            // Clicking the top of the track jumps to the top of what is
+            // loaded, which is exactly where older history is wanted.
+            handle_mouse(
+                mouse_at(MouseEventKind::Down(MouseButton::Left), track.x, track.y),
+                ctx,
+            );
+
+            let request = try_read_control(&mut server).expect("the click pages history in");
+            assert_eq!(
+                request["method"],
+                crate::protocol::framed::STREAM_HISTORY_METHOD
+            );
+            assert_eq!(request["params"]["cursor"], "cursor-1");
+        });
+    }
+
+    #[tokio::test]
+    async fn dragging_the_pane_scrollbar_thumb_pages_in_more_history() {
+        use crossterm::event::{MouseButton, MouseEventKind};
+
+        with_test_ctx(vec![RemoteDescriptor::local()], |ctx| {
+            *ctx.mirrors.local_mut() = mirror_with_history(&tall_screen(60), "cursor-1");
+            compose_and_lay_out(ctx);
+            let track = ctx
+                .app
+                .view
+                .pane_infos
+                .first()
+                .and_then(crate::ui::pane_scrollbar_rect)
+                .expect("a pane with scrollback shows a scrollbar");
+
+            let (session, mut server) = session_pair();
+            ctx.links
+                .insert(LOCAL_REMOTE_INDEX, Link::Up(Box::new(session)));
+
+            // The pane sits at the bottom of its history, so the thumb sits
+            // at the bottom of the track. Grab it and drag to the top.
+            let thumb_row = track.y + track.height.saturating_sub(1);
+            handle_mouse(
+                mouse_at(MouseEventKind::Down(MouseButton::Left), track.x, thumb_row),
+                ctx,
+            );
+            assert!(
+                try_read_control(&mut server).is_none(),
+                "grabbing the thumb scrolls nothing yet"
+            );
+
+            handle_mouse(
+                mouse_at(MouseEventKind::Drag(MouseButton::Left), track.x, track.y),
+                ctx,
+            );
+
+            let request = try_read_control(&mut server).expect("the drag pages history in");
+            assert_eq!(
+                request["method"],
+                crate::protocol::framed::STREAM_HISTORY_METHOD
+            );
+            assert_eq!(request["params"]["cursor"], "cursor-1");
+            assert!(
+                ctx.app.request_history_backfill_pane.is_none(),
+                "the request is drained once"
+            );
+        });
+    }
+
+    #[tokio::test]
+    async fn wheel_scrolling_toward_the_top_pages_in_more_history() {
+        use crossterm::event::MouseEventKind;
+
+        with_test_ctx(vec![RemoteDescriptor::local()], |ctx| {
+            *ctx.mirrors.local_mut() = mirror_with_history(&tall_screen(60), "cursor-1");
+            compose_and_lay_out(ctx);
+            let inner = ctx
+                .app
+                .view
+                .pane_infos
+                .first()
+                .expect("pane info")
+                .inner_rect;
+
+            let (session, mut server) = session_pair();
+            ctx.links
+                .insert(LOCAL_REMOTE_INDEX, Link::Up(Box::new(session)));
+
+            handle_mouse(mouse_at(MouseEventKind::ScrollUp, inner.x, inner.y), ctx);
+
+            let request = try_read_control(&mut server).expect("the wheel pages history in");
+            assert_eq!(
+                request["method"],
+                crate::protocol::framed::STREAM_HISTORY_METHOD
+            );
+            // The lazy scroll plan, not the whole budget.
+            assert_eq!(
+                request["params"]["max_bytes"],
+                crate::protocol::framed::HISTORY_PAGE_DEFAULT_BYTES
+            );
+        });
+    }
+
+    #[tokio::test]
+    async fn page_up_on_a_plain_pane_pages_in_more_history() {
+        with_test_ctx(vec![RemoteDescriptor::local()], |ctx| {
+            *ctx.mirrors.local_mut() = mirror_with_history(&tall_screen(60), "cursor-1");
+            compose_and_lay_out(ctx);
+
+            let (session, mut server) = session_pair();
+            ctx.links
+                .insert(LOCAL_REMOTE_INDEX, Link::Up(Box::new(session)));
+
+            handle_key(key(KeyCode::PageUp), ctx);
+
+            let request = try_read_control(&mut server).expect("page up pages history in");
+            assert_eq!(
+                request["method"],
+                crate::protocol::framed::STREAM_HISTORY_METHOD
+            );
+        });
+    }
+
+    #[tokio::test]
+    async fn copy_mode_jump_to_top_fetches_one_large_history_page() {
+        with_test_ctx(vec![RemoteDescriptor::local()], |ctx| {
+            *ctx.mirrors.local_mut() = mirror_with_history("alpha\r\n", "cursor-1");
+            compose_into(ctx.mirrors.local(), ctx.chrome, ctx.ids, ctx.app);
+            ctx.app.mode = Mode::Terminal;
+            {
+                let source = MirrorPaneSource::new(ctx.mirrors.local());
+                let _requests = crate::ui::compute_view_with_content(
+                    ctx.app,
+                    &source,
+                    ratatui::layout::Rect::new(0, 0, 106, 26),
+                );
+                ctx.app.enter_copy_mode(&source);
+            }
+            assert_eq!(ctx.app.mode, Mode::Copy);
+
+            let (session, mut server) = session_pair();
+            ctx.links
+                .insert(LOCAL_REMOTE_INDEX, Link::Up(Box::new(session)));
+
+            handle_key(key(KeyCode::Char('g')), ctx);
+
+            let request = try_read_control(&mut server).expect("the jump fetches history");
+            assert_eq!(
+                request["method"],
+                crate::protocol::framed::STREAM_HISTORY_METHOD
+            );
+            // One large fetch, not the page-by-page scroll plan.
+            assert_eq!(request["params"]["max_bytes"], 1024 * 1024);
+            assert!(
+                !ctx.app.request_history_top_backfill,
+                "the request is drained once"
+            );
+        });
     }
 
     #[tokio::test]

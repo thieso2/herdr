@@ -95,6 +95,10 @@ pub fn incompatible_status_line(
 /// `remote list` state column.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConnectionState {
+    /// A local runtime: reached over this machine's API socket, so this
+    /// machine drives no ssh bridge for it and never connects, retries, or
+    /// backs off. Terminal and inert, like [`Self::Disabled`].
+    Local,
     /// Disabled in config; no connection is attempted.
     Disabled,
     /// A connect-plus-handshake attempt is in flight.
@@ -124,6 +128,9 @@ pub struct ConnectionMachine {
     /// recent `Connected` session. Carried into `Offline` when that session
     /// drops before `stable_uptime`, so flapping remotes keep escalating.
     session_attempt: u32,
+    /// Whether this is a local runtime. Kept so an enable flip restores
+    /// `Local` instead of scheduling a connect that would never happen.
+    local: bool,
 }
 
 impl ConnectionMachine {
@@ -141,6 +148,23 @@ impl ConnectionMachine {
             state,
             tuning,
             session_attempt: 0,
+            local: false,
+        }
+    }
+
+    /// A machine for a local runtime. It never drives a connection: the
+    /// client owns the API-socket link, so every transition below is inert
+    /// and the state stays `Local` (or `Disabled`) for its whole life.
+    pub fn new_local(enabled: bool, tuning: BackoffTuning) -> Self {
+        Self {
+            state: if enabled {
+                ConnectionState::Local
+            } else {
+                ConnectionState::Disabled
+            },
+            tuning,
+            session_attempt: 0,
+            local: true,
         }
     }
 
@@ -170,6 +194,7 @@ impl ConnectionMachine {
             ConnectionState::Offline { attempt, .. } => attempt.saturating_add(1),
             ConnectionState::Connecting { attempt } => *attempt,
             ConnectionState::Connected { .. }
+            | ConnectionState::Local
             | ConnectionState::Disabled
             | ConnectionState::Incompatible { .. } => return,
         };
@@ -179,7 +204,7 @@ impl ConnectionMachine {
     /// Handshake completed; the session is live.
     pub fn on_connected(&mut self, now: Instant) {
         match &self.state {
-            ConnectionState::Disabled => return,
+            ConnectionState::Local | ConnectionState::Disabled => return,
             ConnectionState::Connecting { attempt } => self.session_attempt = *attempt,
             _ => {}
         }
@@ -190,7 +215,10 @@ impl ConnectionMachine {
     /// overlap. Terminal until a manual reset or a config change: retrying
     /// cannot succeed while either side stays on its current version.
     pub fn on_incompatible(&mut self, message: impl Into<String>) {
-        if matches!(self.state, ConnectionState::Disabled) {
+        if matches!(
+            self.state,
+            ConnectionState::Local | ConnectionState::Disabled
+        ) {
             return;
         }
         self.state = ConnectionState::Incompatible {
@@ -215,7 +243,9 @@ impl ConnectionMachine {
                 }
             }
             ConnectionState::Offline { attempt, .. } => attempt.saturating_add(1),
-            ConnectionState::Disabled | ConnectionState::Incompatible { .. } => return,
+            ConnectionState::Local
+            | ConnectionState::Disabled
+            | ConnectionState::Incompatible { .. } => return,
         };
         self.state = ConnectionState::Offline {
             attempt,
@@ -227,7 +257,10 @@ impl ConnectionMachine {
     /// Manual reset: clear the backoff and reconnect immediately. From a live
     /// or in-flight connection this forces a teardown-and-reconnect.
     pub fn on_reset(&mut self, now: Instant) {
-        if matches!(self.state, ConnectionState::Disabled) {
+        if matches!(
+            self.state,
+            ConnectionState::Local | ConnectionState::Disabled
+        ) {
             return;
         }
         self.session_attempt = 0;
@@ -242,6 +275,9 @@ impl ConnectionMachine {
     pub fn set_enabled(&mut self, enabled: bool, now: Instant) {
         match (enabled, &self.state) {
             (false, _) => self.state = ConnectionState::Disabled,
+            (true, ConnectionState::Disabled) if self.local => {
+                self.state = ConnectionState::Local;
+            }
             (true, ConnectionState::Disabled) => {
                 self.session_attempt = 0;
                 self.state = ConnectionState::Offline {
@@ -298,6 +334,38 @@ mod tests {
         let machine = machine(now);
         assert!(machine.ready_to_connect(now));
         assert_eq!(machine.next_deadline(), Some(now));
+    }
+
+    #[test]
+    fn a_local_machine_never_connects_and_survives_an_enable_flip() {
+        let now = Instant::now();
+        let mut machine = ConnectionMachine::new_local(true, T);
+        assert_eq!(machine.state(), &ConnectionState::Local);
+
+        // Inert in every direction: the client owns the API-socket link, so
+        // this machine must never schedule a connect, a retry, or a backoff.
+        assert!(!machine.ready_to_connect(now + Duration::from_secs(3600)));
+        assert_eq!(machine.next_deadline(), None);
+        machine.on_connect_started();
+        machine.on_connected(now);
+        machine.on_disconnected(now, "noise".into(), 0.5);
+        machine.on_incompatible("noise");
+        machine.on_reset(now);
+        assert_eq!(machine.state(), &ConnectionState::Local);
+
+        // Disabling is a config-level off; re-enabling restores `Local`
+        // rather than scheduling a connect that would never happen.
+        machine.set_enabled(false, now);
+        assert_eq!(machine.state(), &ConnectionState::Disabled);
+        machine.set_enabled(true, now);
+        assert_eq!(machine.state(), &ConnectionState::Local);
+        assert!(!machine.ready_to_connect(now));
+
+        // A local entry that starts disabled starts disabled.
+        assert_eq!(
+            ConnectionMachine::new_local(false, T).state(),
+            &ConnectionState::Disabled
+        );
     }
 
     #[test]

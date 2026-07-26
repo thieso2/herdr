@@ -37,7 +37,7 @@ impl RemoteEditState {
         Self {
             original_name: Some(entry.name.clone()),
             name: entry.name.clone(),
-            target: entry.target.clone(),
+            target: entry.target.clone().unwrap_or_default(),
             session: entry.session.clone(),
             focused_field: 0,
             error: None,
@@ -61,7 +61,12 @@ impl RemoteEditState {
     pub(crate) fn entry(&self) -> Result<crate::fleet::config::RemoteEntry, String> {
         let entry = crate::fleet::config::RemoteEntry {
             name: self.name.trim().to_owned(),
-            target: self.target.trim().to_owned(),
+            // An empty target field is a local runtime, not an error: it is
+            // how the dialog expresses "this machine" without ssh.
+            target: {
+                let target = self.target.trim();
+                (!target.is_empty()).then(|| target.to_owned())
+            },
             session: {
                 let session = self.session.trim();
                 if session.is_empty() {
@@ -182,7 +187,7 @@ mod tests {
 
         let entry = state.entry().expect("valid entry");
         assert_eq!(entry.name, "gpu-01");
-        assert_eq!(entry.target, "can@gpu1.example");
+        assert_eq!(entry.target.as_deref(), Some("can@gpu1.example"));
         assert_eq!(entry.session, "default");
         assert!(entry.enabled);
     }
@@ -190,17 +195,36 @@ mod tests {
     #[test]
     fn validation_errors_surface_and_typing_clears_them() {
         let mut state = RemoteEditState::add();
-        state.name = "local".to_owned();
+        state.name = "has space".to_owned();
         state.target = "host".to_owned();
-        let err = state.entry().expect_err("reserved name");
-        assert!(err.contains("reserved"));
+        let err = state.entry().expect_err("illegal name");
+        assert!(err.contains("may only contain"), "{err}");
         state.error = Some(err);
         remote_edit_apply_key(&mut state, key(KeyCode::Char('x')));
         assert_eq!(state.error, None, "typing clears the error row");
+    }
 
-        state = RemoteEditState::add();
-        state.name = "a".to_owned();
-        assert!(state.entry().is_err(), "empty target refused");
+    #[test]
+    fn an_empty_target_field_saves_a_local_runtime() {
+        // Regression: the dialog used to refuse an empty target, and `local`
+        // was a reserved name. Both were consequences of the implicit remote
+        // #0; a target-less entry is now how you add your own box.
+        let mut state = RemoteEditState::add();
+        state.name = "local".to_owned();
+        let entry = state.entry().expect("a target-less entry is valid");
+        assert_eq!(entry.name, "local");
+        assert_eq!(entry.target, None);
+        assert!(entry.is_local());
+        assert_eq!(entry.session, "default");
+
+        // Whitespace is not a target either.
+        state.target = "   ".to_owned();
+        assert_eq!(state.entry().expect("still local").target, None);
+
+        // Editing one round-trips the field.
+        let round_trip = RemoteEditState::edit(&entry);
+        assert_eq!(round_trip.target, "", "no target renders as an empty field");
+        assert_eq!(round_trip.entry().expect("valid").target, None);
     }
 
     #[test]
@@ -214,7 +238,7 @@ mod tests {
 
         let entry = crate::fleet::config::RemoteEntry {
             name: "gpu".into(),
-            target: "can@gpu".into(),
+            target: Some("can@gpu".into()),
             session: "work".into(),
             enabled: true,
         };

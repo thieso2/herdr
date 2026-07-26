@@ -69,6 +69,33 @@ Connecting never installs or upgrades a remote as a side effect. Only a host wit
 
 A `--remote` launch is an ephemeral fleet of one: the target is not stored anywhere. After a session that worked, Herdr offers once to save it as a named remote in `remotes.toml`, so the next launch can use the name.
 
+### The fleet is exactly what you configure
+
+`remotes.toml` is the whole fleet. There is no implicit local runtime: nothing is connected that you did not ask for, and a fresh install with no `remotes.toml` opens an empty fleet.
+
+An entry with **no `target`** is a *local* runtime — this machine, over its own API socket, with no SSH and no `sshd`. An entry **with** a `target` is reached over an SSH bridge. Both are ordinary entries: both take a name and a session, both can be disabled, and both can be edited or removed. `local` is no longer a reserved name.
+
+```toml
+# ~/.config/overherdr/remotes.toml
+[[remote]]
+name = "me"
+# no target: this machine, no ssh
+session = "default"
+
+[[remote]]
+name = "scratch"
+session = "scratch"     # a second local session, an independent runtime
+
+[[remote]]
+name = "gpu-1"
+target = "can@gpu-1.example"
+session = "default"
+```
+
+Because a local entry names its own session, two local entries that differ only by session are two independent runtimes with their own servers and their own state. An empty `target = ""` is rejected rather than treated as local — omit the key instead.
+
+`herdr remote upgrade` skips local entries: they have no SSH target, and this machine's binary rolls forward with `herdr update`.
+
 ### Saved fleet remotes
 
 A saved remote reconnects on its own in the background, so it resolves `herdr` on the far side each time rather than pinning a path. SSH runs your login shell non-interactively there, which often means a stripped `PATH` — under `zsh`, only `.zshenv` is read — so Herdr looks on `PATH` first and then at `~/.local/bin/herdr`, the directory it installs into. A remote whose Herdr lives in `~/.local/bin` connects whether or not that directory is on the non-interactive `PATH`.

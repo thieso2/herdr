@@ -23,6 +23,7 @@ impl App {
         self.state
             .handle_copy_mode_key(&self.terminal_runtimes, key);
         self.dispatch_pending_clipboard_write();
+        self.state.discard_history_backfill_requests();
     }
 }
 
@@ -561,6 +562,9 @@ impl AppState {
             return;
         };
         self.set_pane_scroll_offset(terminal_runtimes, pane_id, metrics.max_offset_from_bottom);
+        // Local scrollback stops here; a client streaming this pane has more
+        // history to pull and should pull it in one fetch, not a page a press.
+        self.request_history_top_backfill = true;
         if let Some(copy_mode) = self.copy_mode.as_mut() {
             copy_mode.cursor_row = 0;
         }

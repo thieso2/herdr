@@ -582,6 +582,8 @@ impl App {
             request_add_remote: false,
             request_client_config_reload: false,
             request_clipboard_write: None,
+            request_history_top_backfill: false,
+            request_history_backfill_pane: None,
             creating_new_tab: false,
             requested_new_tab_name: None,
             pending_workspace_create_cwd: None,

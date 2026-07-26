@@ -111,7 +111,15 @@ pub struct SshBridgeTransport;
 
 impl FleetTransport for SshBridgeTransport {
     fn connect(&self, entry: &RemoteEntry) -> io::Result<FleetIo> {
-        let (child, stdout, stdin) = BridgeChild::spawn(&entry.target, &entry.session)?;
+        // Local entries never reach a transport: `add_remote` gives them no
+        // worker at all, because this process owns their API socket.
+        let target = entry.target.as_deref().ok_or_else(|| {
+            io::Error::other(format!(
+                "remote '{}' is a local runtime and has no ssh bridge",
+                entry.name
+            ))
+        })?;
+        let (child, stdout, stdin) = BridgeChild::spawn(target, &entry.session)?;
         let diagnostics = Some(child.stderr_tail());
         Ok(FleetIo {
             reader: Box::new(stdout),
@@ -130,13 +138,15 @@ impl FleetTransport for SshBridgeTransport {
         if !bridge_child::diagnostics_report_missing_binary(failure) {
             return None;
         }
+        // A local runtime has no binary to install: it is this machine.
+        let target = entry.target.as_deref()?;
         let brand = crate::identity::BRAND;
         info!(
             remote = %entry.name,
-            target = %entry.target,
+            target,
             "remote has no {brand}; installing it"
         );
-        match crate::remote::install_missing_remote_binary(&entry.target) {
+        match crate::remote::install_missing_remote_binary(target) {
             Ok(version) => Some(FleetRepair::Repaired(format!(
                 "installed {brand} {version} on the remote"
             ))),
@@ -151,6 +161,8 @@ impl FleetTransport for SshBridgeTransport {
 /// durations for rendering and the API.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RemoteStatusKind {
+    /// A local runtime: no ssh bridge, so nothing to connect or retry.
+    Local,
     Disabled,
     Connecting {
         attempt: u32,
@@ -330,7 +342,14 @@ impl FleetManager {
 
     fn add_remote(&mut self, entry: RemoteEntry) {
         let now = Instant::now();
-        let machine = ConnectionMachine::new(entry.enabled, now, self.tuning.backoff);
+        // A local entry is listed like any other runtime but never gets a
+        // worker: this process reaches it over the API socket, not ssh.
+        let is_local = entry.is_local();
+        let machine = if is_local {
+            ConnectionMachine::new_local(entry.enabled, self.tuning.backoff)
+        } else {
+            ConnectionMachine::new(entry.enabled, now, self.tuning.backoff)
+        };
         let name = entry.name.clone();
         let enabled = entry.enabled;
         if let Ok(mut shared) = self.shared.lock() {
@@ -340,7 +359,7 @@ impl FleetManager {
                 .remotes
                 .insert(name.clone(), RemoteRuntime { entry, machine });
         }
-        if enabled {
+        if enabled && !is_local {
             self.spawn_worker(name);
         }
     }
@@ -403,6 +422,7 @@ impl Drop for FleetManager {
 
 fn status_kind(machine: &ConnectionMachine, now: Instant) -> RemoteStatusKind {
     match machine.state() {
+        ConnectionState::Local => RemoteStatusKind::Local,
         ConnectionState::Disabled => RemoteStatusKind::Disabled,
         ConnectionState::Connecting { attempt } => {
             RemoteStatusKind::Connecting { attempt: *attempt }
@@ -814,7 +834,7 @@ mod tests {
     fn entry(name: &str) -> RemoteEntry {
         RemoteEntry {
             name: name.to_string(),
-            target: format!("test@{name}.invalid"),
+            target: Some(format!("test@{name}.invalid")),
             session: crate::session::DEFAULT_SESSION_NAME.to_string(),
             enabled: true,
         }
@@ -1190,7 +1210,7 @@ mod tests {
 
         // Remove b, change a's target (identity change → remove-plus-add).
         let mut changed = entry("a");
-        changed.target = "test@a-two.invalid".to_string();
+        changed.target = Some("test@a-two.invalid".to_string());
         let changes = manager.apply_config(vec![changed.clone()]);
         assert!(changes.contains(&RemoteChange::Removed(entry("b"))));
         assert!(changes.contains(&RemoteChange::Removed(entry("a"))));
@@ -1218,7 +1238,7 @@ mod tests {
             vec![RemoteChange::SettingsChanged {
                 old: {
                     let mut old = entry("a");
-                    old.target = "test@a-two.invalid".to_string();
+                    old.target = Some("test@a-two.invalid".to_string());
                     old
                 },
                 new: disabled,
@@ -1235,14 +1255,15 @@ mod tests {
     fn start_skips_invalid_and_duplicate_entries() {
         let transport = ScriptedTransport::new(vec![FakeBehavior::RefuseConnect]);
         let mut bad_target = entry("bad");
-        bad_target.target = "-oProxyCommand=evil".to_string();
-        let mut reserved = entry("x");
-        reserved.name = "local".to_string();
+        bad_target.target = Some("-oProxyCommand=evil".to_string());
+        // `local` is an ordinary name now; an empty target is the invalid one.
+        let mut empty_target = entry("x");
+        empty_target.target = Some(String::new());
         let mut disabled_duplicate = entry("a");
         disabled_duplicate.enabled = false;
 
         let manager = FleetManager::start(
-            vec![entry("a"), bad_target, reserved, disabled_duplicate],
+            vec![entry("a"), bad_target, empty_target, disabled_duplicate],
             Arc::clone(&transport) as Arc<dyn FleetTransport>,
             tuning(Duration::from_secs(60)),
             noop_hook(),

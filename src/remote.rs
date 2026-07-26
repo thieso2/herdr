@@ -104,8 +104,8 @@ pub(crate) fn remote_name_from_target(target: &str) -> Option<String> {
     if name.is_empty() {
         return None;
     }
-    // The derived name still has to be a legal remote name (length, reserved
-    // `local`, and the rest); an illegal derivation means no default.
+    // The derived name still has to be a legal remote name (length, charset
+    // and the rest); an illegal derivation means no default.
     crate::fleet::config::validate_remote_name(&name)
         .ok()
         .map(|()| name)
@@ -248,8 +248,8 @@ mod shared_tests {
             remote_name_from_target("root@10.0.0.4:2222"),
             Some("10.0.0.4".to_string())
         );
-        // `local` is reserved for the implicit local runtime.
-        assert_eq!(remote_name_from_target("local"), None);
+        // `local` is an ordinary host name now that no runtime is implicit.
+        assert_eq!(remote_name_from_target("local"), Some("local".to_string()));
         assert_eq!(remote_name_from_target("@"), None);
     }
 }

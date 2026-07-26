@@ -15,7 +15,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::app::state::{RemoteChipConnection, RemoteChipState};
 
 use super::connection::ClientConnectionState;
-use super::{RemoteMirrors, LOCAL_REMOTE_INDEX, LOCAL_REMOTE_NAME};
+#[cfg(test)]
+use super::LOCAL_REMOTE_NAME;
+use super::{RemoteMirrors, LOCAL_REMOTE_INDEX};
 
 /// One remote the client composes over: the implicit local runtime plus the
 /// enabled fleet config entries, in config order.
@@ -37,6 +39,9 @@ pub(crate) struct RemoteDescriptor {
 }
 
 impl RemoteDescriptor {
+    /// The descriptor the implicit remote #0 used to be. Test-only: a local
+    /// runtime is now an ordinary target-less config entry.
+    #[cfg(test)]
     pub(crate) fn local() -> Self {
         Self {
             index: LOCAL_REMOTE_INDEX,
@@ -69,25 +74,27 @@ impl RemoteDescriptor {
     }
 }
 
-/// The composed remote list: the local runtime first, then every *enabled*
-/// fleet config entry in file order. Hues follow list order so they stay
-/// stable while the config file does.
+/// The composed remote list: every *enabled* fleet config entry in file
+/// order, and nothing else. There is no implicit local runtime — an entry
+/// with no target is a local one, and it is in this list only because the
+/// config asked for it. Hues follow list order so they stay stable while the
+/// config file does.
 pub(crate) fn remote_descriptors(
     entries: &[crate::fleet::config::RemoteEntry],
 ) -> Vec<RemoteDescriptor> {
-    let mut descriptors = vec![RemoteDescriptor::local()];
-    for entry in entries.iter().filter(|entry| entry.enabled) {
-        let index = descriptors.len();
-        descriptors.push(RemoteDescriptor {
+    entries
+        .iter()
+        .filter(|entry| entry.enabled)
+        .enumerate()
+        .map(|(index, entry)| RemoteDescriptor {
             index,
             name: entry.name.clone(),
             hue_index: index,
-            target: Some(entry.target.clone()),
+            target: entry.target.clone(),
             session: entry.session.clone(),
             program: None,
-        });
-    }
-    descriptors
+        })
+        .collect()
 }
 
 /// Client-owned view membership over the fleet. Stores the *hidden* set so
@@ -279,21 +286,52 @@ mod tests {
     fn entry(name: &str, enabled: bool) -> RemoteEntry {
         RemoteEntry {
             name: name.to_owned(),
-            target: format!("can@{name}.example"),
+            target: Some(format!("can@{name}.example")),
             session: "work".to_owned(),
             enabled,
         }
     }
 
+    /// A local runtime entry. Selection, filtering and remap tests put one
+    /// first so they keep exercising a fleet whose head is local - the shape
+    /// the implicit remote #0 used to force, now spelled out in config.
+    fn local(name: &str) -> RemoteEntry {
+        RemoteEntry {
+            name: name.to_owned(),
+            target: None,
+            session: "default".to_owned(),
+            enabled: true,
+        }
+    }
+
     #[test]
-    fn descriptors_are_local_first_then_enabled_entries_in_config_order() {
+    fn descriptors_are_exactly_the_enabled_entries_in_config_order() {
+        // Regression: an implicit `local` used to be prepended here, so no
+        // config could remove it and its name was reserved. The fleet is now
+        // exactly what the file configures - local runtimes included.
         let descriptors = remote_descriptors(&[
             entry("buildbox", true),
             entry("dark", false),
             entry("gpu-01", true),
         ]);
         let names: Vec<&str> = descriptors.iter().map(|d| d.name.as_str()).collect();
-        assert_eq!(names, vec!["local", "buildbox", "gpu-01"]);
+        assert_eq!(names, vec!["buildbox", "gpu-01"]);
+        assert!(remote_descriptors(&[]).is_empty(), "no implicit runtime");
+
+        // A target-less entry is a local runtime, wherever config puts it.
+        let mixed = remote_descriptors(&[entry("gpu-01", true), local("me")]);
+        assert_eq!(mixed[1].name, "me");
+        assert_eq!(mixed[1].target, None, "no ssh for a local runtime");
+        assert_eq!(mixed[1].index, 1);
+
+        let descriptors = remote_descriptors(&[
+            local("me"),
+            entry("buildbox", true),
+            entry("dark", false),
+            entry("gpu-01", true),
+        ]);
+        let names: Vec<&str> = descriptors.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(names, vec!["me", "buildbox", "gpu-01"]);
         let indices: Vec<usize> = descriptors.iter().map(|d| d.index).collect();
         assert_eq!(indices, vec![0, 1, 2]);
         assert_eq!(descriptors[0].target, None);
@@ -319,13 +357,13 @@ mod tests {
             descriptor.program.as_deref(),
             Some("/home/can/.local/bin/herdr")
         );
-        // A saved fleet remote keeps running `herdr` from the remote PATH.
-        assert!(RemoteDescriptor::local().program.is_none());
+        // A saved fleet remote keeps resolving the fork on the remote PATH.
+        assert!(remote_descriptors(&[entry("a", true)])[0].program.is_none());
     }
 
     #[test]
     fn toggle_filters_without_ever_emptying_the_view() {
-        let descriptors = remote_descriptors(&[entry("a", true), entry("b", true)]);
+        let descriptors = remote_descriptors(&[local("me"), entry("a", true), entry("b", true)]);
         let mut selection = FleetSelection::new();
         assert!(selection.is_in_view(0) && selection.is_in_view(1) && selection.is_in_view(2));
 
@@ -345,7 +383,7 @@ mod tests {
 
     #[test]
     fn solo_leaves_exactly_one_remote_in_view_and_focuses_it() {
-        let descriptors = remote_descriptors(&[entry("a", true), entry("b", true)]);
+        let descriptors = remote_descriptors(&[local("me"), entry("a", true), entry("b", true)]);
         let mut selection = FleetSelection::new();
         selection.solo(1, &descriptors);
         assert!(!selection.is_in_view(0));
@@ -361,7 +399,7 @@ mod tests {
 
     #[test]
     fn focused_remote_falls_back_to_the_first_in_view() {
-        let descriptors = remote_descriptors(&[entry("a", true)]);
+        let descriptors = remote_descriptors(&[local("me"), entry("a", true)]);
         let mut selection = FleetSelection::new();
         selection.focused_remote = 1;
         assert_eq!(selection.effective_focused_remote(&descriptors), 1);
@@ -375,12 +413,12 @@ mod tests {
 
     #[test]
     fn remap_drops_selection_state_for_removed_remotes() {
-        let descriptors = remote_descriptors(&[entry("a", true), entry("b", true)]);
+        let descriptors = remote_descriptors(&[local("me"), entry("a", true), entry("b", true)]);
         let mut selection = FleetSelection::new();
         selection.solo(2, &descriptors);
 
         // b is removed from the config: the solo selection must repair.
-        let shrunk = remote_descriptors(&[entry("a", true)]);
+        let shrunk = remote_descriptors(&[local("me"), entry("a", true)]);
         selection.remap(&descriptors, &shrunk);
         assert!(descriptors.len() > shrunk.len());
         assert_eq!(selection.effective_focused_remote(&shrunk), 0);
@@ -389,14 +427,15 @@ mod tests {
 
     #[test]
     fn remap_keys_selection_by_remote_identity_across_removals() {
-        let old = remote_descriptors(&[entry("buildbox", true), entry("gpu-01", true)]);
+        let old =
+            remote_descriptors(&[local("me"), entry("buildbox", true), entry("gpu-01", true)]);
         let mut selection = FleetSelection::new();
         selection.toggle(1, &old).expect("hide buildbox");
         selection.focused_remote = 2; // gpu-01
 
         // buildbox is removed: gpu-01 shifts from index 2 to index 1 and
         // must carry its own selection state, not inherit buildbox's.
-        let new = remote_descriptors(&[entry("gpu-01", true)]);
+        let new = remote_descriptors(&[local("me"), entry("gpu-01", true)]);
         selection.remap(&old, &new);
         assert!(
             selection.is_in_view(1),
@@ -411,7 +450,7 @@ mod tests {
 
     #[test]
     fn chip_states_carry_connection_membership_and_hue() {
-        let descriptors = remote_descriptors(&[entry("a", true), entry("b", true)]);
+        let descriptors = remote_descriptors(&[local("me"), entry("a", true), entry("b", true)]);
         let mut selection = FleetSelection::new();
         selection.toggle(2, &descriptors).expect("filter b");
 

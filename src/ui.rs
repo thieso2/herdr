@@ -1484,6 +1484,31 @@ mod tests {
         assert_eq!(scrollbar_offset_from_drag_row(metrics, track, row, grab), 7);
     }
 
+    #[test]
+    fn a_click_above_the_thumb_grabs_nothing_instead_of_underflowing() {
+        // Scrolled to the bottom, so the thumb sits at the bottom of the
+        // track and most of the track is above it - the ordinary
+        // page-up-by-clicking gesture.
+        let metrics = crate::pane::ScrollMetrics {
+            offset_from_bottom: 0,
+            max_offset_from_bottom: 20,
+            viewport_rows: 5,
+        };
+        let track = Rect::new(9, 4, 1, 8);
+        let thumb = scrollbar_thumb(metrics, track).expect("thumb");
+        assert!(thumb.top > track.y, "the thumb leaves track above it");
+
+        assert_eq!(scrollbar_thumb_grab_offset(metrics, track, track.y), None);
+        assert_eq!(
+            scrollbar_thumb_grab_offset(metrics, track, thumb.top - 1),
+            None
+        );
+        assert_eq!(
+            scrollbar_thumb_grab_offset(metrics, track, thumb.top),
+            Some(0)
+        );
+    }
+
     fn buffer_row_text(buffer: &ratatui::buffer::Buffer, area: Rect, row: u16) -> String {
         (area.x..area.x + area.width)
             .map(|x| buffer[(x, row)].symbol())

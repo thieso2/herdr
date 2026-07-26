@@ -75,7 +75,9 @@ pub(crate) fn scrollbar_thumb_grab_offset(
     row: u16,
 ) -> Option<u16> {
     let thumb = scrollbar_thumb(metrics, track)?;
-    (row >= thumb.top && row < thumb.top + thumb.len).then_some(row - thumb.top)
+    // `then_some` would evaluate the subtraction eagerly and underflow on
+    // every click above the thumb, which is most of the track.
+    (row >= thumb.top && row < thumb.top + thumb.len).then(|| row - thumb.top)
 }
 
 fn scrollbar_offset_from_thumb_top(

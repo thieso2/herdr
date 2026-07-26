@@ -6,8 +6,11 @@
 //! through an explicit reload that diffs the freshly loaded entries against
 //! the running fleet with [`diff_remotes`].
 //!
-//! The local runtime is the implicit remote `#0`; the name `local` is
-//! reserved and never appears in the file.
+//! The file is the whole fleet: there is no implicit local runtime. An entry
+//! with no `target` is a *local* runtime, reached over this machine's API
+//! socket with no ssh; an entry with a `target` is reached over an ssh
+//! bridge. That makes "my own box" configurable, removable, and repeatable
+//! across sessions, exactly like any other remote.
 
 use std::fs::OpenOptions;
 use std::io;
@@ -15,9 +18,6 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use tracing::warn;
-
-/// Reserved name of the implicit local runtime (remote `#0`).
-pub const LOCAL_REMOTE_NAME: &str = "local";
 
 const REMOTES_FILE: &str = "remotes.toml";
 const REMOTES_LOCK_FILE: &str = ".remotes.lock";
@@ -31,14 +31,17 @@ fn default_enabled() -> bool {
     true
 }
 
-/// One configured remote runtime.
+/// One configured runtime in the fleet, local or remote.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RemoteEntry {
-    /// Unique fleet-local name; `local` is reserved.
+    /// Unique fleet-local name.
     pub name: String,
-    /// SSH destination (`[user@]host` or an ssh_config alias).
-    pub target: String,
-    /// Remote herdr session name; defaults to the default session.
+    /// SSH destination (`[user@]host` or an ssh_config alias). `None` is a
+    /// *local* runtime: this machine's API socket, no ssh, no sshd.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+    /// Herdr session name; defaults to the default session. Two local
+    /// entries differing only by session are two independent runtimes.
     #[serde(default = "default_session")]
     pub session: String,
     /// Disabled remotes stay listed but get no connection.
@@ -47,10 +50,16 @@ pub struct RemoteEntry {
 }
 
 impl RemoteEntry {
+    /// Whether this entry is reached over this machine's API socket rather
+    /// than an ssh bridge.
+    pub fn is_local(&self) -> bool {
+        self.target.is_none()
+    }
+
     /// The connection identity of an entry. A change here is a different
-    /// remote runtime and must be treated as remove-plus-add.
-    pub fn connection_identity(&self) -> (&str, &str) {
-        (&self.target, &self.session)
+    /// runtime and must be treated as remove-plus-add.
+    pub fn connection_identity(&self) -> (Option<&str>, &str) {
+        (self.target.as_deref(), &self.session)
     }
 }
 
@@ -94,6 +103,8 @@ pub fn validate_remote_name(name: &str) -> Result<(), String> {
             "remote name cannot be longer than {MAX_REMOTE_NAME_LEN} bytes"
         ));
     }
+    // `local` used to be reserved for an implicit remote #0. There is no
+    // implicit runtime any more, so the name is ordinary and usable.
     if name == "." || name == ".." {
         return Err("remote name cannot be . or ..".to_string());
     }
@@ -105,28 +116,32 @@ pub fn validate_remote_name(name: &str) -> Result<(), String> {
             "remote name may only contain ASCII letters, numbers, '.', '_' and '-'".to_string(),
         );
     }
-    if name == LOCAL_REMOTE_NAME {
-        return Err(format!(
-            "remote name '{LOCAL_REMOTE_NAME}' is reserved for the implicit local runtime"
-        ));
-    }
     Ok(())
 }
 
-/// Validates one entry.
+/// Validates one entry. A missing target is a local runtime and always
+/// valid; a present one must still be a usable ssh destination.
 pub fn validate_entry(entry: &RemoteEntry) -> Result<(), String> {
     validate_remote_name(&entry.name)?;
-    if entry.target.is_empty() {
-        return Err(format!("remote '{}' has an empty target", entry.name));
-    }
-    if entry.target.starts_with('-') {
-        return Err(format!(
-            "remote '{}' target must not start with '-'",
-            entry.name
-        ));
+    if let Some(target) = entry.target.as_deref() {
+        validate_target(&entry.name, target)?;
     }
     crate::session::validate_name(&entry.session)
         .map_err(|err| format!("remote '{}': {err}", entry.name))?;
+    Ok(())
+}
+
+fn validate_target(name: &str, target: &str) -> Result<(), String> {
+    if target.is_empty() {
+        // Distinct from an omitted target: an empty string in the file is
+        // far more likely a mistake than a request for a local runtime.
+        return Err(format!(
+            "remote '{name}' has an empty target; omit `target` entirely for a local runtime"
+        ));
+    }
+    if target.starts_with('-') {
+        return Err(format!("remote '{name}' target must not start with '-'"));
+    }
     Ok(())
 }
 
@@ -322,7 +337,7 @@ mod tests {
     fn entry(name: &str, target: &str) -> RemoteEntry {
         RemoteEntry {
             name: name.to_string(),
-            target: target.to_string(),
+            target: Some(target.to_string()),
             session: crate::session::DEFAULT_SESSION_NAME.to_string(),
             enabled: true,
         }
@@ -393,7 +408,7 @@ mod tests {
         let mut remotes = vec![entry("a", "host-a"), entry("b", "host-b")];
         upsert_in(&mut remotes, entry("a", "host-a-new"));
         assert_eq!(remotes.len(), 2);
-        assert_eq!(remotes[0].target, "host-a-new");
+        assert_eq!(remotes[0].target.as_deref(), Some("host-a-new"));
         assert_eq!(remotes[1].name, "b");
 
         upsert_in(&mut remotes, entry("c", "host-c"));
@@ -410,9 +425,32 @@ mod tests {
     }
 
     #[test]
-    fn local_name_is_reserved() {
-        assert!(validate_remote_name("local").is_err());
-        assert!(validate_entries(&[entry("local", "host")]).is_err());
+    fn local_is_an_ordinary_name_and_a_missing_target_is_a_local_runtime() {
+        // Regression: `local` was reserved for an implicit remote #0 that no
+        // config could remove. Both are gone - the fleet is exactly the file.
+        assert!(validate_remote_name("local").is_ok());
+        assert!(validate_entries(&[entry("local", "host")]).is_ok());
+
+        let me = RemoteEntry {
+            name: "me".into(),
+            target: None,
+            session: "default".into(),
+            enabled: true,
+        };
+        assert!(me.is_local());
+        assert_eq!(validate_entry(&me), Ok(()), "a missing target is legal");
+        assert_eq!(me.connection_identity(), (None, "default"));
+
+        // An *empty* target is still a mistake, and says how to fix itself.
+        let mut empty = me.clone();
+        empty.target = Some(String::new());
+        let err = validate_entry(&empty).expect_err("empty target refused");
+        assert!(err.contains("omit `target`"), "{err}");
+
+        // Two local entries are distinct runtimes when their sessions differ.
+        let mut scratch = me.clone();
+        scratch.session = "scratch".into();
+        assert_ne!(me.connection_identity(), scratch.connection_identity());
     }
 
     #[test]
@@ -428,7 +466,7 @@ mod tests {
     fn entry_validation_rejects_bad_targets_and_sessions() {
         let mut bad_target = entry("a", "");
         assert!(validate_entry(&bad_target).is_err());
-        bad_target.target = "-oProxyCommand=evil".to_string();
+        bad_target.target = Some("-oProxyCommand=evil".to_string());
         assert!(validate_entry(&bad_target).is_err());
 
         let mut bad_session = entry("a", "host");
@@ -446,15 +484,31 @@ mod tests {
 
     #[test]
     fn sanitize_drops_invalid_and_duplicate_entries() {
-        let reserved = entry("local", "host");
         let bad_target = entry("bad", "-oProxyCommand=evil");
+        let mut empty_target = entry("empty", "host");
+        empty_target.target = Some(String::new());
         let entries = vec![
             entry("a", "host-a"),
             bad_target,
-            reserved,
+            empty_target,
             entry("a", "host-dup"),
         ];
         assert_eq!(sanitize_entries(entries), vec![entry("a", "host-a")]);
+    }
+
+    #[test]
+    fn sanitize_keeps_local_entries() {
+        // A target-less entry is a local runtime, not a malformed remote.
+        let me = RemoteEntry {
+            name: "me".into(),
+            target: None,
+            session: "default".into(),
+            enabled: true,
+        };
+        assert_eq!(
+            sanitize_entries(vec![entry("a", "host-a"), me.clone()]),
+            vec![entry("a", "host-a"), me]
+        );
     }
 
     #[test]

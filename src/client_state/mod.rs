@@ -29,10 +29,13 @@ use crate::terminal::replica::PaneReplica;
 pub(crate) use catalog::SessionCatalog;
 pub(crate) use connection::ClientConnectionState;
 
-/// Remote index of the local server.
+/// Index of the fleet's first remote. It used to be the implicit local
+/// server; it is now simply whatever `remotes.toml` lists first, and the
+/// only index guaranteed to exist in a non-empty fleet.
 pub(crate) const LOCAL_REMOTE_INDEX: usize = 0;
 
-/// Display name of the local remote.
+/// Display name of the index-0 mirror in test fixtures.
+#[cfg(test)]
 pub(crate) const LOCAL_REMOTE_NAME: &str = "local";
 
 /// One remote's mirrored state: connection, catalog, and pane replicas.
@@ -66,6 +69,9 @@ impl RemoteMirror {
         }
     }
 
+    /// A mirror at index 0 named `local`. Test-only: production names every
+    /// mirror after its config entry.
+    #[cfg(test)]
     pub(crate) fn local() -> Self {
         Self::new(LOCAL_REMOTE_INDEX, LOCAL_REMOTE_NAME)
     }
@@ -272,25 +278,40 @@ pub(crate) struct RemoteMirrors {
 }
 
 impl RemoteMirrors {
+    /// An empty collection. Callers insert one mirror per fleet descriptor;
+    /// no runtime is implicit, so none is seeded here.
+    pub(crate) fn new() -> Self {
+        Self {
+            mirrors: BTreeMap::new(),
+        }
+    }
+
+    /// A collection seeded with one mirror at index 0 named `local`.
+    ///
+    /// Test-only: it is the fixture shape for "a fleet whose head is a local
+    /// runtime", which production now expresses as an ordinary target-less
+    /// config entry rather than an implicit remote #0.
+    #[cfg(test)]
     pub(crate) fn with_local() -> Self {
         let mut mirrors = BTreeMap::new();
         mirrors.insert(LOCAL_REMOTE_INDEX, RemoteMirror::local());
         Self { mirrors }
     }
 
-    // Production reads mirrors through `get`; the direct local accessors
-    // serve the single-mirror seam and its tests.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// The mirror at index 0. Test-only companion to [`Self::with_local`].
+    #[cfg(test)]
     pub(crate) fn local(&self) -> &RemoteMirror {
         self.mirrors
             .get(&LOCAL_REMOTE_INDEX)
-            .expect("local mirror always exists")
+            .expect("index 0 mirror always exists in these fixtures")
     }
 
+    /// The mirror at index 0. Test-only companion to [`Self::with_local`].
+    #[cfg(test)]
     pub(crate) fn local_mut(&mut self) -> &mut RemoteMirror {
         self.mirrors
             .get_mut(&LOCAL_REMOTE_INDEX)
-            .expect("local mirror always exists")
+            .expect("index 0 mirror always exists in these fixtures")
     }
 
     pub(crate) fn get(&self, remote_index: usize) -> Option<&RemoteMirror> {
@@ -307,11 +328,10 @@ impl RemoteMirrors {
         self.mirrors.insert(mirror.remote_index, mirror);
     }
 
-    /// Drops a remote's mirror. The local mirror at #0 is never removed.
+    /// Drops a remote's mirror. Every mirror is a config entry now, so any
+    /// of them can go when the config drops it - index 0 included.
     pub(crate) fn remove(&mut self, remote_index: usize) {
-        if remote_index != LOCAL_REMOTE_INDEX {
-            self.mirrors.remove(&remote_index);
-        }
+        self.mirrors.remove(&remote_index);
     }
 
     // Whole-collection iteration currently only backs tests; composition

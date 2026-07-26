@@ -270,6 +270,22 @@ pub(super) fn dispatch_mouse_intent(
     if let Some(content) = app.request_clipboard_write.take() {
         crate::selection::write_osc52_bytes(&content);
     }
+    // A scrollbar click or thumb drag moved a pane's viewport through the
+    // content seam. Near the top of loaded history that pages more in; the
+    // replica's policy decides, so an idle drag costs nothing.
+    if let Some((remote, stream_id)) = app
+        .request_history_backfill_pane
+        .take()
+        .and_then(|pane_id| super::run::stream_for_composed_pane(mirrors, ids, pane_id))
+    {
+        super::run::request_backfill(
+            links,
+            mirrors,
+            remote,
+            stream_id,
+            crate::terminal::replica::BackfillTrigger::Scroll,
+        );
+    }
     // handle_mouse can open modal surfaces. Context menus, confirm-close,
     // and rename dialogs are interpreted client-side below; anything else
     // reverts to the pre-click mode instead of trapping the user in a dead
@@ -1015,13 +1031,21 @@ mod tests {
         let mut ids = ComposeIds::new();
         let mut app = AppState::test_new();
         app.keybinds = crate::config::Config::default().keybinds();
-        let descriptors =
-            super::super::fleet_view::remote_descriptors(&[crate::fleet::config::RemoteEntry {
-                name: "buildbox".into(),
-                target: "can@buildbox.example".into(),
+        let descriptors = super::super::fleet_view::remote_descriptors(&[
+            // Index 0 is the local runtime whose mirror the fixture seeds.
+            crate::fleet::config::RemoteEntry {
+                name: "local".into(),
+                target: None,
                 session: "default".into(),
                 enabled: true,
-            }]);
+            },
+            crate::fleet::config::RemoteEntry {
+                name: "buildbox".into(),
+                target: Some("can@buildbox.example".into()),
+                session: "default".into(),
+                enabled: true,
+            },
+        ]);
         let mut links = Links::new();
         let mut chrome = GlobalChrome::new();
         // The user focused buildbox, then toggled its chip out of view.

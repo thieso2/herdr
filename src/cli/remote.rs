@@ -50,10 +50,7 @@ fn remote_list(args: &[String]) -> std::io::Result<i32> {
 
 fn offline_remote_list_response(id: &str) -> std::io::Result<serde_json::Value> {
     let entries = crate::fleet::config::load();
-    let remotes = crate::fleet::status::remote_infos_from_entries(
-        &entries,
-        crate::session::active_name().as_deref(),
-    );
+    let remotes = crate::fleet::status::remote_infos_from_entries(&entries);
     serde_json::to_value(&SuccessResponse {
         id: id.to_string(),
         result: crate::api::schema::ResponseResult::RemoteList { remotes },
@@ -168,6 +165,9 @@ fn remote_upgrade(args: &[String]) -> std::io::Result<i32> {
 /// The remotes an upgrade run touches, as `(name, ssh target)` pairs. A name
 /// that is not in the fleet config is used as a bare ssh target, so
 /// `herdr remote upgrade user@host` works before the remote is saved.
+///
+/// Local entries are skipped: they have no ssh target, and this machine's
+/// own binary is rolled forward by `herdr update`, not by a remote upgrade.
 #[cfg(unix)]
 fn upgrade_targets(
     parsed: &RemoteUpgradeArgs,
@@ -176,16 +176,34 @@ fn upgrade_targets(
     if parsed.all {
         return entries
             .iter()
-            .map(|entry| (entry.name.clone(), entry.target.clone()))
+            .filter_map(|entry| Some((entry.name.clone(), entry.target.clone()?)))
             .collect();
     }
     let Some(requested) = parsed.target.as_deref() else {
         return Vec::new();
     };
     match entries.iter().find(|entry| entry.name == requested) {
-        Some(entry) => vec![(entry.name.clone(), entry.target.clone())],
+        Some(entry) => entry
+            .target
+            .clone()
+            .map(|target| vec![(entry.name.clone(), target)])
+            .unwrap_or_default(),
         None => vec![(requested.to_string(), requested.to_string())],
     }
+}
+
+/// Whether `requested` names a configured *local* runtime, which an upgrade
+/// cannot act on. Separates "nothing to upgrade" from "wrong command".
+#[cfg(unix)]
+fn is_configured_local(
+    requested: Option<&str>,
+    entries: &[crate::fleet::config::RemoteEntry],
+) -> bool {
+    requested.is_some_and(|name| {
+        entries
+            .iter()
+            .any(|entry| entry.name == name && entry.is_local())
+    })
 }
 
 #[cfg(unix)]
@@ -193,6 +211,14 @@ fn run_remote_upgrade(parsed: RemoteUpgradeArgs) -> std::io::Result<i32> {
     let entries = crate::fleet::config::load();
     let targets = upgrade_targets(&parsed, &entries);
     if targets.is_empty() {
+        if is_configured_local(parsed.target.as_deref(), &entries) {
+            eprintln!(
+                "{} is a local runtime; upgrade this machine with `{}`",
+                parsed.target.as_deref().unwrap_or_default(),
+                crate::identity::UPDATE_COMMAND
+            );
+            return Ok(2);
+        }
         eprintln!(
             "no remotes configured in {}",
             crate::fleet::config::remotes_path().display()
@@ -365,13 +391,13 @@ mod tests {
         let entries = vec![
             crate::fleet::config::RemoteEntry {
                 name: "gpu-1".into(),
-                target: "can@gpu-1.example".into(),
+                target: Some("can@gpu-1.example".into()),
                 session: "default".into(),
                 enabled: true,
             },
             crate::fleet::config::RemoteEntry {
                 name: "buildbox".into(),
-                target: "can@buildbox.example".into(),
+                target: Some("can@buildbox.example".into()),
                 session: "default".into(),
                 enabled: false,
             },

@@ -1533,6 +1533,16 @@ pub struct AppState {
     /// Set when UI interaction requested a clipboard write that must be
     /// handled by the outer App/event loop instead of directly from AppState.
     pub request_clipboard_write: Option<Vec<u8>>,
+    /// Set when the user jumped to the top of the focused pane's history.
+    /// Clients whose scrollback lives behind a stream drain this to fetch one
+    /// large history page instead of crawling there a page at a time; the
+    /// in-process client holds all of its scrollback already and ignores it.
+    pub request_history_top_backfill: bool,
+    /// Set to the pane whose viewport a scrollbar click or thumb drag just
+    /// moved. Those run through the pane-content seam rather than the
+    /// client's own scroll path, so a streaming client would otherwise never
+    /// learn the viewport walked toward the top of loaded history.
+    pub request_history_backfill_pane: Option<PaneId>,
     pub creating_new_tab: bool,
     pub requested_new_tab_name: Option<String>,
     pub pending_workspace_create_cwd: Option<std::path::PathBuf>,
@@ -1699,6 +1709,15 @@ impl AppState {
 
     pub(crate) fn remove_alias_shadowed_by_new_pane(&mut self, pane_id: PaneId) {
         self.pane_id_aliases.remove(&pane_id.raw());
+    }
+
+    /// Drops both scrollback-backfill requests unserved. Input handling is
+    /// shared, so a client whose panes own their scrollback outright raises
+    /// these requests too; nobody drains them there, and a request left
+    /// standing would misfire on some later event.
+    pub(crate) fn discard_history_backfill_requests(&mut self) {
+        self.request_history_top_backfill = false;
+        self.request_history_backfill_pane = None;
     }
 
     pub fn sound_enabled(&self) -> bool {
@@ -2018,6 +2037,8 @@ impl AppState {
             request_add_remote: false,
             request_client_config_reload: false,
             request_clipboard_write: None,
+            request_history_top_backfill: false,
+            request_history_backfill_pane: None,
             creating_new_tab: false,
             requested_new_tab_name: None,
             pending_workspace_create_cwd: None,

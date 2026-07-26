@@ -2634,7 +2634,7 @@ mod tests {
     fn update_install_instruction_distinguishes_install_from_restart() {
         assert_eq!(
             update_install_instruction(HERDR_UPDATE_COMMAND),
-            "detach, run `herdr update`, then follow its restart guidance"
+            format!("detach, run `{HERDR_UPDATE_COMMAND}`, then follow its restart guidance")
         );
         assert_eq!(
             update_install_instruction(HOMEBREW_UPDATE_COMMAND),

@@ -9,9 +9,12 @@ pub(crate) use unix::*;
 ///
 /// Upgrades are forward-only: a remote that already runs the target (or
 /// something newer, for example a host upgraded ahead of this client) is
-/// never rewritten. Version strings that do not parse are treated as "not the
-/// target", so an unreadable or hand-built remote binary is upgraded rather
-/// than silently left behind.
+/// never rewritten. Prerelease builds (`X.Y.Z-preview.<build>`) compare on
+/// their release core; a release outranks every prerelease of the same core,
+/// and two different prerelease builds of the same core cannot be ordered, so
+/// they are skipped rather than risked as a downgrade. Only a version whose
+/// release core does not parse at all (an unreadable or hand-built binary) is
+/// rolled forward unconditionally rather than silently left behind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 // Remote attach and fleet upgrades are unix-only; the decision itself is
 // platform-neutral so it stays testable everywhere.
@@ -23,6 +26,20 @@ pub(crate) enum RemoteUpgradeDecision {
     AlreadyCurrent,
     /// The remote runs something newer; never downgrade.
     RemoteIsNewer,
+    /// The remote runs a different build of the same release core (for
+    /// example two preview builds); neither side is provably newer, so never
+    /// rewrite it.
+    Unordered,
+}
+
+/// A version split into its parseable release core and the raw prerelease
+/// suffix, when present: `0.10.0-preview.42` -> (`0.10.0`, `preview.42`).
+fn split_release_core(version: &str) -> (Option<crate::update::Version>, Option<&str>) {
+    let (core, suffix) = match version.split_once('-') {
+        Some((core, suffix)) => (core, Some(suffix)),
+        None => (version, None),
+    };
+    (crate::update::Version::parse(core), suffix)
 }
 
 /// Pure forward-only guard for one remote.
@@ -39,18 +56,27 @@ pub(crate) fn remote_upgrade_decision(
     if remote_version == target_version {
         return RemoteUpgradeDecision::AlreadyCurrent;
     }
-    let (Some(remote), Some(target)) = (
-        crate::update::Version::parse(remote_version),
-        crate::update::Version::parse(target_version),
-    ) else {
+    let (remote_core, remote_suffix) = split_release_core(remote_version);
+    let (target_core, target_suffix) = split_release_core(target_version);
+    let (Some(remote_core), Some(target_core)) = (remote_core, target_core) else {
+        // An unreadable or hand-built version is rolled forward rather than
+        // silently left behind.
         return RemoteUpgradeDecision::Install;
     };
-    if remote > target {
-        RemoteUpgradeDecision::RemoteIsNewer
-    } else if remote == target {
-        RemoteUpgradeDecision::AlreadyCurrent
-    } else {
-        RemoteUpgradeDecision::Install
+    if remote_core > target_core {
+        return RemoteUpgradeDecision::RemoteIsNewer;
+    }
+    if remote_core < target_core {
+        return RemoteUpgradeDecision::Install;
+    }
+    // Same release core: prereleases sort below their release, and two
+    // distinct prerelease builds carry no order at all.
+    match (remote_suffix, target_suffix) {
+        (None, None) => RemoteUpgradeDecision::AlreadyCurrent,
+        (None, Some(_)) => RemoteUpgradeDecision::RemoteIsNewer,
+        (Some(_), None) => RemoteUpgradeDecision::Install,
+        (Some(remote), Some(target)) if remote == target => RemoteUpgradeDecision::AlreadyCurrent,
+        (Some(_), Some(_)) => RemoteUpgradeDecision::Unordered,
     }
 }
 
@@ -147,6 +173,45 @@ mod shared_tests {
         assert_eq!(
             remote_upgrade_decision(Some("nightly-abc"), "0.10.0"),
             RemoteUpgradeDecision::Install
+        );
+    }
+
+    #[test]
+    fn preview_builds_compare_on_their_release_core_and_never_downgrade() {
+        // A newer preview core is never downgraded by an older stable client.
+        assert_eq!(
+            remote_upgrade_decision(Some("0.8.0-preview.2026-07-21"), "0.7.5"),
+            RemoteUpgradeDecision::RemoteIsNewer
+        );
+        // An older preview core still rolls forward.
+        assert_eq!(
+            remote_upgrade_decision(Some("0.7.0-preview.2026-06-01"), "0.7.5"),
+            RemoteUpgradeDecision::Install
+        );
+        // A prerelease rolls forward to the release of its own core...
+        assert_eq!(
+            remote_upgrade_decision(Some("0.10.0-preview.40"), "0.10.0"),
+            RemoteUpgradeDecision::Install
+        );
+        // ...and the release is never rewritten by a prerelease of that core.
+        assert_eq!(
+            remote_upgrade_decision(Some("0.10.0"), "0.10.0-preview.40"),
+            RemoteUpgradeDecision::RemoteIsNewer
+        );
+        // Two different preview builds of the same core carry no order:
+        // skipped, never reinstalled backwards.
+        assert_eq!(
+            remote_upgrade_decision(Some("0.10.0-preview.50"), "0.10.0-preview.40"),
+            RemoteUpgradeDecision::Unordered
+        );
+        // Identical builds spelled differently are current, not unordered.
+        assert_eq!(
+            remote_upgrade_decision(Some("v0.10.0-preview.40"), "0.10.0-preview.40"),
+            RemoteUpgradeDecision::AlreadyCurrent
+        );
+        assert_eq!(
+            remote_upgrade_decision(Some("v0.10.0"), "0.10.0"),
+            RemoteUpgradeDecision::AlreadyCurrent
         );
     }
 

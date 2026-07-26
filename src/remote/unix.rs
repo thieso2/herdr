@@ -186,9 +186,13 @@ pub(crate) fn run_remote(remote: RemoteLaunch) -> io::Result<()> {
         // The far-side `herdr bridge` starts the remote server itself,
         // and the framed hello negotiates the version window, so there
         // is nothing to stop or restart here.
+        // The ephemeral remote is named by its full target (user@host and
+        // port included): the out-of-window remedy quotes the name as
+        // `herdr remote upgrade <name>`, and only the full target reaches
+        // the same ssh identity for an unsaved remote.
         crate::client_state::run::run_pure_client_fleet_of_one(
             &loaded_config.config,
-            &ephemeral_remote_name(&remote.target),
+            &remote.target,
             &remote.target,
             &session_name,
             Some(prepared_remote.remote_herdr.shell_path.clone()),
@@ -223,6 +227,13 @@ fn run_remote_legacy(
         remote.keybindings,
         remote.live_handoff,
     );
+    // Refuse a skewed host before touching its server: the legacy socket
+    // matches protocols exactly, so stopping a healthy old server could only
+    // kill its panes and fail the attach anyway. The error names the machine
+    // and the exact fix.
+    if let Some(message) = legacy_skew_error(&remote.target, &prepared_remote.reported) {
+        return Err(io::Error::other(message));
+    }
     ensure_remote_server_ready(
         remote_ssh,
         &prepared_remote.remote_herdr,
@@ -230,6 +241,7 @@ fn run_remote_legacy(
         prepared_remote.stop_after_install_approved,
         remote.live_handoff,
         false,
+        &prepared_remote.reported.version,
     )?;
 
     let _bridge = SshStdioBridge::start(
@@ -243,10 +255,22 @@ fn run_remote_legacy(
     run_client_process(&local_socket, &reattach_command, remote.keybindings)
 }
 
-/// Display name of an ephemeral `--remote` fleet-of-one: the name it would
-/// be saved under, falling back to the raw target.
-fn ephemeral_remote_name(target: &str) -> String {
-    crate::remote::remote_name_from_target(target).unwrap_or_else(|| target.to_string())
+/// The legacy `--remote` attach requires an exact protocol match. `None`
+/// when the prepared binary can attach; otherwise the out-of-window remedy,
+/// naming the machine and the exact fix, produced *before* anything on the
+/// host is stopped or restarted.
+fn legacy_skew_error(target: &str, reported: &RemoteBinaryVersion) -> Option<String> {
+    match reported.protocol {
+        Some(protocol) if protocol == CURRENT_PROTOCOL => None,
+        Some(protocol) if protocol > CURRENT_PROTOCOL => Some(format!(
+            "remote {target} runs herdr {} (protocol {protocol}), newer than this client (protocol {CURRENT_PROTOCOL}); run `herdr update` here",
+            reported.version
+        )),
+        _ => Some(format!(
+            "remote {target} runs herdr {}, which does not speak this client's protocol {CURRENT_PROTOCOL}; run `herdr remote upgrade {target}` to roll it forward",
+            reported.version
+        )),
+    }
 }
 
 /// The first unused fleet name derived from an ssh target, or `None` when no
@@ -548,6 +572,11 @@ struct PreparedRemoteHerdr {
     remote_herdr: RemoteHerdr,
     installed_or_replaced: bool,
     stop_after_install_approved: bool,
+    /// What the prepared binary reports about itself: the discovered
+    /// binary's probe on the use-installed path, or this build's identity
+    /// after a fresh install. The legacy attach path reads it to refuse a
+    /// skewed host up front instead of stopping its server for nothing.
+    reported: RemoteBinaryVersion,
 }
 
 #[derive(Clone)]
@@ -846,15 +875,21 @@ fn prepare_remote_herdr(
             remote_herdr: herdr,
             installed_or_replaced: false,
             stop_after_install_approved: false,
+            reported,
         });
     }
 
+    let target_version = current_version();
     let mut stop_after_install_approved = false;
     if let Some((probe, _)) = &installed {
-        stop_after_install_approved =
-            confirm_remote_install_with_running_server(ssh, probe, live_handoff_enabled, false)?;
+        stop_after_install_approved = confirm_remote_install_with_running_server(
+            ssh,
+            probe,
+            live_handoff_enabled,
+            false,
+            &target_version,
+        )?;
     }
-    let target_version = current_version();
     confirm_remote_install(
         ssh.target(),
         &remote_herdr,
@@ -882,6 +917,12 @@ fn prepare_remote_herdr(
         remote_herdr,
         installed_or_replaced: true,
         stop_after_install_approved,
+        // `remote_binary_matches` above verified the installed binary
+        // reports exactly this build's version and protocol.
+        reported: RemoteBinaryVersion {
+            version: target_version,
+            protocol: Some(CURRENT_PROTOCOL),
+        },
     })
 }
 
@@ -904,6 +945,10 @@ pub(crate) enum RemoteUpgradeOutcome {
     /// The remote runs something newer. Upgrades are forward-only, so this
     /// is reported and skipped rather than downgraded.
     Newer { version: String, target: String },
+    /// The remote runs a different build of the same release core (for
+    /// example two preview builds) that cannot be ordered against the
+    /// target; skipped so an upgrade can never be a hidden downgrade.
+    Unordered { version: String, target: String },
 }
 
 impl RemoteUpgradeOutcome {
@@ -921,6 +966,9 @@ impl RemoteUpgradeOutcome {
             Self::Newer { version, target } => {
                 format!("{name}: runs {version}, newer than {target}; skipped (upgrades are forward-only)")
             }
+            Self::Unordered { version, target } => {
+                format!("{name}: runs {version}, which cannot be ordered against {target}; skipped (upgrades are forward-only)")
+            }
         }
     }
 
@@ -931,6 +979,7 @@ impl RemoteUpgradeOutcome {
             Self::Upgraded { from: None, .. } => "installed",
             Self::AlreadyCurrent { .. } => "already_current",
             Self::Newer { .. } => "skipped_newer",
+            Self::Unordered { .. } => "skipped_unordered",
         }
     }
 }
@@ -971,6 +1020,12 @@ pub(crate) fn upgrade_remote(
                 target: target_version.to_string(),
             });
         }
+        crate::remote::RemoteUpgradeDecision::Unordered => {
+            return Ok(RemoteUpgradeOutcome::Unordered {
+                version: installed_version.unwrap_or_else(|| target_version.to_string()),
+                target: target_version.to_string(),
+            });
+        }
         crate::remote::RemoteUpgradeDecision::Install => {}
     }
 
@@ -979,8 +1034,13 @@ pub(crate) fn upgrade_remote(
     if let Some((probe, _)) = &installed {
         // Live handoff belongs to an interactive `--remote` launch; an
         // upgrade decides between keeping the server and stopping it.
-        stop_after_install_approved =
-            confirm_remote_install_with_running_server(&ssh, probe, false, options.yes)?;
+        stop_after_install_approved = confirm_remote_install_with_running_server(
+            &ssh,
+            probe,
+            false,
+            options.yes,
+            target_version,
+        )?;
     }
     confirm_remote_install(
         target,
@@ -1024,6 +1084,7 @@ pub(crate) fn upgrade_remote(
         stop_after_install_approved,
         false,
         options.yes,
+        target_version,
     )?;
 
     Ok(RemoteUpgradeOutcome::Upgraded {
@@ -1204,8 +1265,11 @@ fn remote_binary_version(
     ssh: &RemoteSsh,
     remote_herdr: &RemoteHerdr,
 ) -> io::Result<Option<RemoteBinaryVersion>> {
+    // The status probe must not fail the whole command: a herdr too old to
+    // know `status client` is still a *found* binary (never a fresh-install
+    // candidate); it just reports no protocol.
     let command = format!(
-        "test -x {0} && {0} --version && {0} status client --json",
+        "test -x {0} && {0} --version && ({0} status client --json 2>/dev/null || true)",
         remote_herdr.shell_path
     );
     let output = ssh.sh_output(&command)?;
@@ -1373,6 +1437,7 @@ fn ensure_remote_server_ready(
     stop_after_install_approved: bool,
     live_handoff_enabled: bool,
     yes: bool,
+    prepared_version: &str,
 ) -> io::Result<()> {
     let status = remote_server_status(ssh, remote_herdr)?;
     let RemoteServerStatus::Running {
@@ -1409,7 +1474,14 @@ fn ensure_remote_server_ready(
         return Ok(());
     }
 
-    if confirm_remote_server_stop(ssh.target(), version.as_deref(), protocol, reason, yes)? {
+    if confirm_remote_server_stop(
+        ssh.target(),
+        version.as_deref(),
+        protocol,
+        reason,
+        yes,
+        prepared_version,
+    )? {
         stop_remote_server(ssh, remote_herdr)?;
     }
     Ok(())
@@ -1441,6 +1513,7 @@ fn confirm_remote_install_with_running_server(
     remote_herdr: &RemoteHerdr,
     live_handoff_enabled: bool,
     yes: bool,
+    target_version: &str,
 ) -> io::Result<bool> {
     let target = ssh.target();
     let status = match remote_server_status(ssh, remote_herdr) {
@@ -1507,8 +1580,7 @@ fn confirm_remote_install_with_running_server(
             eprintln!("remote herdr server on {target} is already compatible:");
             eprintln!("  server: v{}", version_label(version.as_deref()));
             eprintln!(
-                "Herdr will install {} without stopping the running remote server.",
-                current_version()
+                "Herdr will install {target_version} without stopping the running remote server."
             );
         }
         return Ok(false);
@@ -1531,8 +1603,7 @@ fn confirm_remote_install_with_running_server(
         eprintln!("remote herdr server on {target} is currently running:");
         eprintln!("  server: v{}", version_label(version.as_deref()));
         eprintln!(
-            "Herdr will install {} and hand off live pane processes to the prepared server.",
-            current_version()
+            "Herdr will install {target_version} and hand off live pane processes to the prepared server."
         );
         return Ok(false);
     }
@@ -1544,10 +1615,7 @@ fn confirm_remote_install_with_running_server(
     );
     eprintln!("This stops active remote pane processes, including shells, dev servers, and tests.");
     eprintln!();
-    eprint!(
-        "Install {} and stop the remote server now? [y/N] ",
-        current_version()
-    );
+    eprint!("Install {target_version} and stop the remote server now? [y/N] ");
     io::stderr().flush()?;
 
     let mut answer = String::new();
@@ -1655,6 +1723,7 @@ fn confirm_remote_server_stop(
     _protocol: Option<u32>,
     reason: RemoteServerRestartReason,
     yes: bool,
+    prepared_version: &str,
 ) -> io::Result<bool> {
     if yes {
         return Ok(true);
@@ -1667,16 +1736,15 @@ fn confirm_remote_server_stop(
         }
 
         eprintln!(
-            "remote herdr server on {target} is still running v{}; it will use {} after it restarts.",
-            version_label(version),
-            current_version()
+            "remote herdr server on {target} is still running v{}; it will use {prepared_version} after it restarts.",
+            version_label(version)
         );
         return Ok(false);
     }
 
     eprintln!("remote herdr server on {target} is currently running:");
     eprintln!("  server: v{}", version_label(version));
-    eprintln!("  prepared binary: {}", current_version());
+    eprintln!("  prepared binary: {prepared_version}");
     eprintln!();
 
     match reason {
@@ -2795,6 +2863,46 @@ mod tests {
     }
 
     #[test]
+    fn legacy_attach_refuses_a_skewed_host_with_the_exact_remedy() {
+        // Matching protocol: attach proceeds, nothing to report.
+        let current = RemoteBinaryVersion {
+            version: current_version(),
+            protocol: Some(CURRENT_PROTOCOL),
+        };
+        assert_eq!(legacy_skew_error("can@gpu-1.example", &current), None);
+
+        // Older (or protocol-less, pre-`status client`) host: the remedy
+        // names the machine and `herdr remote upgrade <target>`, and is
+        // produced before any server over there is stopped.
+        let older = RemoteBinaryVersion {
+            version: "0.7.5".into(),
+            protocol: Some(CURRENT_PROTOCOL.saturating_sub(1)),
+        };
+        let message = legacy_skew_error("can@gpu-1.example", &older).expect("skewed");
+        assert!(message.contains("can@gpu-1.example"), "{message}");
+        assert!(
+            message.contains("herdr remote upgrade can@gpu-1.example"),
+            "{message}"
+        );
+
+        let ancient = RemoteBinaryVersion {
+            version: "0.5.0".into(),
+            protocol: None,
+        };
+        let message = legacy_skew_error("host", &ancient).expect("skewed");
+        assert!(message.contains("herdr remote upgrade host"), "{message}");
+
+        // Newer host: this side is the old one; the fix is `herdr update`.
+        let newer = RemoteBinaryVersion {
+            version: "99.0.0".into(),
+            protocol: Some(CURRENT_PROTOCOL + 1),
+        };
+        let message = legacy_skew_error("host", &newer).expect("skewed");
+        assert!(message.contains("herdr update"), "{message}");
+        assert!(!message.contains("remote upgrade"), "{message}");
+    }
+
+    #[test]
     fn saved_remote_names_avoid_collisions() {
         let entries = vec![crate::fleet::config::RemoteEntry {
             name: "buildbox.example".into(),
@@ -2815,12 +2923,6 @@ mod tests {
         assert!(crate::fleet::config::validate_remote_name(&taken).is_ok());
         // Nothing legal to derive: no offer at all.
         assert_eq!(available_remote_name("local", &entries), None);
-    }
-
-    #[test]
-    fn ephemeral_remote_name_falls_back_to_the_raw_target() {
-        assert_eq!(ephemeral_remote_name("can@gpu-1.example"), "gpu-1.example");
-        assert_eq!(ephemeral_remote_name("local"), "local");
     }
 
     #[test]

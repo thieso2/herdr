@@ -1243,12 +1243,20 @@ fn link_generation(link: Option<&Link>) -> Option<u64> {
 /// Sends heartbeat pings on established fleet links and fails links whose
 /// remote has been silent past the pong timeout, so a silently dead
 /// transport cannot keep a connected chip dot. The local socket is exempt,
-/// matching the legacy client. Returns true when a link changed state.
+/// matching the legacy client — and locality follows the descriptor, not
+/// the index: an ephemeral `--remote` fleet-of-one puts an ssh transport at
+/// index 0, and that link needs heartbeats like any other remote. Returns
+/// true when a link changed state.
 fn service_remote_heartbeats(ctx: &mut LoopCtx<'_>) -> bool {
     let now = Instant::now();
     let mut dead: Vec<usize> = Vec::new();
     for (remote, link) in ctx.links.iter_mut() {
-        if *remote == LOCAL_REMOTE_INDEX {
+        let is_local = ctx
+            .descriptors
+            .iter()
+            .find(|descriptor| descriptor.index == *remote)
+            .is_none_or(|descriptor| descriptor.target.is_none());
+        if is_local {
             continue;
         }
         let Link::Up(session) = link else {
@@ -3026,6 +3034,46 @@ mod tests {
             assert!(matches!(ctx.links.get(&1), Some(Link::Down { .. })));
             assert!(matches!(ctx.links.get(&2), Some(Link::Up(_))));
             assert!(rx2.try_recv().is_ok(), "heartbeat ping was written");
+        });
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_ephemeral_fleet_of_one_at_index_zero_gets_heartbeats() {
+        // `--remote` puts an ssh transport at index 0: the local-socket
+        // heartbeat exemption must follow the descriptor, not the index.
+        let descriptor =
+            RemoteDescriptor::ephemeral("can@gpu-1.example", "can@gpu-1.example", "default", None);
+        with_test_ctx(vec![descriptor], |ctx| {
+            let (mut session, _rx) = threaded_session(1, 8);
+            session.last_inbound = Instant::now() - REMOTE_PONG_TIMEOUT;
+            ctx.links
+                .insert(LOCAL_REMOTE_INDEX, Link::Up(Box::new(session)));
+
+            assert!(
+                service_remote_heartbeats(ctx),
+                "a dead ephemeral transport must drop"
+            );
+            assert!(matches!(
+                ctx.links.get(&LOCAL_REMOTE_INDEX),
+                Some(Link::Down { .. })
+            ));
+        });
+    }
+
+    #[tokio::test]
+    async fn the_local_socket_descriptor_stays_exempt_from_heartbeats() {
+        with_test_ctx(vec![RemoteDescriptor::local()], |ctx| {
+            let (mut session, _rx) = threaded_session(1, 8);
+            session.last_inbound = Instant::now() - REMOTE_PONG_TIMEOUT * 2;
+            ctx.links
+                .insert(LOCAL_REMOTE_INDEX, Link::Up(Box::new(session)));
+
+            assert!(!service_remote_heartbeats(ctx));
+            assert!(matches!(
+                ctx.links.get(&LOCAL_REMOTE_INDEX),
+                Some(Link::Up(_))
+            ));
         });
     }
 

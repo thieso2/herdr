@@ -38,6 +38,12 @@ pub const RELEASE_TAG_PREFIX: &str = "overherdr-v";
 #[allow(dead_code)]
 pub const FORK_PATCH_FLOOR: u32 = 100;
 
+/// The self-update command as printed to users.
+///
+/// A literal rather than a `format!` because it is matched against in `const`
+/// position; `brand_owned_command_literals_track_brand` keeps it honest.
+pub const UPDATE_COMMAND: &str = "overherdr update";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -69,6 +75,19 @@ mod tests {
             !RELEASE_TAG_PREFIX.starts_with('v'),
             "a `v*` tag fires upstream's release.yml, which this fork cannot run"
         );
+    }
+
+    #[test]
+    fn brand_owned_command_literals_track_brand() {
+        assert_eq!(UPDATE_COMMAND, format!("{BRAND} update"));
+    }
+
+    #[test]
+    fn commands_printed_to_users_name_the_fork_binary() {
+        // These are commands the user is told to type. Naming upstream's
+        // binary here is wrong advice, not just wrong branding.
+        assert!(crate::session::stop_command_for(None).starts_with(BRAND));
+        assert!(crate::session::stop_command_for(Some("work")).starts_with(BRAND));
     }
 
     #[test]

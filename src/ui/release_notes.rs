@@ -487,7 +487,7 @@ mod tests {
     #[test]
     fn release_notes_preview_lines_show_update_steps() {
         let palette = Palette::catppuccin();
-        let lines = release_notes_preview_line_entries("herdr update", &palette)
+        let lines = release_notes_preview_line_entries(crate::identity::UPDATE_COMMAND, &palette)
             .into_iter()
             .map(|(_, line)| line)
             .collect::<Vec<_>>();
@@ -496,11 +496,17 @@ mod tests {
         assert_eq!(line_text(&lines[0]), " ● update ready");
         assert_eq!(
             line_text(&lines[1]),
-            " detach, run herdr update, then follow its restart guidance"
+            format!(
+                " detach, run {}, then follow its restart guidance",
+                crate::identity::UPDATE_COMMAND
+            )
         );
         assert_eq!(lines[0].spans[1].style.fg, Some(palette.accent));
         assert_eq!(lines[0].spans[2].style.fg, Some(palette.text));
-        assert_eq!(lines[1].spans[2].content.as_ref(), "herdr update");
+        assert_eq!(
+            lines[1].spans[2].content.as_ref(),
+            crate::identity::UPDATE_COMMAND
+        );
         assert_eq!(lines[1].spans[2].style.fg, Some(palette.accent));
         assert_eq!(lines[1].spans[2].style.bg, Some(palette.surface0));
     }
@@ -515,12 +521,15 @@ mod tests {
             preview: true,
         };
 
-        let lines = release_notes_display_lines(&notes, "herdr update", &palette);
+        let lines = release_notes_display_lines(&notes, crate::identity::UPDATE_COMMAND, &palette);
 
         assert_eq!(line_text(&lines[0].1), " ● update ready");
         assert_eq!(
             line_text(&lines[1].1),
-            " detach, run herdr update, then follow its restart guidance"
+            format!(
+                " detach, run {}, then follow its restart guidance",
+                crate::identity::UPDATE_COMMAND
+            )
         );
         assert_eq!(line_text(&lines[2].1), "");
         assert_eq!(line_text(&lines[3].1), " ADDED");

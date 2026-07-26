@@ -101,9 +101,10 @@ pub fn active_name() -> Option<String> {
 }
 
 pub fn local_attach_command() -> String {
+    let brand = crate::identity::BRAND;
     match active_name() {
-        Some(name) => format!("herdr session attach {name}"),
-        None => "herdr".to_string(),
+        Some(name) => format!("{brand} session attach {name}"),
+        None => brand.to_string(),
     }
 }
 
@@ -112,9 +113,10 @@ pub fn local_stop_command() -> String {
 }
 
 pub fn stop_command_for(name: Option<&str>) -> String {
+    let brand = crate::identity::BRAND;
     match name {
-        Some(name) => format!("herdr session stop {name}"),
-        None => "herdr server stop".to_string(),
+        Some(name) => format!("{brand} session stop {name}"),
+        None => format!("{brand} server stop"),
     }
 }
 
@@ -133,9 +135,10 @@ pub fn active_restart_after_update_guidance() -> String {
         if let Ok(socket_path) = std::env::var(crate::api::SOCKET_PATH_ENV_VAR) {
             return restart_after_update_guidance(
                 &format!(
-                    "{}={} herdr server stop",
+                    "{}={} {} server stop",
                     crate::api::SOCKET_PATH_ENV_VAR,
-                    socket_path
+                    socket_path,
+                    crate::identity::BRAND
                 ),
                 None,
             );
@@ -836,7 +839,7 @@ mod tests {
         let _guard = env_lock().lock().unwrap();
         std::env::remove_var(SESSION_ENV_VAR);
 
-        assert_eq!(local_attach_command(), "herdr");
+        assert_eq!(local_attach_command(), crate::identity::BRAND);
     }
 
     #[test]
@@ -844,7 +847,10 @@ mod tests {
         let _guard = env_lock().lock().unwrap();
         std::env::set_var(SESSION_ENV_VAR, "work");
 
-        assert_eq!(local_attach_command(), "herdr session attach work");
+        assert_eq!(
+            local_attach_command(),
+            format!("{} session attach work", crate::identity::BRAND)
+        );
 
         std::env::remove_var(SESSION_ENV_VAR);
     }
@@ -854,7 +860,10 @@ mod tests {
         let _guard = env_lock().lock().unwrap();
         std::env::remove_var(SESSION_ENV_VAR);
 
-        assert_eq!(local_stop_command(), "herdr server stop");
+        assert_eq!(
+            local_stop_command(),
+            format!("{} server stop", crate::identity::BRAND)
+        );
 
         std::env::remove_var(SESSION_ENV_VAR);
     }
@@ -864,7 +873,10 @@ mod tests {
         let _guard = env_lock().lock().unwrap();
         std::env::set_var(SESSION_ENV_VAR, "work");
 
-        assert_eq!(local_stop_command(), "herdr session stop work");
+        assert_eq!(
+            local_stop_command(),
+            format!("{} session stop work", crate::identity::BRAND)
+        );
 
         std::env::remove_var(SESSION_ENV_VAR);
     }
@@ -889,7 +901,10 @@ mod tests {
 
         assert_eq!(
             active_restart_after_update_guidance(),
-            "Stop the old server to use the new version.\nStopping exits pane processes.\nRun `HERDR_SOCKET_PATH=/tmp/custom-herdr.sock herdr server stop`, then restart Herdr with the same socket override."
+            format!(
+                "Stop the old server to use the new version.\nStopping exits pane processes.\nRun `HERDR_SOCKET_PATH=/tmp/custom-herdr.sock {} server stop`, then restart Herdr with the same socket override.",
+                crate::identity::BRAND
+            )
         );
 
         std::env::remove_var(crate::api::SOCKET_PATH_ENV_VAR);

@@ -91,7 +91,11 @@ impl BridgeChild {
     /// Spawns the bridge child for `target`/`session` with piped stdio and a
     /// background thread capturing stderr into a bounded tail.
     pub fn spawn(target: &str, session: &str) -> io::Result<(Self, ChildStdout, ChildStdin)> {
-        Self::spawn_program(target, session, "herdr")
+        // The fleet bridge is a separate path from the `--remote` bootstrap:
+        // it invokes the remote binary by bare name over ssh, so it has to ask
+        // for the fork's name or it finds an unrelated upstream herdr (or, as
+        // reported, nothing at all).
+        Self::spawn_program(target, session, crate::identity::BRAND)
     }
 
     /// Spawns the bridge child running an explicit remote herdr path.
@@ -171,6 +175,18 @@ impl Drop for BridgeChild {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_bridge_program_is_the_fork_binary() {
+        // Regression: the bridge used to exec bare `herdr`, which on a host
+        // with no upstream install failed with "command not found: herdr".
+        let brand = crate::identity::BRAND;
+        assert_eq!(
+            remote_bridge_command_for(brand, crate::session::DEFAULT_SESSION_NAME),
+            format!("exec {brand} bridge")
+        );
+        assert_ne!(brand, "herdr");
+    }
 
     #[test]
     fn bridge_command_omits_default_session() {

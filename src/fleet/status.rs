@@ -54,6 +54,12 @@ pub fn remote_infos_from_statuses(
                 Some(retry_in.as_millis().min(u128::from(u64::MAX)) as u64),
                 (!last_error.is_empty()).then(|| last_error.clone()),
             ),
+            RemoteStatusKind::Incompatible { message } => (
+                RemoteConnectionStateInfo::Incompatible,
+                None,
+                None,
+                (!message.is_empty()).then(|| message.clone()),
+            ),
         };
         remotes.push(RemoteInfo {
             index: offset + 1,
@@ -162,6 +168,22 @@ mod tests {
 
         assert_eq!(remotes[3].state, RemoteConnectionStateInfo::Disabled);
         assert!(!remotes[3].enabled);
+    }
+
+    #[test]
+    fn incompatible_status_maps_to_its_own_state_with_the_message() {
+        let statuses = vec![RemoteStatus {
+            entry: entry("old", true),
+            kind: RemoteStatusKind::Incompatible {
+                message: "upgrade the remote herdr".to_string(),
+            },
+        }];
+        let remotes = remote_infos_from_statuses(&statuses, None);
+        assert_eq!(remotes[1].state, RemoteConnectionStateInfo::Incompatible);
+        assert_eq!(
+            remotes[1].last_error.as_deref(),
+            Some("upgrade the remote herdr")
+        );
     }
 
     #[test]

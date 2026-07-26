@@ -1570,25 +1570,6 @@ fn reload_local_client_config(
     }
 }
 
-/// Applies a `notification.posted` event with this client's local policy:
-/// the sound config decides whether sounds play, and toast kinds route to
-/// the terminal or system notifier. Consumed by the unix-only pure client;
-/// the legacy client applies the same policy through `handle_notify`.
-#[cfg(unix)]
-pub(crate) fn apply_notification_event(
-    kind: crate::api::schema::events::NotificationEventKind,
-    message: &str,
-    body: Option<&str>,
-    sound_config: &crate::config::SoundConfig,
-) {
-    let kind = match kind {
-        crate::api::schema::events::NotificationEventKind::Sound => NotifyKind::Sound,
-        crate::api::schema::events::NotificationEventKind::Toast => NotifyKind::Toast,
-        crate::api::schema::events::NotificationEventKind::SystemToast => NotifyKind::SystemToast,
-    };
-    handle_notify(kind, message, body, sound_config);
-}
-
 fn handle_notify(
     kind: NotifyKind,
     message: &str,
@@ -1816,8 +1797,28 @@ fn window_title_osc(title: Option<&str>) -> Vec<u8> {
     format!("\x1b]0;{safe_title}\x07").into_bytes()
 }
 
+// Shared with the pure-client run path, which selects the focused
+// remote's title client-side.
 pub(crate) fn write_window_title(title: Option<&str>) {
     let _ = io::stdout().write_all(&window_title_osc(title));
+}
+
+/// Pure-client entry into the shared notification delivery policy: maps the
+/// framed event kind onto the legacy delivery kinds and applies the exact
+/// same sound/toast/system-toast handling.
+#[cfg(unix)]
+pub(crate) fn deliver_notification(
+    kind: crate::api::schema::events::NotificationEventKind,
+    message: &str,
+    body: Option<&str>,
+    sound_config: &crate::config::SoundConfig,
+) {
+    let kind = match kind {
+        crate::api::schema::events::NotificationEventKind::Sound => NotifyKind::Sound,
+        crate::api::schema::events::NotificationEventKind::Toast => NotifyKind::Toast,
+        crate::api::schema::events::NotificationEventKind::SystemToast => NotifyKind::SystemToast,
+    };
+    handle_notify(kind, message, body, sound_config);
 }
 
 // ---------------------------------------------------------------------------

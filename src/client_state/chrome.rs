@@ -19,12 +19,14 @@ pub(crate) struct GlobalChrome {
     /// One-line connection status surfaced while the remote is not
     /// connected (connecting, offline with retry, or incompatible).
     pub(crate) connection_status: Option<String>,
-    /// Last window title written to the host terminal. Focused-remote-wins:
-    /// with a single remote today the local remote is always focused, so
-    /// its `window_title.changed` facts apply directly; a multi-remote
-    /// client keeps this selector and writes only the focused remote's
-    /// title.
-    pub(crate) window_title: Option<String>,
+    /// Which remotes are in view and which remote holds the focus. Pure
+    /// presentation: never affects connections.
+    pub(crate) selection: super::fleet_view::FleetSelection,
+    /// Last window title pushed by each remote; the focused remote's title
+    /// wins the host terminal.
+    pub(crate) window_titles: std::collections::BTreeMap<usize, String>,
+    /// The add/edit-remote dialog, when open.
+    pub(crate) remote_edit: Option<super::remote_edit::RemoteEditState>,
     /// Double-click candidate for pane word selection, client-side mouse
     /// state exactly like the legacy `App::last_pane_click`.
     pub(crate) last_pane_click: Option<crate::app::PaneClickState>,

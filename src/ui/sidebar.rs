@@ -1142,6 +1142,10 @@ fn render_workspace_list(
         let ws = &app.workspaces[i];
         let row_y = card.rect.y;
         let row_height = card.rect.height;
+        // Per-remote attribution: present only when two or more remotes are
+        // in view (fleet composition); single-remote views carry no tags.
+        let remote_tag = app.workspace_remote_tags.get(i);
+        let gutter_w = u16::from(remote_tag.is_some());
         let selected = i == app.selected && is_navigating;
         let is_active = Some(i) == app.active;
         let is_dragged = dragged_ws_idx == Some(i);
@@ -1209,6 +1213,18 @@ fn render_workspace_list(
             },
         );
 
+        if let Some(tag) = remote_tag {
+            let hue = p.remote_hue(tag.hue_index);
+            let buf = frame.buffer_mut();
+            for y in row_y..row_y + row_height {
+                if y >= list_bottom {
+                    break;
+                }
+                buf[(card.rect.x, y)].set_symbol("▎");
+                buf[(card.rect.x, y)].set_style(Style::default().fg(hue));
+            }
+        }
+
         for (row_index, resolved) in rows.iter().enumerate() {
             if row_index as u16 >= row_height || row_y + row_index as u16 >= list_bottom {
                 break;
@@ -1242,6 +1258,13 @@ fn render_workspace_list(
             } else {
                 3
             };
+            // The dim remote token rides the card's last row (the branch
+            // row in the default layout) and always fits: its width comes
+            // out of the row's token budget.
+            let remote_token = remote_tag.filter(|_| row_index + 1 == rows.len());
+            let token_width = remote_token
+                .map(|tag| display_width(&tag.name).saturating_add(3))
+                .unwrap_or(0);
             spans.extend(resolved_token_spans(
                 resolved,
                 state_icon,
@@ -1250,11 +1273,22 @@ fn render_workspace_list(
                 branch_style,
                 branch_style,
                 p,
-                card.rect.width.saturating_sub(prefix_width) as usize,
+                (card.rect.width.saturating_sub(prefix_width + gutter_w) as usize)
+                    .saturating_sub(token_width),
             ));
+            if let Some(tag) = remote_token {
+                let token_style = Style::default().fg(p.overlay0).add_modifier(Modifier::DIM);
+                spans.push(Span::styled(" · ", token_style));
+                spans.push(Span::styled(tag.name.clone(), token_style));
+            }
             frame.render_widget(
                 Paragraph::new(Line::from(spans)),
-                Rect::new(card.rect.x, row_y + row_index as u16, card.rect.width, 1),
+                Rect::new(
+                    card.rect.x + gutter_w,
+                    row_y + row_index as u16,
+                    card.rect.width.saturating_sub(gutter_w),
+                    1,
+                ),
             );
         }
     }
@@ -1389,6 +1423,10 @@ fn render_agent_detail(
         };
         let agent_style = Style::default().fg(p.overlay0).add_modifier(Modifier::DIM);
         let state_icon = agent_icon(detail.state, detail.seen, app.spinner_tick, p);
+        // Agents get the remote hue gutter only; the space rows carry the
+        // name token.
+        let remote_tag = app.workspace_remote_tags.get(detail.ws_idx);
+        let gutter_w = u16::from(remote_tag.is_some());
 
         for (row_index, resolved) in rows.iter().take(height as usize).enumerate() {
             let mut spans = vec![Span::raw(if row_index == 0 { " " } else { "   " })];
@@ -1401,12 +1439,26 @@ fn render_agent_detail(
                 agent_style,
                 p,
                 body.width
-                    .saturating_sub(if row_index == 0 { 1 } else { 3 }) as usize,
+                    .saturating_sub(if row_index == 0 { 1 } else { 3 })
+                    .saturating_sub(gutter_w) as usize,
             ));
             frame.render_widget(
                 Paragraph::new(Line::from(spans)).style(row_style),
-                Rect::new(body.x, row_y + row_index as u16, body.width, 1),
+                Rect::new(
+                    body.x + gutter_w,
+                    row_y + row_index as u16,
+                    body.width.saturating_sub(gutter_w),
+                    1,
+                ),
             );
+        }
+        if let Some(tag) = remote_tag {
+            let hue = p.remote_hue(tag.hue_index);
+            let buf = frame.buffer_mut();
+            for y in row_y..(row_y + height).min(body_bottom) {
+                buf[(body.x, y)].set_symbol("▎");
+                buf[(body.x, y)].set_style(Style::default().fg(hue));
+            }
         }
         row_y = row_y
             .saturating_add(height)

@@ -103,6 +103,11 @@ pub enum RemoteStatusKind {
         retry_in: Duration,
         last_error: String,
     },
+    /// The protocol version windows do not overlap; no automatic retries
+    /// until a side is upgraded or a manual reset forces another attempt.
+    Incompatible {
+        message: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -354,6 +359,9 @@ fn status_kind(machine: &ConnectionMachine, now: Instant) -> RemoteStatusKind {
             retry_in: retry_at.saturating_duration_since(now),
             last_error: last_error.clone(),
         },
+        ConnectionState::Incompatible { message } => RemoteStatusKind::Incompatible {
+            message: message.clone(),
+        },
     }
 }
 
@@ -382,6 +390,9 @@ struct Worker {
 
 enum SessionEnd {
     Failed(String),
+    /// The handshake was rejected because the protocol windows do not
+    /// overlap; the machine parks in `Incompatible` with no retries.
+    Incompatible(String),
     ManualReset,
     Stop,
 }
@@ -425,6 +436,15 @@ impl Worker {
 
             match self.run_session(&rx, generation, &mut writer) {
                 SessionEnd::Stop => return,
+                SessionEnd::Incompatible(message) => {
+                    warn!(remote = %self.name, message = %message, "fleet remote protocol incompatible; parking until reset");
+                    if self
+                        .with_machine(|machine| machine.on_incompatible(message))
+                        .is_none()
+                    {
+                        return;
+                    }
+                }
                 SessionEnd::ManualReset => {
                     let now = Instant::now();
                     if self.with_machine(|machine| machine.on_reset(now)).is_none() {
@@ -508,6 +528,11 @@ impl Worker {
                     let Some(value) = control_payload(&frame) else {
                         continue;
                     };
+                    if let Some(error) = crate::protocol::framed::control_error(&value) {
+                        if error.code == "protocol_out_of_window" {
+                            return SessionEnd::Incompatible(error.message);
+                        }
+                    }
                     match parse_session_welcome(&value) {
                         Ok(welcome) => {
                             debug!(

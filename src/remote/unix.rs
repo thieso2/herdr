@@ -8,13 +8,13 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
 use serde::Deserialize;
-use tracing::{debug, warn};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
 };
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
+use tracing::{debug, warn};
 
 const BRIDGE_ACCEPT_POLL: Duration = Duration::from_millis(50);
 const BRIDGE_SOCKET_PERMISSION_MODE: u32 = 0o600;
@@ -153,28 +153,78 @@ fn validate_remote_target(target: &str) -> Result<&str, String> {
     Ok(target)
 }
 
+/// Runs a `--remote` launch: an ephemeral fleet-of-one against one ssh
+/// target.
+///
+/// The target is not saved anywhere. It is prepared (bootstrap-installed
+/// only when the host has no herdr at all), connected, and — if the session
+/// worked and the target is not already a named remote — offered for saving
+/// on the way out.
+///
+/// Two client paths, one contract. With the pure client enabled the launch
+/// rides the same framed fleet session a saved remote uses, so it gets the
+/// n/n-1 protocol window. With the pure client off it keeps the legacy
+/// client-socket bridge, which matches protocol versions exactly; a skewed
+/// host there is reported with the `herdr remote upgrade` remedy instead of
+/// being silently reinstalled.
 pub(crate) fn run_remote(remote: RemoteLaunch) -> io::Result<()> {
     let session_name = crate::session::active_name()
         .unwrap_or_else(|| crate::session::DEFAULT_SESSION_NAME.to_string());
-    let local_socket = local_forward_socket_path(&remote.target, &session_name);
+    let loaded_config = crate::config::Config::load();
+    let manage_ssh_config = loaded_config.config.remote.manage_ssh_config;
+    let remote_ssh = RemoteSsh::new(remote.target.clone(), manage_ssh_config);
+    let prepared_remote = prepare_remote_herdr(&remote_ssh, remote.live_handoff)?;
+
+    let connected = if crate::client_state::run::pure_client_enabled(&loaded_config.config) {
+        if remote.keybindings != RemoteKeybindings::Local || remote.live_handoff {
+            // Both belong to the legacy client-socket path: the fleet
+            // session has no remote keymap hop and no server handoff.
+            warn!(
+                    "--remote-keybindings and --handoff are ignored by the pure client; unset [experimental] pure_client to use them"
+                );
+        }
+        // The far-side `herdr bridge` starts the remote server itself,
+        // and the framed hello negotiates the version window, so there
+        // is nothing to stop or restart here.
+        crate::client_state::run::run_pure_client_fleet_of_one(
+            &loaded_config.config,
+            &ephemeral_remote_name(&remote.target),
+            &remote.target,
+            &session_name,
+            Some(prepared_remote.remote_herdr.shell_path.clone()),
+        )?
+    } else {
+        run_remote_legacy(remote, &session_name, &remote_ssh, prepared_remote)?;
+        true
+    };
+
+    if connected {
+        offer_to_save_remote(remote_ssh.target(), &session_name);
+    }
+    Ok(())
+}
+
+/// The legacy `--remote` path: the local forward socket plus a client
+/// process, matching protocols exactly.
+fn run_remote_legacy(
+    remote: RemoteLaunch,
+    session_name: &str,
+    remote_ssh: &RemoteSsh,
+    prepared_remote: PreparedRemoteHerdr,
+) -> io::Result<()> {
+    let local_socket = local_forward_socket_path(&remote.target, session_name);
     let program = std::env::args()
         .next()
         .unwrap_or_else(|| "herdr".to_string());
     let reattach_command = reattach_command(
         &program,
         &remote.target,
-        &session_name,
+        session_name,
         remote.keybindings,
         remote.live_handoff,
     );
-    let manage_ssh_config = crate::config::Config::load()
-        .config
-        .remote
-        .manage_ssh_config;
-    let remote_ssh = RemoteSsh::new(remote.target.clone(), manage_ssh_config);
-    let prepared_remote = prepare_remote_herdr(&remote_ssh, remote.live_handoff)?;
     ensure_remote_server_ready(
-        &remote_ssh,
+        remote_ssh,
         &prepared_remote.remote_herdr,
         prepared_remote.installed_or_replaced,
         prepared_remote.stop_after_install_approved,
@@ -186,11 +236,77 @@ pub(crate) fn run_remote(remote: RemoteLaunch) -> io::Result<()> {
         remote.target,
         prepared_remote.remote_herdr,
         local_socket.clone(),
-        session_name,
+        session_name.to_string(),
         remote_ssh.options(),
     )?;
 
     run_client_process(&local_socket, &reattach_command, remote.keybindings)
+}
+
+/// Display name of an ephemeral `--remote` fleet-of-one: the name it would
+/// be saved under, falling back to the raw target.
+fn ephemeral_remote_name(target: &str) -> String {
+    crate::remote::remote_name_from_target(target).unwrap_or_else(|| target.to_string())
+}
+
+/// The first unused fleet name derived from an ssh target, or `None` when no
+/// legal name can be derived.
+fn available_remote_name(
+    target: &str,
+    entries: &[crate::fleet::config::RemoteEntry],
+) -> Option<String> {
+    let base = crate::remote::remote_name_from_target(target)?;
+    if !entries.iter().any(|entry| entry.name == base) {
+        return Some(base);
+    }
+    (2..=99).find_map(|suffix| {
+        let candidate = format!("{base}-{suffix}");
+        (crate::fleet::config::validate_remote_name(&candidate).is_ok()
+            && !entries.iter().any(|entry| entry.name == candidate))
+        .then_some(candidate)
+    })
+}
+
+/// Offers, once per launch, to keep a working `--remote` target as a named
+/// fleet remote. A target already in `remotes.toml` is never re-offered, and
+/// a non-interactive launch never prompts.
+fn offer_to_save_remote(target: &str, session: &str) {
+    if !io::stdin().is_terminal() {
+        return;
+    }
+    let entries = crate::fleet::config::load();
+    if entries
+        .iter()
+        .any(|entry| entry.target == target && entry.session == session)
+    {
+        return;
+    }
+    let Some(name) = available_remote_name(target, &entries) else {
+        return;
+    };
+
+    match crate::cli::confirm(&format!("save {target} as fleet remote '{name}'?")) {
+        Ok(true) => {}
+        Ok(false) => return,
+        Err(err) => {
+            debug!(err = %err, "could not read the save-remote answer");
+            return;
+        }
+    }
+
+    let entry = crate::fleet::config::RemoteEntry {
+        name: name.clone(),
+        target: target.to_string(),
+        session: session.to_string(),
+        enabled: true,
+    };
+    match crate::fleet::config::upsert_remote(entry) {
+        Ok(_) => eprintln!(
+            "herdr: saved remote '{name}' to {}",
+            crate::fleet::config::remotes_path().display()
+        ),
+        Err(err) => eprintln!("herdr: could not save remote '{name}': {err}"),
+    }
 }
 
 pub(crate) fn run_remote_client_bridge() -> io::Result<()> {
@@ -705,7 +821,9 @@ fn prepare_remote_herdr(
 
     if crate::remote::remote_bootstrap_action(
         override_binary.is_some(),
-        installed.as_ref().map(|(_, reported)| reported.version.as_str()),
+        installed
+            .as_ref()
+            .map(|(_, reported)| reported.version.as_str()),
     ) == crate::remote::RemoteBootstrapAction::UseInstalled
     {
         let (herdr, reported) = installed.unwrap_or_else(|| {
@@ -780,10 +898,7 @@ pub(crate) struct RemoteUpgradeOptions {
 pub(crate) enum RemoteUpgradeOutcome {
     /// The remote now runs `to`; `from` is what it ran before (absent when
     /// there was no herdr on the host at all).
-    Upgraded {
-        from: Option<String>,
-        to: String,
-    },
+    Upgraded { from: Option<String>, to: String },
     /// The remote already ran the target version; nothing was written.
     AlreadyCurrent { version: String },
     /// The remote runs something newer. Upgrades are forward-only, so this
@@ -795,7 +910,10 @@ impl RemoteUpgradeOutcome {
     /// A one-line report for the CLI.
     pub(crate) fn summary(&self, name: &str) -> String {
         match self {
-            Self::Upgraded { from: Some(from), to } => {
+            Self::Upgraded {
+                from: Some(from),
+                to,
+            } => {
                 format!("{name}: upgraded {from} -> {to}")
             }
             Self::Upgraded { from: None, to } => format!("{name}: installed {to}"),
@@ -1115,9 +1233,11 @@ fn remote_binary_version(
 }
 
 fn remote_binary_matches(ssh: &RemoteSsh, remote_herdr: &RemoteHerdr) -> io::Result<bool> {
-    Ok(remote_binary_version(ssh, remote_herdr)?.is_some_and(|reported| {
-        reported.version == current_version() && reported.protocol == Some(CURRENT_PROTOCOL)
-    }))
+    Ok(
+        remote_binary_version(ssh, remote_herdr)?.is_some_and(|reported| {
+            reported.version == current_version() && reported.protocol == Some(CURRENT_PROTOCOL)
+        }),
+    )
 }
 
 fn remote_binary_override_path() -> io::Result<Option<PathBuf>> {
@@ -2672,6 +2792,35 @@ mod tests {
             ),
             "herdr --remote host --handoff"
         );
+    }
+
+    #[test]
+    fn saved_remote_names_avoid_collisions() {
+        let entries = vec![crate::fleet::config::RemoteEntry {
+            name: "buildbox.example".into(),
+            target: "someone@buildbox.example".into(),
+            session: "default".into(),
+            enabled: true,
+        }];
+
+        // Free name: the plain derivation.
+        assert_eq!(
+            available_remote_name("can@gpu-1.example", &entries),
+            Some("gpu-1.example".to_string())
+        );
+        // Taken name: the next free suffix, still a legal remote name.
+        let taken = available_remote_name("can@buildbox.example", &entries)
+            .expect("a colliding target still gets a name");
+        assert_eq!(taken, "buildbox.example-2");
+        assert!(crate::fleet::config::validate_remote_name(&taken).is_ok());
+        // Nothing legal to derive: no offer at all.
+        assert_eq!(available_remote_name("local", &entries), None);
+    }
+
+    #[test]
+    fn ephemeral_remote_name_falls_back_to_the_raw_target() {
+        assert_eq!(ephemeral_remote_name("can@gpu-1.example"), "gpu-1.example");
+        assert_eq!(ephemeral_remote_name("local"), "local");
     }
 
     #[test]

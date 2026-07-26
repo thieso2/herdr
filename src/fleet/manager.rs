@@ -531,16 +531,12 @@ impl Worker {
                         continue;
                     };
                     if let Some(error) = crate::protocol::framed::control_error(&value) {
-                        if error.code
-                            == crate::protocol::framed::PROTOCOL_OUT_OF_WINDOW_CODE
-                        {
+                        if error.code == crate::protocol::framed::PROTOCOL_OUT_OF_WINDOW_CODE {
                             // The remedy is the remote's own; a rejection
                             // without one is read as "this side is too old",
                             // the only side we can act on locally.
                             let remedy = crate::protocol::framed::parse_hello_remedy(&error)
-                                .unwrap_or(
-                                    crate::protocol::framed::HelloRemedy::UpgradeClient,
-                                );
+                                .unwrap_or(crate::protocol::framed::HelloRemedy::UpgradeClient);
                             return SessionEnd::Incompatible(incompatible_status_line(
                                 &self.name,
                                 false,

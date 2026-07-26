@@ -112,6 +112,19 @@ herdr session delete <name> [--json]
 
 Use `default` as the session name when you need to stop the default session explicitly.
 
+## Remotes
+
+```bash
+herdr remote list [--json]
+herdr remote reset <name> [--json]
+herdr remote reload [--json]
+herdr remote upgrade <name-or-target> | --all [--yes] [--json]
+```
+
+`remote list` reads `remotes.toml` even with no server running. `remote reset` drops one remote's connection and reconnects immediately, which is also how an `incompatible` remote is retried after an upgrade. `remote reload` applies hand edits to `remotes.toml`.
+
+`remote upgrade` rolls remotes forward to the version your update channel offers, one host at a time. It accepts a configured remote name or a bare ssh target, never downgrades a host that is already newer, and requires `--yes` when stdin is not interactive. Connecting to a remote never upgrades it; this command is the only thing that does. See [Mixed versions and the upgrade window](/docs/persistence-remote/#mixed-versions-and-the-upgrade-window).
+
 ## Workspaces
 
 ```bash

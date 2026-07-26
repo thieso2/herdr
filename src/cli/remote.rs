@@ -4,8 +4,7 @@ use std::io::IsTerminal;
 
 use crate::api::schema::{EmptyParams, Method, Request, SuccessResponse};
 
-const UPGRADE_USAGE: &str =
-    "usage: herdr remote upgrade <name-or-target> | --all [--yes] [--json]";
+const UPGRADE_USAGE: &str = "usage: herdr remote upgrade <name-or-target> | --all [--yes] [--json]";
 
 pub(super) fn run_remote_command(args: &[String]) -> std::io::Result<i32> {
     match args.first().map(|arg| arg.as_str()) {
@@ -155,8 +154,13 @@ fn remote_upgrade(args: &[String]) -> std::io::Result<i32> {
     }
     #[cfg(windows)]
     {
-        let _ = parsed;
-        eprintln!("herdr remote upgrade is not supported on Windows yet");
+        let what = match (parsed.all, parsed.target.as_deref()) {
+            (true, _) => "--all".to_string(),
+            (false, Some(name)) => name.to_string(),
+            (false, None) => String::new(),
+        };
+        let _ = (parsed.yes, parsed.json);
+        eprintln!("herdr remote upgrade {what} is not supported on Windows yet");
         Ok(1)
     }
 }
@@ -297,9 +301,7 @@ fn print_remote_help() {
     eprintln!("  herdr remote list [--json]    list fleet remotes and their connection state");
     eprintln!("  herdr remote reset <name>     drop a remote connection and reconnect now");
     eprintln!("  herdr remote reload [--json]  apply hand edits made to remotes.toml");
-    eprintln!(
-        "  herdr remote upgrade <name-or-target> | --all [--yes] [--json]"
-    );
+    eprintln!("  herdr remote upgrade <name-or-target> | --all [--yes] [--json]");
     eprintln!(
         "                                roll remotes forward to the channel's herdr (never downgrades)"
     );

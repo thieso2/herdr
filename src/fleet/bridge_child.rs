@@ -45,8 +45,12 @@ fn pump_stderr_tail(mut reader: impl Read, tail: &Arc<Mutex<String>>) {
 }
 
 /// Builds the far-side command string executed by ssh.
-pub fn remote_bridge_command(session: &str) -> String {
-    let mut command = String::from("exec herdr");
+///
+/// Saved fleet remotes run `herdr` from the remote PATH; a `--remote` launch
+/// pins the binary it discovered (or installed), which need not be on the
+/// non-interactive PATH.
+pub fn remote_bridge_command_for(program: &str, session: &str) -> String {
+    let mut command = format!("exec {program}");
     if session != crate::session::DEFAULT_SESSION_NAME {
         command.push_str(" --session ");
         command.push_str(&crate::remote::shell_quote(session));
@@ -87,13 +91,22 @@ impl BridgeChild {
     /// Spawns the bridge child for `target`/`session` with piped stdio and a
     /// background thread capturing stderr into a bounded tail.
     pub fn spawn(target: &str, session: &str) -> io::Result<(Self, ChildStdout, ChildStdin)> {
+        Self::spawn_program(target, session, "herdr")
+    }
+
+    /// Spawns the bridge child running an explicit remote herdr path.
+    pub fn spawn_program(
+        target: &str,
+        session: &str,
+        program: &str,
+    ) -> io::Result<(Self, ChildStdout, ChildStdin)> {
         let mut command = Command::new("ssh");
         command
             .arg("-T")
             .arg("-o")
             .arg("BatchMode=yes")
             .arg(target)
-            .arg(remote_bridge_command(session))
+            .arg(remote_bridge_command_for(program, session))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -161,7 +174,14 @@ mod tests {
 
     #[test]
     fn bridge_command_omits_default_session() {
-        assert_eq!(remote_bridge_command("default"), "exec herdr bridge");
+        assert_eq!(
+            remote_bridge_command_for("herdr", "default"),
+            "exec herdr bridge"
+        );
+        assert_eq!(
+            remote_bridge_command_for("/home/can/.local/bin/herdr", "default"),
+            "exec /home/can/.local/bin/herdr bridge"
+        );
     }
 
     #[test]
@@ -185,11 +205,11 @@ mod tests {
     #[test]
     fn bridge_command_quotes_named_session() {
         assert_eq!(
-            remote_bridge_command("work"),
+            remote_bridge_command_for("herdr", "work"),
             "exec herdr --session work bridge"
         );
         assert_eq!(
-            remote_bridge_command("with'quote"),
+            remote_bridge_command_for("herdr", "with'quote"),
             "exec herdr --session 'with'\\''quote' bridge"
         );
     }

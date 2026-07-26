@@ -65,12 +65,18 @@ pub const FRAMED_PROTOCOL_VERSION: u32 = 1;
 /// the window and breaks every n-1 peer.
 pub const FRAMED_PROTOCOL_MIN_SUPPORTED: u32 = 1;
 
-// The n/n-1 window is a compile-time invariant, not a convention: a version
-// bump that forgets the minimum fails the build here.
-const _: () = {
-    assert!(FRAMED_PROTOCOL_MIN_SUPPORTED <= FRAMED_PROTOCOL_VERSION);
-    assert!(FRAMED_PROTOCOL_MIN_SUPPORTED + 1 >= FRAMED_PROTOCOL_VERSION);
-};
+/// True when a `(version, min_supported)` pair honors the n/n-1 policy: the
+/// build speaks its own version and at most one release back.
+pub const fn window_honors_policy(version: u32, min_supported: u32) -> bool {
+    min_supported <= version && min_supported + 1 >= version
+}
+
+// The window is a compile-time invariant, not a convention: a version bump
+// that forgets to move the minimum fails the build here.
+const _: () = assert!(window_honors_policy(
+    FRAMED_PROTOCOL_VERSION,
+    FRAMED_PROTOCOL_MIN_SUPPORTED
+));
 
 /// Control-error code of an out-of-window `session.hello` rejection.
 pub const PROTOCOL_OUT_OF_WINDOW_CODE: &str = "protocol_out_of_window";
@@ -1683,13 +1689,19 @@ mod tests {
         // it, or every n-1 peer stops interoperating. Kept as a runtime test
         // next to the compile-time assertion so the failure names the rule.
         assert!(
-            FRAMED_PROTOCOL_MIN_SUPPORTED <= FRAMED_PROTOCOL_VERSION,
-            "min supported protocol must not exceed the current protocol"
+            window_honors_policy(FRAMED_PROTOCOL_VERSION, FRAMED_PROTOCOL_MIN_SUPPORTED),
+            "bumping FRAMED_PROTOCOL_VERSION requires FRAMED_PROTOCOL_MIN_SUPPORTED = version - 1 \
+             (version {FRAMED_PROTOCOL_VERSION}, min {FRAMED_PROTOCOL_MIN_SUPPORTED})"
         );
-        assert!(
-            FRAMED_PROTOCOL_MIN_SUPPORTED >= FRAMED_PROTOCOL_VERSION.saturating_sub(1),
-            "bumping FRAMED_PROTOCOL_VERSION requires FRAMED_PROTOCOL_MIN_SUPPORTED = version - 1"
-        );
+
+        // What the policy accepts and rejects, spelled out.
+        assert!(window_honors_policy(1, 1));
+        assert!(window_honors_policy(2, 1));
+        assert!(window_honors_policy(7, 6));
+        // Window collapsed to n-only after a bump: every n-1 peer breaks.
+        assert!(!window_honors_policy(3, 1));
+        // A minimum above the version is not a window at all.
+        assert!(!window_honors_policy(2, 3));
     }
 
     #[test]

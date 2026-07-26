@@ -249,7 +249,10 @@ const SESSION_CAPABILITIES: &[&str] = &[
 /// Outcome of one local connect attempt.
 enum ConnectOutcome {
     Connected(Box<ConnectedLocal>),
-    Incompatible { remedy: HelloRemedy, message: String },
+    Incompatible {
+        remedy: HelloRemedy,
+        message: String,
+    },
     Failed(String),
 }
 
@@ -265,7 +268,10 @@ enum HelloRejection {
     /// Terminal for this pairing: the peer is outside the supported window
     /// (or lacks a capability the client cannot run without). The remedy is
     /// the server's own, never guessed.
-    Incompatible { remedy: HelloRemedy, message: String },
+    Incompatible {
+        remedy: HelloRemedy,
+        message: String,
+    },
     /// Retryable failure (transport, malformed answer, other rejections).
     Failed(String),
 }
@@ -403,8 +409,12 @@ fn remote_connect_and_read(
         return;
     };
     let established = (|| {
-        let (child, mut stdout, mut stdin) = BridgeChild::spawn(target, &descriptor.session)
-            .map_err(|err| format!("ssh bridge spawn failed: {err}"))?;
+        let (child, mut stdout, mut stdin) = BridgeChild::spawn_program(
+            target,
+            &descriptor.session,
+            descriptor.program.as_deref().unwrap_or("herdr"),
+        )
+        .map_err(|err| format!("ssh bridge spawn failed: {err}"))?;
         // Watchdog: the hello-answer read below is a blocking pipe read with
         // no native timeout, so a remote that accepts the connection but
         // never answers would wedge this thread and its link forever.
@@ -534,22 +544,63 @@ pub(crate) fn run_pure_client(config: &crate::config::Config) -> io::Result<()> 
     crate::logging::startup("client");
     info!("running pure client of the local server (remote #0)");
 
-    // Terminal graphics respect the same [experimental] kitty_graphics gate
-    // as the server render path: replicas ingest kitty APC data from the
-    // pane DATA stream, and the pure client paints visible placements onto
-    // the host terminal after each draw.
-    crate::kitty_graphics::set_enabled(config.experimental.kitty_graphics);
-
     let mut mirrors = RemoteMirrors::with_local();
     // The fleet config defines the remotes; every enabled remote gets a
     // mirror and a connection regardless of view membership.
-    let mut descriptors = remote_descriptors(&crate::fleet::config::load());
+    let descriptors = remote_descriptors(&crate::fleet::config::load());
     for descriptor in descriptors.iter().skip(1) {
         mirrors.insert(super::RemoteMirror::new(
             descriptor.index,
             descriptor.name.clone(),
         ));
     }
+    run_pure_client_over(config, descriptors, mirrors).map(|_| ())
+}
+
+/// Runs the pure client as an *ephemeral fleet-of-one* against one ssh
+/// target: a `--remote` launch that is not in `remotes.toml`, has no local
+/// runtime in view, and lives only for this session. It rides the same
+/// framed session path as a saved fleet remote, so it gets the n/n-1
+/// version window instead of the legacy exact-protocol match.
+///
+/// Returns whether the session ever completed a handshake, which gates the
+/// offer to save the target as a named remote.
+pub(crate) fn run_pure_client_fleet_of_one(
+    config: &crate::config::Config,
+    name: &str,
+    target: &str,
+    session: &str,
+    program: Option<String>,
+) -> io::Result<bool> {
+    crate::logging::startup("client");
+    info!(
+        target,
+        session, "running pure client as an ephemeral fleet-of-one"
+    );
+
+    let descriptor = RemoteDescriptor::ephemeral(name, target, session, program);
+    let mut mirrors = RemoteMirrors::with_local();
+    // The ephemeral remote *is* remote #0: there is no local runtime here.
+    mirrors.insert(super::RemoteMirror::new(
+        descriptor.index,
+        descriptor.name.clone(),
+    ));
+    run_pure_client_over(config, vec![descriptor], mirrors)
+}
+
+/// The shared pure-client run: terminal setup, the loop, and teardown.
+/// Returns whether any remote ever completed a handshake.
+fn run_pure_client_over(
+    config: &crate::config::Config,
+    mut descriptors: Vec<RemoteDescriptor>,
+    mut mirrors: RemoteMirrors,
+) -> io::Result<bool> {
+    // Terminal graphics respect the same [experimental] kitty_graphics gate
+    // as the server render path: replicas ingest kitty APC data from the
+    // pane DATA stream, and the pure client paints visible placements onto
+    // the host terminal after each draw.
+    crate::kitty_graphics::set_enabled(config.experimental.kitty_graphics);
+
     let mut chrome = GlobalChrome::new();
     let mut ids = ComposeIds::new();
     let mut app = AppState::empty();
@@ -658,6 +709,9 @@ struct InteractionState {
     next_generation: u64,
     /// When the connecting spinner last advanced one visual frame.
     last_spinner_step: Option<Instant>,
+    /// Whether any remote ever completed a handshake this run. An ephemeral
+    /// `--remote` launch only offers to save a target that actually worked.
+    ever_connected: bool,
 }
 
 /// Everything one input or frame event may touch. Bundled so the event
@@ -727,16 +781,15 @@ fn run_loop(
     event_tx: &mpsc::SyncSender<LoopEvent>,
     event_rx: &mpsc::Receiver<LoopEvent>,
     should_quit: &Arc<AtomicBool>,
-) -> io::Result<()> {
+) -> io::Result<bool> {
     let mut framer = crate::raw_input::RawInputFramer::for_host_input();
     let mut ui = InteractionState::default();
     let mut links: Links = BTreeMap::new();
-    links.insert(
-        LOCAL_REMOTE_INDEX,
-        establish_local(mirrors, chrome, &mut ui, event_tx, should_quit),
-    );
-    for descriptor in descriptors.iter().skip(1) {
-        let link = establish_remote(descriptor, mirrors, &mut ui, event_tx, should_quit);
+    // Transport follows the descriptor, not the index: remote #0 is the
+    // local socket in a normal run and the ssh bridge in an ephemeral
+    // `--remote` fleet-of-one.
+    for descriptor in descriptors.iter() {
+        let link = establish_for(descriptor, mirrors, chrome, &mut ui, event_tx, should_quit);
         links.insert(descriptor.index, link);
     }
     let mut ctx = LoopCtx {
@@ -756,7 +809,7 @@ fn run_loop(
 
     loop {
         if ctx.should_quit.load(Ordering::Acquire) || ctx.app.should_quit {
-            return Ok(());
+            return Ok(ctx.ui.ever_connected);
         }
 
         // Reconnect with backoff whenever a link is down. View membership
@@ -779,29 +832,22 @@ fn run_loop(
             })
             .collect();
         for remote in due {
-            let link = if remote == LOCAL_REMOTE_INDEX {
-                establish_local(
-                    ctx.mirrors,
-                    ctx.chrome,
-                    ctx.ui,
-                    ctx.event_tx,
-                    ctx.should_quit,
-                )
-            } else if let Some(descriptor) = ctx
+            let Some(descriptor) = ctx
                 .descriptors
                 .iter()
                 .find(|descriptor| descriptor.index == remote)
-            {
-                establish_remote(
-                    descriptor,
-                    ctx.mirrors,
-                    ctx.ui,
-                    ctx.event_tx,
-                    ctx.should_quit,
-                )
-            } else {
+                .cloned()
+            else {
                 continue;
             };
+            let link = establish_for(
+                &descriptor,
+                ctx.mirrors,
+                ctx.chrome,
+                ctx.ui,
+                ctx.event_tx,
+                ctx.should_quit,
+            );
             ctx.links.insert(remote, link);
             dirty = true;
         }
@@ -875,7 +921,7 @@ fn run_loop(
         let event = match event_rx.recv_timeout(LOOP_TICK) {
             Ok(event) => event,
             Err(mpsc::RecvTimeoutError::Timeout) => continue,
-            Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
+            Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(ctx.ui.ever_connected),
         };
         ctx.handle_event(event, &mut framer);
         dirty = true;
@@ -931,6 +977,24 @@ fn apply_window_title(ctx: &mut LoopCtx<'_>) {
     }
 }
 
+/// Connects one remote through the transport its descriptor names: the
+/// local API socket when it has no ssh target, an ssh bridge child
+/// otherwise.
+fn establish_for(
+    descriptor: &RemoteDescriptor,
+    mirrors: &mut RemoteMirrors,
+    chrome: &mut GlobalChrome,
+    ui: &mut InteractionState,
+    event_tx: &mpsc::SyncSender<LoopEvent>,
+    should_quit: &Arc<AtomicBool>,
+) -> Link {
+    if descriptor.target.is_some() {
+        establish_remote(descriptor, mirrors, ui, event_tx, should_quit)
+    } else {
+        establish_local(mirrors, chrome, ui, event_tx, should_quit)
+    }
+}
+
 /// Attempts the local connection and, on success, kicks off the catalog
 /// resync and the socket reader thread.
 fn establish_local(
@@ -966,6 +1030,7 @@ fn establish_local(
             // only source of truth for this connection.
             mirror.begin_resync();
             chrome.connection_status = None;
+            ui.ever_connected = true;
 
             let id = session.request_id("snapshot");
             session.pending.insert(id.clone(), Pending::Snapshot);
@@ -1056,6 +1121,14 @@ fn handle_established(
         debug!(remote, generation, "dropping stale remote connect outcome");
         return;
     }
+    // Remote #0 is the local runtime in a normal run, but an ephemeral
+    // `--remote` fleet-of-one puts an ssh target there: the remedy line
+    // follows the transport, not the index.
+    let is_local = ctx
+        .descriptors
+        .iter()
+        .find(|descriptor| descriptor.index == remote)
+        .is_none_or(|descriptor| descriptor.target.is_none());
     let Some(mirror) = ctx.mirrors.get_mut(remote) else {
         ctx.links.remove(&remote);
         return;
@@ -1080,6 +1153,7 @@ fn handle_established(
                     capabilities: welcome.capabilities,
                 });
             mirror.begin_resync();
+            ctx.ui.ever_connected = true;
             // Outbound frames go through a dedicated writer thread so a
             // stalled remote's full pipe can never block the run loop (and
             // with it every other remote and local pane). The thread ends
@@ -1126,7 +1200,7 @@ fn handle_established(
         RemoteEstablished::Incompatible { remedy, message } => {
             let status = crate::fleet::connection::incompatible_status_line(
                 &mirror.name,
-                remote == LOCAL_REMOTE_INDEX,
+                is_local,
                 remedy,
                 &message,
             );

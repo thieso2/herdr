@@ -30,6 +30,10 @@ pub(crate) struct RemoteDescriptor {
     pub(crate) target: Option<String>,
     /// Remote herdr session name.
     pub(crate) session: String,
+    /// Remote herdr binary to exec for the bridge; `None` runs `herdr` from
+    /// the remote PATH, which is what saved fleet remotes do. A `--remote`
+    /// launch pins the binary it discovered or installed.
+    pub(crate) program: Option<String>,
 }
 
 impl RemoteDescriptor {
@@ -40,6 +44,27 @@ impl RemoteDescriptor {
             hue_index: 0,
             target: None,
             session: crate::session::DEFAULT_SESSION_NAME.to_owned(),
+            program: None,
+        }
+    }
+
+    /// The single descriptor of an ephemeral `--remote` fleet-of-one: not in
+    /// `remotes.toml`, alive only for this launch, and sitting at index 0
+    /// because there is no local runtime in the view.
+    #[cfg(unix)]
+    pub(crate) fn ephemeral(
+        name: impl Into<String>,
+        target: impl Into<String>,
+        session: impl Into<String>,
+        program: Option<String>,
+    ) -> Self {
+        Self {
+            index: LOCAL_REMOTE_INDEX,
+            name: name.into(),
+            hue_index: 0,
+            target: Some(target.into()),
+            session: session.into(),
+            program,
         }
     }
 }
@@ -59,6 +84,7 @@ pub(crate) fn remote_descriptors(
             hue_index: index,
             target: Some(entry.target.clone()),
             session: entry.session.clone(),
+            program: None,
         });
     }
     descriptors
@@ -273,6 +299,28 @@ mod tests {
         assert_eq!(descriptors[0].target, None);
         assert_eq!(descriptors[2].target.as_deref(), Some("can@gpu-01.example"));
         assert_eq!(descriptors[2].hue_index, 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_ephemeral_remote_is_a_fleet_of_one_at_index_zero() {
+        let descriptor = RemoteDescriptor::ephemeral(
+            "buildbox.example",
+            "can@buildbox.example",
+            "work",
+            Some("/home/can/.local/bin/herdr".to_string()),
+        );
+        // Remote #0 with an ssh target: there is no local runtime in view,
+        // so the bridge transport is chosen by the target, not the index.
+        assert_eq!(descriptor.index, LOCAL_REMOTE_INDEX);
+        assert_eq!(descriptor.target.as_deref(), Some("can@buildbox.example"));
+        assert_eq!(descriptor.session, "work");
+        assert_eq!(
+            descriptor.program.as_deref(),
+            Some("/home/can/.local/bin/herdr")
+        );
+        // A saved fleet remote keeps running `herdr` from the remote PATH.
+        assert!(RemoteDescriptor::local().program.is_none());
     }
 
     #[test]

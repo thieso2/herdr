@@ -163,10 +163,7 @@ mod shared_tests {
             remote_name_from_target("can@buildbox.example"),
             Some("buildbox.example".to_string())
         );
-        assert_eq!(
-            remote_name_from_target("gpu-1"),
-            Some("gpu-1".to_string())
-        );
+        assert_eq!(remote_name_from_target("gpu-1"), Some("gpu-1".to_string()));
         assert_eq!(
             remote_name_from_target("root@10.0.0.4:2222"),
             Some("10.0.0.4".to_string())

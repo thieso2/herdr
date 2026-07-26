@@ -63,7 +63,11 @@ Then attach with:
 herdr --remote workbox
 ```
 
-Remote attach supports Linux and macOS hosts on x86_64 and aarch64. Herdr checks the remote platform, prefers a matching `herdr` already on the remote `PATH`, then checks common direct, Homebrew, mise, and Nix profile install paths. If no matching binary exists, interactive runs prompt to install one to `~/.local/bin/herdr`; non-interactive runs fail instead of modifying the host. If `~/.local/bin` is not on the remote `PATH`, Herdr warns after install.
+Remote attach supports Linux and macOS hosts on x86_64 and aarch64. Herdr checks the remote platform, prefers a `herdr` already on the remote `PATH`, then checks common direct, Homebrew, mise, and Nix profile install paths.
+
+Connecting never installs or upgrades a remote as a side effect. Only a host with **no** `herdr` at all is bootstrapped: interactive runs prompt to install one to `~/.local/bin/herdr`, and non-interactive runs fail instead of modifying the host. A host that already has Herdr is used as it is, even when it runs a different version; roll it forward deliberately with [`herdr remote upgrade`](#upgrading-remotes). If `~/.local/bin` is not on the remote `PATH`, Herdr warns after install.
+
+A `--remote` launch is an ephemeral fleet of one: the target is not stored anywhere. After a session that worked, Herdr offers once to save it as a named remote in `remotes.toml`, so the next launch can use the name.
 
 Native Windows `herdr --remote` is not part of the Windows beta. From Windows, SSH into the server and run `herdr` there.
 
@@ -93,6 +97,28 @@ For local builds or custom binaries, set `HERDR_REMOTE_BINARY` to a local file p
 ```bash
 HERDR_REMOTE_BINARY=target/release/herdr herdr --remote workbox
 ```
+
+## Mixed versions and the upgrade window
+
+Herdr speaks a versioned protocol with a one-release window: any two adjacent releases interoperate, and the session speaks the older side's version. Features added without a breaking change ride capability flags, so a slightly older peer simply does not get them.
+
+A remote outside that window is not retried in a loop. It greys out, names itself, and prints the exact fix, for example:
+
+```text
+remote workbox is outside the supported protocol window: ...; run `herdr remote upgrade workbox`
+```
+
+If the *client* is the old side, the fix is `herdr update` on this machine instead.
+
+### Upgrading remotes
+
+```bash
+herdr remote upgrade workbox        # one remote, by name or ssh target
+herdr remote upgrade --all          # the whole fleet, one host at a time
+herdr remote upgrade --all --yes    # approve every prompt (required non-interactively)
+```
+
+Upgrades are forward-only: a remote that already runs the target version, or something newer, is reported and skipped rather than downgraded. The target version follows your update channel. `--yes` is required when stdin is not interactive, because an upgrade rewrites the remote binary and may stop a running remote server.
 
 ## Remote named sessions
 

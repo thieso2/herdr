@@ -53,6 +53,17 @@ pub(crate) fn parse_env_assignment(raw: &str) -> Result<(String, String), String
     Ok((key.to_string(), value.to_string()))
 }
 
+/// Shared yes/no prompt for commands that change something on disk or on a
+/// remote host. Defaults to no.
+pub(crate) fn confirm(prompt: &str) -> std::io::Result<bool> {
+    use std::io::Write as _;
+    eprint!("{prompt} [y/N] ");
+    std::io::stderr().flush()?;
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line)?;
+    Ok(matches!(line.trim(), "y" | "Y" | "yes" | "YES" | "Yes"))
+}
+
 pub enum CommandOutcome {
     Handled(i32),
     NotCli,

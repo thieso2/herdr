@@ -79,6 +79,9 @@ pub(crate) enum GlobalMenuAction {
     Keybinds,
     ReloadConfig,
     Settings,
+    /// Opens the pure client's add-remote dialog. Always offered there, so
+    /// the first remote can be added with no chip strip on screen.
+    AddRemote,
 }
 
 pub(super) fn global_menu_actions(state: &AppState) -> Vec<GlobalMenuAction> {
@@ -95,6 +98,9 @@ pub(super) fn global_menu_actions(state: &AppState) -> Vec<GlobalMenuAction> {
     }
     if state.update_available.is_some() || state.latest_release_notes_available {
         actions.push(GlobalMenuAction::WhatsNew);
+    }
+    if state.pure_client {
+        actions.push(GlobalMenuAction::AddRemote);
     }
     actions.push(GlobalMenuAction::Detach);
     actions
@@ -147,6 +153,10 @@ pub(super) fn apply_global_menu_action(state: &mut AppState, action: GlobalMenuA
             leave_modal(state);
         }
         GlobalMenuAction::Settings => super::settings::open_settings(state),
+        GlobalMenuAction::AddRemote => {
+            state.request_add_remote = true;
+            leave_modal(state);
+        }
     }
 }
 
@@ -1921,6 +1931,7 @@ mod tests {
                     GlobalMenuAction::Keybinds => "keybinds",
                     GlobalMenuAction::ReloadConfig => "reload config",
                     GlobalMenuAction::WhatsNew => "what's new",
+                    GlobalMenuAction::AddRemote => "add remote",
                     GlobalMenuAction::Detach => "detach",
                 })
                 .collect();
@@ -1928,8 +1939,62 @@ mod tests {
             if pure_client {
                 assert!(!actions.contains(&GlobalMenuAction::Settings));
                 assert!(!actions.contains(&GlobalMenuAction::ReloadConfig));
+                assert!(actions.contains(&GlobalMenuAction::AddRemote));
+            } else {
+                assert!(!actions.contains(&GlobalMenuAction::AddRemote));
             }
         }
+    }
+
+    /// The add-remote dialog is pure-client chrome, so the entry that opens
+    /// it is pure-client only: the legacy TUI has no such dialog and keeps
+    /// exactly the menu it has today.
+    #[test]
+    fn add_remote_is_a_pure_client_only_menu_entry() {
+        let mut state = AppState::test_new();
+
+        state.pure_client = false;
+        assert!(!global_menu_actions(&state).contains(&GlobalMenuAction::AddRemote));
+        assert!(!state.global_menu_labels().contains(&"add remote"));
+
+        state.pure_client = true;
+        assert_eq!(
+            global_menu_actions(&state),
+            vec![
+                GlobalMenuAction::Keybinds,
+                GlobalMenuAction::AddRemote,
+                GlobalMenuAction::Detach,
+            ],
+            "add remote sits with the other global entries, just before detach"
+        );
+        assert_eq!(
+            state.global_menu_labels(),
+            vec!["keybinds", "add remote", "detach"]
+        );
+    }
+
+    /// With only the local runtime configured no chip strip is composed, so
+    /// the strip's add affordance does not exist and the menu entry is the
+    /// only way to add the first remote. It requests the dialog through a
+    /// flag the owning (pure-client) loop drains, because `AppState` cannot
+    /// reach client chrome.
+    #[test]
+    fn add_remote_menu_action_requests_the_dialog_and_closes_the_menu() {
+        let mut state = state_with_workspaces(&["test"]);
+        state.pure_client = true;
+        state.mode = Mode::GlobalMenu;
+        assert!(!state.request_add_remote);
+
+        apply_global_menu_action(&mut state, GlobalMenuAction::AddRemote);
+
+        assert!(
+            state.request_add_remote,
+            "the owning loop drains this into the dialog"
+        );
+        assert_eq!(state.mode, Mode::Terminal, "the menu closes behind it");
+        assert!(!state.should_quit);
+        assert!(!state.detach_requested);
+        assert!(!state.request_reload_config);
     }
 
     #[test]

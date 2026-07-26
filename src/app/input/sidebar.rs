@@ -212,6 +212,9 @@ impl AppState {
         } else if self.latest_release_notes_available {
             labels.push("what's new");
         }
+        if self.pure_client {
+            labels.push("add remote");
+        }
         labels.push("detach");
         labels
     }

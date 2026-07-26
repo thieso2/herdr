@@ -578,6 +578,7 @@ impl App {
             request_submit_worktree_open: false,
             request_submit_worktree_remove: false,
             request_reload_config: false,
+            request_add_remote: false,
             request_client_config_reload: false,
             request_clipboard_write: None,
             creating_new_tab: false,

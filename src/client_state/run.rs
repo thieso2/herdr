@@ -1978,8 +1978,28 @@ fn visible_panes_of_workspace(catalog: &SessionCatalog, workspace_id: &str) -> V
         .collect()
 }
 
-/// Interprets one host input event client-side.
+/// Interprets one host input event client-side, then drains the requests
+/// the shared `AppState` layer can only ask for (it holds no client chrome).
 fn handle_raw_input(raw: crate::raw_input::RawInputEvent, ctx: &mut LoopCtx<'_>) {
+    interpret_raw_input(raw, ctx);
+    drain_app_requests(ctx);
+}
+
+/// Turns pending `AppState` requests into client chrome. The global menu's
+/// add-remote entry is the only way to add the first remote: with a single
+/// runtime configured no chip strip is composed, so the strip's own add
+/// affordance is not on screen.
+fn drain_app_requests(ctx: &mut LoopCtx<'_>) {
+    if ctx.app.request_add_remote {
+        ctx.app.request_add_remote = false;
+        if ctx.chrome.remote_edit.is_none() {
+            debug!("opening the add-remote dialog from the global menu");
+            ctx.chrome.remote_edit = Some(super::remote_edit::RemoteEditState::add());
+        }
+    }
+}
+
+fn interpret_raw_input(raw: crate::raw_input::RawInputEvent, ctx: &mut LoopCtx<'_>) {
     match raw {
         crate::raw_input::RawInputEvent::Key(key) => handle_key(key, ctx),
         crate::raw_input::RawInputEvent::Paste(text) => {
@@ -3017,10 +3037,89 @@ mod tests {
             assert!(!ctx.app.should_quit);
 
             // Enter on detach (last entry) exits the fleet client.
+            let detach_row = ctx.app.global_menu_labels().len().saturating_sub(1);
             ctx.app.mode = Mode::GlobalMenu;
-            ctx.app.global_menu = crate::app::state::MenuListState::new(1);
+            ctx.app.global_menu = crate::app::state::MenuListState::new(detach_row);
             handle_key(key(KeyCode::Enter), ctx);
             assert!(ctx.app.should_quit, "detach exits the pure client");
+        });
+    }
+
+    /// The reported bootstrap hole: with only the local runtime configured
+    /// no chip strip is composed, so the strip's add affordance - the only
+    /// way to add a remote - does not exist. The global menu is always
+    /// reachable, so its "add remote" entry has to open the same dialog,
+    /// end to end through the real menu mouse path.
+    #[tokio::test]
+    async fn the_menu_adds_the_first_remote_when_no_chip_strip_exists() {
+        use crossterm::event::MouseButton;
+        with_test_ctx(vec![RemoteDescriptor::local()], |ctx| {
+            ctx.app.pure_client = true;
+            render_chip_strip(ctx, 106, 30);
+            assert!(
+                ctx.app.remote_chips.is_empty(),
+                "a local-only fleet composes no chips"
+            );
+            assert_eq!(
+                ctx.app.view.remote_add_hit_area.width, 0,
+                "and so the strip's add affordance is not on screen"
+            );
+
+            let click = |column: u16, row: u16| {
+                crate::raw_input::RawInputEvent::Mouse(MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column,
+                    row,
+                    modifiers: KeyModifiers::empty(),
+                })
+            };
+            let launcher = ctx.app.global_launcher_rect();
+            handle_raw_input(click(launcher.x, launcher.y), ctx);
+            assert_eq!(ctx.app.mode, Mode::GlobalMenu);
+
+            let row = ctx
+                .app
+                .global_menu_labels()
+                .iter()
+                .position(|label| *label == "add remote")
+                .expect("the pure client offers an add-remote entry");
+            let menu = ctx.app.global_menu_rect();
+            handle_raw_input(click(menu.x + 2, menu.y + 1 + row as u16), ctx);
+
+            assert_eq!(
+                ctx.chrome.remote_edit,
+                Some(super::super::remote_edit::RemoteEditState::add()),
+                "the menu opens the same add dialog the chip strip opens"
+            );
+            assert!(!ctx.app.request_add_remote, "the request is drained once");
+            assert!(!ctx.app.should_quit);
+        });
+    }
+
+    #[tokio::test]
+    async fn the_menu_adds_a_remote_from_the_keyboard_too() {
+        with_test_ctx(vec![RemoteDescriptor::local()], |ctx| {
+            ctx.app.pure_client = true;
+            render_chip_strip(ctx, 106, 30);
+
+            let row = ctx
+                .app
+                .global_menu_labels()
+                .iter()
+                .position(|label| *label == "add remote")
+                .expect("the pure client offers an add-remote entry");
+            ctx.app.mode = Mode::GlobalMenu;
+            ctx.app.global_menu = crate::app::state::MenuListState::new(row);
+            handle_raw_input(
+                crate::raw_input::RawInputEvent::Key(key(KeyCode::Enter)),
+                ctx,
+            );
+
+            assert_eq!(
+                ctx.chrome.remote_edit,
+                Some(super::super::remote_edit::RemoteEditState::add())
+            );
+            assert!(!ctx.app.request_add_remote);
         });
     }
 

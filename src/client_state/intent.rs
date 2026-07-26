@@ -745,7 +745,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pure_client_global_menu_offers_keybinds_and_detach_only() {
+    async fn pure_client_global_menu_offers_keybinds_add_remote_and_detach() {
         let (mut mirrors, mut ids, mut app) = composed();
         app.mode = crate::app::Mode::Terminal;
         app.pure_client = true;
@@ -762,8 +762,13 @@ mod tests {
         };
 
         // Settings and reload config have no client-side effect; they are
-        // omitted so no menu row is silently dead.
-        assert_eq!(app.global_menu_labels(), vec!["keybinds", "detach"]);
+        // omitted so no menu row is silently dead. Add remote is the
+        // inverse: it only exists here, and is the only way to add the
+        // first remote when no chip strip is composed.
+        assert_eq!(
+            app.global_menu_labels(),
+            vec!["keybinds", "add remote", "detach"]
+        );
 
         let launcher = app.global_launcher_rect();
         let mut dispatch = |mouse, app: &mut AppState, chrome: &mut _| {
@@ -792,10 +797,20 @@ mod tests {
         assert_eq!(app.mode, crate::app::Mode::Terminal);
         assert!(!app.should_quit);
 
-        // Row 2 is detach: the fleet client exits, remotes keep running.
+        // Row 2 is add remote: it asks the run loop for the dialog and
+        // closes the menu; the flag is the client-chrome seam.
         dispatch(click(launcher.x, launcher.y), &mut app, &mut chrome);
         let menu = app.global_menu_rect();
         dispatch(click(menu.x + 2, menu.y + 2), &mut app, &mut chrome);
+        assert!(app.request_add_remote, "the run loop opens the dialog");
+        assert_eq!(app.mode, crate::app::Mode::Terminal);
+        assert!(!app.should_quit);
+        app.request_add_remote = false;
+
+        // Row 3 is detach: the fleet client exits, remotes keep running.
+        dispatch(click(launcher.x, launcher.y), &mut app, &mut chrome);
+        let menu = app.global_menu_rect();
+        dispatch(click(menu.x + 2, menu.y + 3), &mut app, &mut chrome);
         assert!(app.should_quit, "detach exits the pure client");
     }
 

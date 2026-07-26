@@ -1516,6 +1516,11 @@ pub struct AppState {
     pub request_submit_worktree_open: bool,
     pub request_submit_worktree_remove: bool,
     pub request_reload_config: bool,
+    /// Set when the user asked to add a fleet remote from the global menu.
+    /// The add-remote dialog is client chrome that `AppState` cannot reach,
+    /// so the owning pure-client loop drains this into the dialog. Only the
+    /// pure client offers the entry that sets it.
+    pub request_add_remote: bool,
     /// Set when the headless server should ask attached clients to reload
     /// their client-local sound config from disk.
     pub request_client_config_reload: bool,
@@ -2003,6 +2008,7 @@ impl AppState {
             request_submit_worktree_open: false,
             request_submit_worktree_remove: false,
             request_reload_config: false,
+            request_add_remote: false,
             request_client_config_reload: false,
             request_clipboard_write: None,
             creating_new_tab: false,

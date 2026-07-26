@@ -24,6 +24,7 @@ use crate::ipc::{
 
 mod framed_session;
 mod pane_graphics_stream;
+pub(crate) use framed_session::allocate_stream_id as allocate_pane_stream_id;
 pub(crate) use pane_graphics_stream::cancel_inactive_streams as cancel_inactive_pane_graphics_streams;
 
 const SOCKET_PERMISSION_MODE: u32 = 0o600;
@@ -155,7 +156,7 @@ fn handle_connection(
     let line = match preamble {
         ConnectionPreamble::FramedSession => {
             debug!("framed session opened on api socket");
-            return framed_session::serve(stream, running);
+            return framed_session::serve(stream, api_tx, event_hub, running);
         }
         ConnectionPreamble::RequestLine(line) => line,
     };
@@ -362,6 +363,9 @@ fn api_method_name(method: &Method) -> &'static str {
         Method::ClientWindowTitleSet(_) => "client.window_title.set",
         Method::ClientWindowTitleClear(_) => "client.window_title.clear",
         Method::SessionSnapshot(_) => "session.snapshot",
+        Method::RemoteList(_) => "remote.list",
+        Method::RemoteReset(_) => "remote.reset",
+        Method::RemoteReload(_) => "remote.reload",
         Method::WorkspaceCreate(_) => "workspace.create",
         Method::WorkspaceList(_) => "workspace.list",
         Method::WorkspaceGet(_) => "workspace.get",
@@ -422,6 +426,12 @@ fn api_method_name(method: &Method) -> &'static str {
         Method::PaneGraphicsStreamSet(_) => "pane.graphics.stream.set",
         Method::PaneGraphicsStreamOpen(_) => "pane.graphics.stream.open",
         Method::PaneGraphicsStreamClose(_) => "pane.graphics.stream.close",
+        Method::PaneStreamOpen(_) => "stream.open",
+        Method::PaneStreamClose(_) => "stream.close",
+        Method::PaneStreamResize(_) => "stream.resize",
+        Method::PaneStreamScroll(_) => "stream.scroll",
+        Method::PaneSendBytes(_) => "pane.send_bytes",
+        Method::PanePasteImage(_) => "pane.paste_image",
         Method::PaneReportAgent(_) => "pane.report_agent",
         Method::PaneReportAgentSession(_) => "pane.report_agent_session",
         Method::PaneReportMetadata(_) => "pane.report_metadata",

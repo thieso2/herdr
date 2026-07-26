@@ -885,6 +885,17 @@ pub struct ExperimentalConfig {
     pub kitty_graphics: bool,
     /// Persist pane screen history to session-history.json. Default: false.
     pub pane_history: bool,
+    /// Run the TUI as a pure client of the local server: the sidebar is
+    /// driven by the server's session catalog, pane content renders from
+    /// streamed replicas, and input is interpreted client-side into
+    /// control-plane methods.
+    ///
+    /// Unset resolves to the release default
+    /// (`crate::client_state::run::PURE_CLIENT_DEFAULT`, currently the
+    /// legacy path). An explicit `true`/`false` always wins over the
+    /// release default, so users who opted in or out keep their choice
+    /// when the default flips. Ignored on Windows.
+    pub pure_client: Option<bool>,
     /// Expose the focused pane's cursor anchor to the outer terminal even when
     /// the pane requested `?25l`, so macOS native input methods keep tracking
     /// the candidate window when TUIs paint their own cursor (Claude Code, pi,

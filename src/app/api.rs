@@ -9,6 +9,7 @@ mod layouts;
 mod pane_graphics;
 mod panes;
 pub(crate) mod plugins;
+mod remotes;
 mod responses;
 mod session;
 mod tabs;
@@ -87,9 +88,21 @@ impl App {
         } else {
             self.last_git_remote_status_refresh = Instant::now();
         }
-        let changed = self
+        let changed_indices = self
             .state
             .apply_workspace_git_statuses(&self.terminal_runtimes, results);
+        let changed = !changed_indices.is_empty();
+        // Catalog clients (the pure fleet client) mirror workspace git
+        // facts from workspace.updated events. Pushed directly to the hub,
+        // bypassing plugin hooks, so a periodic git refresh cannot fire
+        // plugin hook storms (same reasoning as emit_workspace_token_updated).
+        for ws_idx in changed_indices {
+            let workspace = self.workspace_info(ws_idx);
+            self.event_hub.push(crate::api::schema::EventEnvelope {
+                event: crate::api::schema::EventKind::WorkspaceUpdated,
+                data: crate::api::schema::EventData::WorkspaceUpdated { workspace },
+            });
+        }
         if changed {
             self.render_dirty.store(true, Ordering::Release);
             self.render_notify.notify_one();
@@ -271,7 +284,12 @@ impl App {
             } else {
                 None
             };
-        let terminal_cwd_reported = matches!(ev, AppEvent::TerminalCwdReported { .. });
+        let terminal_cwd_reported = if let AppEvent::TerminalCwdReported { pane_id, .. } = &ev {
+            Some(*pane_id)
+        } else {
+            None
+        };
+        let terminal_cwd_before = terminal_cwd_reported.and_then(|pane_id| self.pane_cwd(pane_id));
         let previous_toast = self.state.toast.clone();
         let pane_updates = self.state.handle_app_event(ev);
         if let Some(agents) = manifest_update_agents {
@@ -291,10 +309,24 @@ impl App {
             }
         }
         self.sync_full_lifecycle_authority_detection_pauses();
-        if terminal_cwd_reported {
+        if let Some(pane_id) = terminal_cwd_reported {
             self.request_git_identity_refresh(Instant::now());
             self.render_dirty.store(true, Ordering::Release);
             self.render_notify.notify_one();
+            // Catalog clients mirror PaneInfo.cwd and the cwd-derived
+            // workspace label; a cwd change that stayed server-side would
+            // freeze both in the pure client. Branch/ahead-behind follow a
+            // moment later via the git refresh requested above.
+            if self.pane_cwd(pane_id) != terminal_cwd_before {
+                if let Some((ws_idx, _)) = self.find_pane(pane_id) {
+                    self.emit_pane_updated(ws_idx, pane_id);
+                    let workspace = self.workspace_info(ws_idx);
+                    self.event_hub.push(crate::api::schema::EventEnvelope {
+                        event: crate::api::schema::EventKind::WorkspaceUpdated,
+                        data: crate::api::schema::EventData::WorkspaceUpdated { workspace },
+                    });
+                }
+            }
         }
         for update in &pane_updates {
             self.refresh_new_herdr_toast_context_for_update(update, &previous_toast);
@@ -783,6 +815,15 @@ impl App {
         self.event_hub.push(event);
     }
 
+    /// The cwd of the terminal attached to `pane_id`, when the pane exists.
+    fn pane_cwd(&self, pane_id: crate::layout::PaneId) -> Option<std::path::PathBuf> {
+        let (_, pane) = self.find_pane(pane_id)?;
+        self.state
+            .terminals
+            .get(&pane.attached_terminal_id)
+            .map(|terminal| terminal.cwd.clone())
+    }
+
     pub(crate) fn emit_pane_updated(&mut self, ws_idx: usize, pane_id: crate::layout::PaneId) {
         if let Some(pane) = self.pane_info(ws_idx, pane_id) {
             self.emit_event(crate::api::schema::EventEnvelope {
@@ -974,6 +1015,11 @@ impl App {
                 );
             }
             Method::SessionSnapshot(_) => return self.handle_session_snapshot(request.id),
+            Method::RemoteList(_) => return self.handle_remote_list(request.id),
+            Method::RemoteReset(params) => {
+                return self.handle_remote_reset(request.id, params);
+            }
+            Method::RemoteReload(_) => return self.handle_remote_reload(request.id),
             Method::WorkspaceList(_) => return self.handle_workspace_list(request.id),
             Method::WorkspaceGet(target) => return self.handle_workspace_get(request.id, target),
             Method::WorkspaceCreate(params) => {
@@ -1090,6 +1136,24 @@ impl App {
             }
             Method::PaneGraphicsStreamClose(params) => {
                 return self.handle_pane_graphics_stream_close(request.id, params);
+            }
+            Method::PaneStreamOpen(params) => {
+                return self.handle_pane_stream_open(request.id, params);
+            }
+            Method::PaneStreamClose(params) => {
+                return self.handle_pane_stream_close(request.id, params);
+            }
+            Method::PaneStreamResize(params) => {
+                return self.handle_pane_stream_resize(request.id, params);
+            }
+            Method::PaneStreamScroll(params) => {
+                return self.handle_pane_stream_scroll(request.id, params);
+            }
+            Method::PaneSendBytes(params) => {
+                return self.handle_pane_send_bytes(request.id, params);
+            }
+            Method::PanePasteImage(params) => {
+                return self.handle_pane_paste_image(request.id, params);
             }
             Method::PaneReportAgent(params) => {
                 return self.handle_pane_report_agent(request.id, params);

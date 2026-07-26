@@ -21,7 +21,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crossterm::event::{KeyModifiers, MouseEventKind};
 use interprocess::local_socket::traits::Listener as _;
 #[cfg(windows)]
 use interprocess::local_socket::traits::Stream as _;
@@ -94,6 +93,14 @@ fn wait_for_live_handoff_response_write(
         Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
             warn!("live handoff response writer disconnected; old server exiting");
         }
+    }
+}
+
+fn notification_event_kind(kind: &protocol::NotifyKind) -> api::schema::NotificationEventKind {
+    match kind {
+        protocol::NotifyKind::Sound => api::schema::NotificationEventKind::Sound,
+        protocol::NotifyKind::Toast => api::schema::NotificationEventKind::Toast,
+        protocol::NotifyKind::SystemToast => api::schema::NotificationEventKind::SystemToast,
     }
 }
 
@@ -264,6 +271,11 @@ pub struct HeadlessServer {
     server_config_diagnostic_without_keybindings: Option<String>,
     /// Writable direct attach owner per terminal id string.
     terminal_attach_owners: HashMap<String, u64>,
+    /// Pane write grants held on behalf of legacy terminal-attach clients,
+    /// keyed by client id. Bridging the legacy path onto the same grant
+    /// table framed pane streams use keeps the single-writer invariant
+    /// across both attach paths during the migration window.
+    legacy_attach_grants: HashMap<u64, crate::pane::write_grant::WriteGrant>,
     /// Monotonic activity counter used to pick the most recently active client.
     next_activity_stamp: u64,
     /// Shared pane runtime size derived from the foreground client,
@@ -284,6 +296,8 @@ pub struct HeadlessServer {
     server_event_tx: mpsc::Sender<ServerEvent>,
 }
 
+/// Legacy direct-attach scroll: adapts the frozen wire scroll vocabulary onto
+/// the shared pane scroll routing.
 fn apply_terminal_attach_scroll(
     runtime: &crate::terminal::TerminalRuntime,
     source: AttachScrollSource,
@@ -293,68 +307,37 @@ fn apply_terminal_attach_scroll(
     row: Option<u16>,
     modifiers: u8,
 ) -> Result<(), String> {
-    let wheel_kind = match direction {
-        AttachScrollDirection::Up => MouseEventKind::ScrollUp,
-        AttachScrollDirection::Down => MouseEventKind::ScrollDown,
+    use crate::terminal::pane_scroll::{
+        apply_pane_scroll_with_page_input, PaneScrollDirection, PaneScrollRequest, PaneScrollSource,
     };
-    if let AttachScrollSource::PageKey { input } = source {
-        let host_scroll = runtime
-            .input_state()
-            .is_some_and(crate::pane::InputState::plain_page_keys_use_host_scrollback);
-        if host_scroll {
-            match direction {
-                AttachScrollDirection::Up => runtime.scroll_up(lines.max(1) as usize),
-                AttachScrollDirection::Down => runtime.scroll_down(lines.max(1) as usize),
-            }
-            return Ok(());
-        }
-        return apply_terminal_attach_input(runtime, input);
-    }
 
-    match runtime.wheel_routing() {
-        Some(crate::pane::WheelRouting::MouseReport) => {
-            runtime.scroll_reset();
-            let column = column.unwrap_or(0);
-            let row = row.unwrap_or(0);
-            let Some(bytes) = runtime.encode_mouse_wheel(
-                wheel_kind,
-                column,
-                row,
-                KeyModifiers::from_bits_truncate(modifiers),
-            ) else {
-                return Err(format!(
-                    "failed to encode terminal attach mouse wheel event: {wheel_kind:?}"
-                ));
-            };
-            runtime
-                .try_send_bytes(Bytes::from(bytes))
-                .map_err(|err| format!("terminal attach mouse wheel input failed: {err}"))?;
-        }
-        Some(crate::pane::WheelRouting::AlternateScroll) => {
-            runtime.scroll_reset();
-            let Some(bytes) = runtime.encode_alternate_scroll(wheel_kind) else {
-                return Ok(());
-            };
-            runtime
-                .try_send_bytes(Bytes::from(bytes))
-                .map_err(|err| format!("terminal attach alternate scroll input failed: {err}"))?;
-        }
-        Some(crate::pane::WheelRouting::HostScroll) | None => match direction {
-            AttachScrollDirection::Up => runtime.scroll_up(lines.max(1) as usize),
-            AttachScrollDirection::Down => runtime.scroll_down(lines.max(1) as usize),
+    let direction = match direction {
+        AttachScrollDirection::Up => PaneScrollDirection::Up,
+        AttachScrollDirection::Down => PaneScrollDirection::Down,
+    };
+    let (scroll_source, page_key_bytes) = match source {
+        AttachScrollSource::Wheel => (PaneScrollSource::Wheel, None),
+        AttachScrollSource::PageKey { input } => (PaneScrollSource::PageKey, Some(input)),
+    };
+    apply_pane_scroll_with_page_input(
+        runtime,
+        PaneScrollRequest {
+            source: scroll_source,
+            direction,
+            lines,
+            column,
+            row,
+            modifiers,
         },
-    }
-    Ok(())
+        page_key_bytes,
+    )
 }
 
 fn apply_terminal_attach_input(
     runtime: &crate::terminal::TerminalRuntime,
     data: Vec<u8>,
 ) -> Result<(), String> {
-    runtime.scroll_reset();
-    runtime
-        .try_send_bytes(Bytes::from(data))
-        .map_err(|err| format!("terminal attach input failed: {err}"))
+    crate::terminal::pane_scroll::apply_pane_input(runtime, data)
 }
 
 #[cfg(windows)]
@@ -456,6 +439,7 @@ impl HeadlessServer {
             server_config_diagnostic,
             server_config_diagnostic_without_keybindings,
             terminal_attach_owners: HashMap::new(),
+            legacy_attach_grants: HashMap::new(),
             next_activity_stamp: 1,
             effective_size: (MIN_COLS, MIN_ROWS),
             shutting_down: false,
@@ -610,6 +594,7 @@ impl HeadlessServer {
             }
 
             self.cancel_inactive_pane_graphics_streams();
+            self.kick_revoked_terminal_attach_clients();
 
             self.drain_client_config_reload_request();
             self.stream_host_mouse_capture_mode();
@@ -664,7 +649,7 @@ impl HeadlessServer {
                 .next_headless_loop_deadline_with_git_refresh(
                     now,
                     needs_render,
-                    self.has_app_client(),
+                    self.git_refresh_consumer_connected(),
                 )
                 .map(|deadline| deadline.min(now + CLIENT_ACCEPT_POLL_INTERVAL))
                 .or(Some(now + CLIENT_ACCEPT_POLL_INTERVAL));
@@ -952,20 +937,21 @@ impl HeadlessServer {
         };
         let (cols, rows) = self.effective_size;
         let area = Rect::new(0, 0, cols, rows);
-        if self.app.state.kitty_graphics_enabled && client.cell_size.is_known() {
-            crate::ui::compute_view_with_cell_size(
-                &mut self.app.state,
-                &self.app.terminal_runtimes,
-                area,
-                client.cell_size,
-            );
+        let cell_size = if self.app.state.kitty_graphics_enabled && client.cell_size.is_known() {
+            client.cell_size
         } else {
-            crate::ui::compute_view_with_runtime_registry(
-                &mut self.app.state,
-                &self.app.terminal_runtimes,
-                area,
-            );
-        }
+            crate::kitty_graphics::HostCellSize::default()
+        };
+        let resize_requests = crate::ui::compute_view_with_content(
+            &mut self.app.state,
+            &self.app.terminal_runtimes,
+            area,
+        );
+        self.app.state.apply_pane_resize_requests(
+            &self.app.terminal_runtimes,
+            &resize_requests,
+            cell_size,
+        );
 
         // Shared runtime size changes affect pane wrapping and foreground-driven
         // rendering semantics. Force one fresh frame to every remaining client
@@ -1396,6 +1382,13 @@ impl HeadlessServer {
         self.app_client_count() > 0
     }
 
+    /// Whether any connected client consumes workspace git facts: a legacy
+    /// full app client on the private socket, or a catalog-capable framed
+    /// API session (the pure fleet client mirroring the session catalog).
+    fn git_refresh_consumer_connected(&self) -> bool {
+        self.has_app_client() || self.app.event_hub.catalog_client_count() > 0
+    }
+
     fn remove_client(&mut self, client_id: u64) -> bool {
         let was_foreground = self.foreground_client_id == Some(client_id);
         self.app.clear_input_source(client_id);
@@ -1405,11 +1398,26 @@ impl HeadlessServer {
             crate::server::clipboard_image::remove_files(removed.staged_clipboard_files);
             if let ClientConnectionMode::TerminalAttach { terminal_id } = removed.mode {
                 self.terminal_attach_owners.remove(&terminal_id);
-                if let Some(terminal_id) = self.terminal_id_by_string(&terminal_id) {
-                    self.app
-                        .state
-                        .direct_attach_resize_locks
-                        .remove(&terminal_id);
+                // Dropping a still-current bridged grant frees the pane; a
+                // grant that was already taken over releases nothing, and the
+                // geometry lock then belongs to the new holder, so it must
+                // not be cleared out from under that holder here.
+                let bridged_grant = self.legacy_attach_grants.remove(&client_id);
+                let grant_pane_id = bridged_grant
+                    .as_ref()
+                    .map(|grant| grant.pane_id().to_owned());
+                drop(bridged_grant);
+                let pane_still_held = grant_pane_id
+                    .as_deref()
+                    .and_then(crate::pane::write_grant::write_grant_holder)
+                    .is_some();
+                if !pane_still_held {
+                    if let Some(terminal_id) = self.terminal_id_by_string(&terminal_id) {
+                        self.app
+                            .state
+                            .direct_attach_resize_locks
+                            .remove(&terminal_id);
+                    }
                 }
             }
         }
@@ -1855,9 +1863,21 @@ impl HeadlessServer {
         message: impl Into<String>,
         body: Option<String>,
     ) -> bool {
+        let message = message.into();
+        // Promote the notification to the shared event hub so framed clients
+        // with the `notification` capability receive it even when no legacy
+        // foreground client is attached.
+        self.app.event_hub.push(api::schema::EventEnvelope {
+            event: api::schema::EventKind::NotificationPosted,
+            data: api::schema::EventData::NotificationPosted {
+                kind: notification_event_kind(&kind),
+                message: message.clone(),
+                body: body.clone(),
+            },
+        });
         self.send_to_foreground_client(ServerMessage::Notify {
             kind,
-            message: message.into(),
+            message,
             body,
         })
     }
@@ -1970,6 +1990,14 @@ impl HeadlessServer {
             None => None,
         };
         let set_title = title.is_some();
+        // Promote the title change to the shared event hub for framed clients
+        // with the `window-title` capability.
+        self.app.event_hub.push(api::schema::EventEnvelope {
+            event: api::schema::EventKind::WindowTitleChanged,
+            data: api::schema::EventData::WindowTitleChanged {
+                title: title.clone(),
+            },
+        });
         let changed = self.send_to_foreground_client(ServerMessage::WindowTitle { title });
         let reason = match (changed, set_title) {
             (true, true) => ClientWindowTitleReason::Set,
@@ -2527,6 +2555,66 @@ impl HeadlessServer {
             }
         }
 
+        // Bridge onto the shared pane write-grant table so a legacy attach
+        // and a framed write stream can never both hold the same pane. The
+        // grant is keyed on a stream id from the framed allocator, so holder
+        // ids never collide across the two attach paths; a framed holder is
+        // refused or revoked here exactly like a second framed writer.
+        self.legacy_attach_grants.remove(&client_id);
+        let bridged_grant = match self
+            .app
+            .public_pane_id_for_terminal_target(&terminal_id)
+            .map(|public_pane_id| (public_pane_id, crate::api::allocate_pane_stream_id()))
+        {
+            Some((public_pane_id, Some(grant_stream_id))) => {
+                match crate::pane::write_grant::acquire_write_grant(
+                    &public_pane_id,
+                    grant_stream_id,
+                    takeover,
+                ) {
+                    Ok(grant) => Some(grant),
+                    Err(conflict) => {
+                        if !takeover {
+                            self.send_to_client(
+                                client_id,
+                                ServerMessage::ServerShutdown {
+                                    reason: Some(format!(
+                                        "terminal attach failed: terminal {terminal_id} already has an attached client; retry with --takeover"
+                                    )),
+                                },
+                            );
+                            self.remove_client_and_resize_if_needed(client_id);
+                            return false;
+                        }
+                        // Unreachable: a takeover acquisition only fails
+                        // against the freshly allocated id itself.
+                        warn!(
+                            holder_stream_id = conflict.holder_stream_id,
+                            "terminal attach takeover could not bridge onto the write grant"
+                        );
+                        None
+                    }
+                }
+            }
+            Some((_, None)) => {
+                self.send_to_client(
+                    client_id,
+                    ServerMessage::ServerShutdown {
+                        reason: Some(
+                            "terminal attach failed: this server has exhausted its stream id space; restart the server"
+                                .to_owned(),
+                        ),
+                    },
+                );
+                self.remove_client_and_resize_if_needed(client_id);
+                return false;
+            }
+            None => {
+                debug!(terminal_id = %terminal_id, "terminal attach target has no public pane id; attaching without a write grant");
+                None
+            }
+        };
+
         let stamp = self.allocate_activity_stamp();
         let Some(client) = self.clients.get_mut(&client_id) else {
             return false;
@@ -2547,6 +2635,9 @@ impl HeadlessServer {
         info!(client_id, cols, rows, terminal_id = %terminal_id, "terminal attach client connected");
         self.terminal_attach_owners
             .insert(terminal_id.clone(), client_id);
+        if let Some(grant) = bridged_grant {
+            self.legacy_attach_grants.insert(client_id, grant);
+        }
         self.app
             .state
             .direct_attach_resize_locks
@@ -2557,6 +2648,32 @@ impl HeadlessServer {
             runtime.resize(rows, cols, cell_size.width_px, cell_size.height_px);
         }
         true
+    }
+
+    /// Disconnects legacy terminal-attach clients whose bridged write grant
+    /// was taken over by a framed write stream, mirroring what a legacy
+    /// takeover does to them. Runs on every main-loop tick; the tick after
+    /// the framed `stream.open` that revoked the grant observes the flag.
+    fn kick_revoked_terminal_attach_clients(&mut self) {
+        let revoked: Vec<u64> = self
+            .legacy_attach_grants
+            .iter()
+            .filter(|(_, grant)| grant.is_revoked())
+            .map(|(client_id, _)| *client_id)
+            .collect();
+        for client_id in revoked {
+            info!(
+                client_id,
+                "terminal attach taken over by a framed pane write stream"
+            );
+            self.send_to_client(
+                client_id,
+                ServerMessage::ServerShutdown {
+                    reason: Some("terminal attach taken over".to_owned()),
+                },
+            );
+            self.remove_client_and_resize_if_needed(client_id);
+        }
     }
 
     fn client_is_pending_terminal_mode(&self, client_id: u64) -> bool {
@@ -3974,7 +4091,7 @@ impl HeadlessServer {
 
         changed |= self.app.clear_due_selection_highlight(now);
 
-        if self.has_app_client() {
+        if self.git_refresh_consumer_connected() {
             self.app.start_git_status_refresh_if_due(now);
         }
 
@@ -4308,6 +4425,9 @@ pub fn run_server() -> io::Result<()> {
         );
         print_ready_message(&api::socket_path(), &client_socket_path());
         server.app.run_plugin_startup_hooks();
+        // Connects all configured remotes in parallel without blocking the
+        // server loop; the fleet self-heals from here on.
+        server.app.start_fleet();
 
         server.run().await
     });
@@ -4411,6 +4531,7 @@ fn run_handoff_import_server(socket_path: &Path, token: &str) -> io::Result<()> 
         info!("handoff import server started");
         print_ready_message(&api::socket_path(), &client_socket_path());
         server.app.run_plugin_startup_hooks();
+        server.app.start_fleet();
         server.run().await
     });
 
@@ -4530,6 +4651,7 @@ mod tests {
             server_config_diagnostic: None,
             server_config_diagnostic_without_keybindings: None,
             terminal_attach_owners: HashMap::new(),
+            legacy_attach_grants: HashMap::new(),
             next_activity_stamp: 1,
             effective_size: (MIN_COLS, MIN_ROWS),
             shutting_down: false,
@@ -4706,6 +4828,52 @@ mod tests {
             Some(expected_version.as_str())
         );
         assert!(server.app.event_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn notify_and_window_title_promote_to_event_hub() {
+        let event_hub = api::EventHub::default();
+        let mut server = test_headless_server_with_event_hub(event_hub.clone());
+
+        // No foreground client is attached; the events must still promote.
+        assert!(!server.send_notify_to_foreground_client(
+            protocol::NotifyKind::Toast,
+            "pi finished",
+            Some("workspace 1".to_string()),
+        ));
+        let response =
+            server.handle_client_window_title_api("title_req".into(), Some("herdr — work".into()));
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(response["result"]["type"], "client_window_title");
+
+        let events = event_hub.events_after(0);
+        assert_eq!(events.len(), 2);
+        assert_eq!(
+            events[0].1.event,
+            api::schema::EventKind::NotificationPosted
+        );
+        match &events[0].1.data {
+            api::schema::EventData::NotificationPosted {
+                kind,
+                message,
+                body,
+            } => {
+                assert_eq!(*kind, api::schema::NotificationEventKind::Toast);
+                assert_eq!(message, "pi finished");
+                assert_eq!(body.as_deref(), Some("workspace 1"));
+            }
+            other => panic!("unexpected event data: {other:?}"),
+        }
+        assert_eq!(
+            events[1].1.event,
+            api::schema::EventKind::WindowTitleChanged
+        );
+        match &events[1].1.data {
+            api::schema::EventData::WindowTitleChanged { title } => {
+                assert_eq!(title.as_deref(), Some("herdr — work"));
+            }
+            other => panic!("unexpected event data: {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -5471,6 +5639,148 @@ next_tab = ""
         });
     }
 
+    #[test]
+    fn terminal_attach_bridges_onto_the_pane_write_grant_table() {
+        with_terminal_session_test_server(
+            |server, terminal_id, terminal_id_string, public_pane_id| {
+                connect_pending_terminal_client(server, 7);
+                assert!(
+                    server.handle_server_event(ServerEvent::ClientAttachTerminal {
+                        client_id: 7,
+                        terminal_id: terminal_id_string.clone(),
+                        takeover: false,
+                    })
+                );
+                assert!(
+                    crate::pane::write_grant::write_grant_holder(&public_pane_id).is_some(),
+                    "legacy attach must hold the shared pane write grant"
+                );
+
+                assert!(
+                    server.handle_server_event(ServerEvent::ClientDisconnected { client_id: 7 })
+                );
+                assert_eq!(
+                    crate::pane::write_grant::write_grant_holder(&public_pane_id),
+                    None,
+                    "legacy detach must release the shared pane write grant"
+                );
+                assert!(!server
+                    .app
+                    .state
+                    .direct_attach_resize_locks
+                    .contains(&terminal_id));
+            },
+        );
+    }
+
+    #[test]
+    fn terminal_attach_is_refused_while_a_framed_write_stream_holds_the_pane() {
+        with_terminal_session_test_server(
+            |server, terminal_id, terminal_id_string, public_pane_id| {
+                // A framed write stream holds the pane grant.
+                let framed_grant =
+                    crate::pane::write_grant::acquire_write_grant(&public_pane_id, 900_001, false)
+                        .expect("framed grant");
+                server
+                    .app
+                    .state
+                    .direct_attach_resize_locks
+                    .insert(terminal_id.clone());
+
+                connect_pending_terminal_client(server, 7);
+                assert!(
+                    !server.handle_server_event(ServerEvent::ClientAttachTerminal {
+                        client_id: 7,
+                        terminal_id: terminal_id_string.clone(),
+                        takeover: false,
+                    })
+                );
+
+                assert!(!server.clients.contains_key(&7));
+                assert!(server.terminal_attach_owners.is_empty());
+                assert!(
+                    !framed_grant.is_revoked(),
+                    "a refused legacy attach must not revoke the framed holder"
+                );
+                assert_eq!(
+                    crate::pane::write_grant::write_grant_holder(&public_pane_id),
+                    Some(900_001)
+                );
+                drop(framed_grant);
+            },
+        );
+    }
+
+    #[test]
+    fn terminal_attach_takeover_revokes_a_framed_write_stream_grant() {
+        with_terminal_session_test_server(
+            |server, _terminal_id, terminal_id_string, public_pane_id| {
+                let framed_grant =
+                    crate::pane::write_grant::acquire_write_grant(&public_pane_id, 900_002, false)
+                        .expect("framed grant");
+
+                connect_pending_terminal_client(server, 7);
+                assert!(
+                    server.handle_server_event(ServerEvent::ClientAttachTerminal {
+                        client_id: 7,
+                        terminal_id: terminal_id_string.clone(),
+                        takeover: true,
+                    })
+                );
+
+                assert!(
+                    framed_grant.is_revoked(),
+                    "a legacy takeover must revoke the framed holder"
+                );
+                let holder = crate::pane::write_grant::write_grant_holder(&public_pane_id);
+                assert!(holder.is_some_and(|holder| holder != 900_002));
+                drop(framed_grant);
+            },
+        );
+    }
+
+    #[test]
+    fn framed_takeover_kicks_legacy_attach_and_keeps_the_geometry_lock() {
+        with_terminal_session_test_server(
+            |server, terminal_id, terminal_id_string, public_pane_id| {
+                connect_pending_terminal_client(server, 7);
+                assert!(
+                    server.handle_server_event(ServerEvent::ClientAttachTerminal {
+                        client_id: 7,
+                        terminal_id: terminal_id_string.clone(),
+                        takeover: false,
+                    })
+                );
+
+                // A framed write stream takes the pane over; the main loop
+                // kick observes the revoked bridged grant and disconnects the
+                // legacy attach client without clearing the new holder's
+                // geometry lock.
+                let framed_grant =
+                    crate::pane::write_grant::acquire_write_grant(&public_pane_id, 900_003, true)
+                        .expect("framed takeover grant");
+                server.kick_revoked_terminal_attach_clients();
+
+                assert!(!server.clients.contains_key(&7));
+                assert!(server.terminal_attach_owners.is_empty());
+                assert!(server.legacy_attach_grants.is_empty());
+                assert_eq!(
+                    crate::pane::write_grant::write_grant_holder(&public_pane_id),
+                    Some(900_003)
+                );
+                assert!(
+                    server
+                        .app
+                        .state
+                        .direct_attach_resize_locks
+                        .contains(&terminal_id),
+                    "the geometry lock now belongs to the framed holder and must survive the kick"
+                );
+                drop(framed_grant);
+            },
+        );
+    }
+
     fn app_client_marks_git_refresh_due_on_first_attach(render_encoding: RenderEncoding) {
         let mut server = test_headless_server();
         server
@@ -5504,6 +5814,45 @@ next_tab = ""
     #[test]
     fn terminal_ansi_app_client_enables_headless_git_refresh() {
         app_client_marks_git_refresh_due_on_first_attach(RenderEncoding::TerminalAnsi);
+    }
+
+    #[test]
+    fn catalog_session_enables_headless_git_refresh() {
+        let mut server = test_headless_server();
+        server
+            .app
+            .state
+            .workspaces
+            .push(crate::workspace::Workspace::test_new("test"));
+
+        // No legacy app client, no catalog session: refresh stays off.
+        assert!(!server.has_app_client());
+        assert!(!server.git_refresh_consumer_connected());
+        assert_eq!(
+            server.app.next_headless_loop_deadline_with_git_refresh(
+                Instant::now(),
+                false,
+                server.git_refresh_consumer_connected()
+            ),
+            None
+        );
+
+        // A catalog-capable framed session (the pure fleet client) counts
+        // as a consumer of workspace git facts.
+        let guard = server.app.event_hub.register_catalog_client();
+        assert!(server.git_refresh_consumer_connected());
+        assert!(server
+            .app
+            .next_headless_loop_deadline_with_git_refresh(
+                Instant::now(),
+                false,
+                server.git_refresh_consumer_connected()
+            )
+            .is_some());
+
+        // Dropping the session turns the refresh loop back off.
+        drop(guard);
+        assert!(!server.git_refresh_consumer_connected());
     }
 
     #[test]

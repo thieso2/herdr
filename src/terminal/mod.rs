@@ -1,9 +1,15 @@
+mod content;
 mod id;
+pub(crate) mod pane_scroll;
+pub(crate) mod replica;
 mod runtime;
 mod runtime_registry;
 pub mod state;
 mod title;
 
+pub(crate) use content::{
+    EmptyPaneContentSource, PaneContent, PaneContentSource, PaneResizeRequest,
+};
 pub use id::TerminalId;
 pub use runtime::TerminalRuntime;
 pub(crate) use runtime_registry::TerminalRuntimeRegistry;

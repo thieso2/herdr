@@ -12,6 +12,14 @@ pub struct TerminalId(String);
 static NEXT_TERMINAL_ID: AtomicU64 = AtomicU64::new(1);
 
 impl TerminalId {
+    /// Wraps a server-issued terminal id verbatim, for clients that mirror
+    /// server terminals instead of allocating their own.
+    // Consumed only by the unix-only pure-client run path (#20).
+    #[cfg_attr(windows, allow(dead_code))]
+    pub(crate) fn from_server(id: impl Into<String>) -> Self {
+        Self(id.into())
+    }
+
     pub fn alloc() -> Self {
         let micros = SystemTime::now()
             .duration_since(UNIX_EPOCH)

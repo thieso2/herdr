@@ -312,7 +312,9 @@ pub(crate) fn render_virtual_with_runtime_registry(
     let pre_compute_suppresses_focused_terminal_cursor =
         !popup_visible && focused_terminal_suppresses_host_cursor(app_state, terminal_runtimes);
     if resize_panes {
-        crate::ui::compute_view_with_cell_size(app_state, terminal_runtimes, area, cell_size);
+        let resize_requests =
+            crate::ui::compute_view_with_content(app_state, terminal_runtimes, area);
+        app_state.apply_pane_resize_requests(terminal_runtimes, &resize_requests, cell_size);
     } else {
         crate::ui::compute_view_without_resizing_panes(app_state, terminal_runtimes, area);
     }
@@ -325,7 +327,7 @@ pub(crate) fn render_virtual_with_runtime_registry(
 
     terminal
         .draw(|frame| {
-            crate::ui::render_with_runtime_registry(app_state, terminal_runtimes, frame);
+            crate::ui::render_with_content(app_state, terminal_runtimes, frame);
         })
         .expect("render to TestBackend should never fail");
 

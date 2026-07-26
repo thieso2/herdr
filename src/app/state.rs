@@ -135,9 +135,26 @@ pub struct Palette {
     pub teal: Color,
     /// Interrupted / warning states.
     pub peach: Color,
+    /// Per-remote identity hues for the fleet chip strip and sidebar gutter,
+    /// assigned by fleet config order and cycled when remotes outnumber
+    /// hues. Themable; when empty, a default list derived from the
+    /// palette's non-state colors is used.
+    pub remote_hues: Vec<Color>,
 }
 
 impl Palette {
+    /// The identity hue for remote `index` (0 = local). Cycles when remotes
+    /// outnumber hues. The default list deliberately avoids the state
+    /// colors (red/yellow/green/teal are taken by agent states).
+    pub fn remote_hue(&self, index: usize) -> Color {
+        if self.remote_hues.is_empty() {
+            let defaults = [self.blue, self.mauve, self.peach];
+            defaults[index % defaults.len()]
+        } else {
+            self.remote_hues[index % self.remote_hues.len()]
+        }
+    }
+
     /// Catppuccin Mocha — the default.
     pub fn catppuccin() -> Self {
         Self {
@@ -157,6 +174,7 @@ impl Palette {
             blue: Color::Rgb(137, 180, 250),
             teal: Color::Rgb(148, 226, 213),
             peach: Color::Rgb(250, 179, 135),
+            remote_hues: Vec::new(),
         }
     }
 
@@ -179,6 +197,7 @@ impl Palette {
             blue: Color::Rgb(30, 102, 245),
             teal: Color::Rgb(23, 146, 153),
             peach: Color::Rgb(254, 100, 11),
+            remote_hues: Vec::new(),
         }
     }
 
@@ -201,6 +220,7 @@ impl Palette {
             blue: Color::Blue,
             teal: Color::Cyan,
             peach: Color::Yellow,
+            remote_hues: Vec::new(),
         }
     }
 
@@ -223,6 +243,7 @@ impl Palette {
             blue: Color::Rgb(122, 162, 247),
             teal: Color::Rgb(125, 207, 255),
             peach: Color::Rgb(255, 158, 100),
+            remote_hues: Vec::new(),
         }
     }
 
@@ -245,6 +266,7 @@ impl Palette {
             blue: Color::Rgb(46, 125, 233),
             teal: Color::Rgb(17, 140, 116),
             peach: Color::Rgb(177, 92, 0),
+            remote_hues: Vec::new(),
         }
     }
 
@@ -267,6 +289,7 @@ impl Palette {
             blue: Color::Rgb(139, 233, 253), // cyan-ish
             teal: Color::Rgb(139, 233, 253),
             peach: Color::Rgb(255, 184, 108),
+            remote_hues: Vec::new(),
         }
     }
 
@@ -289,6 +312,7 @@ impl Palette {
             blue: Color::Rgb(129, 161, 193),
             teal: Color::Rgb(143, 188, 187),
             peach: Color::Rgb(208, 135, 112),
+            remote_hues: Vec::new(),
         }
     }
 
@@ -311,6 +335,7 @@ impl Palette {
             blue: Color::Rgb(131, 165, 152),
             teal: Color::Rgb(142, 192, 124),
             peach: Color::Rgb(254, 128, 25),
+            remote_hues: Vec::new(),
         }
     }
 
@@ -333,6 +358,7 @@ impl Palette {
             blue: Color::Rgb(7, 102, 120),
             teal: Color::Rgb(66, 123, 88),
             peach: Color::Rgb(175, 58, 3),
+            remote_hues: Vec::new(),
         }
     }
 
@@ -355,6 +381,7 @@ impl Palette {
             blue: Color::Rgb(97, 175, 239),
             teal: Color::Rgb(86, 182, 194),
             peach: Color::Rgb(209, 154, 102),
+            remote_hues: Vec::new(),
         }
     }
 
@@ -377,6 +404,7 @@ impl Palette {
             blue: Color::Rgb(64, 120, 242),
             teal: Color::Rgb(1, 132, 188),
             peach: Color::Rgb(152, 104, 1),
+            remote_hues: Vec::new(),
         }
     }
 
@@ -399,6 +427,7 @@ impl Palette {
             blue: Color::Rgb(38, 139, 210),
             teal: Color::Rgb(42, 161, 152),
             peach: Color::Rgb(203, 75, 22),
+            remote_hues: Vec::new(),
         }
     }
 
@@ -421,6 +450,7 @@ impl Palette {
             blue: Color::Rgb(38, 139, 210),
             teal: Color::Rgb(42, 161, 152),
             peach: Color::Rgb(203, 75, 22),
+            remote_hues: Vec::new(),
         }
     }
 
@@ -443,6 +473,7 @@ impl Palette {
             blue: Color::Rgb(126, 156, 216),
             teal: Color::Rgb(127, 180, 202),
             peach: Color::Rgb(255, 160, 102),
+            remote_hues: Vec::new(),
         }
     }
 
@@ -465,6 +496,7 @@ impl Palette {
             blue: Color::Rgb(77, 105, 155),
             teal: Color::Rgb(78, 140, 162),
             peach: Color::Rgb(204, 109, 0),
+            remote_hues: Vec::new(),
         }
     }
 
@@ -487,6 +519,7 @@ impl Palette {
             blue: Color::Rgb(49, 116, 143),    // pine
             teal: Color::Rgb(156, 207, 216),   // foam
             peach: Color::Rgb(234, 154, 151),  // rose
+            remote_hues: Vec::new(),
         }
     }
 
@@ -509,6 +542,7 @@ impl Palette {
             blue: Color::Rgb(40, 105, 131),
             teal: Color::Rgb(86, 148, 159),
             peach: Color::Rgb(215, 130, 126),
+            remote_hues: Vec::new(),
         }
     }
 
@@ -531,6 +565,7 @@ impl Palette {
             blue: Color::Rgb(176, 176, 176),
             teal: Color::Rgb(102, 221, 204),
             peach: Color::Rgb(255, 199, 153),
+            remote_hues: Vec::new(),
         }
     }
 
@@ -610,6 +645,9 @@ impl Palette {
         if let Some(c) = &custom.peach {
             self.peach = parse_color(c);
         }
+        if let Some(hues) = &custom.remote_hues {
+            self.remote_hues = hues.iter().map(|hue| parse_color(hue)).collect();
+        }
         self
     }
 }
@@ -619,6 +657,41 @@ pub struct WorkspaceCardArea {
     pub ws_idx: usize,
     pub rect: Rect,
     pub indented: bool,
+}
+
+/// Connection state shown in a remote chip's dot. A plain projection of the
+/// pure client's per-remote connection machine; the chip dot is the only
+/// place connection state surfaces in the strip.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoteChipConnection {
+    Connected,
+    Connecting,
+    Offline,
+    /// Protocol windows do not overlap; the chip greys out.
+    Incompatible,
+}
+
+/// One chip in the fleet strip atop the sidebar. Pure presentation data
+/// composed by the pure client; empty `AppState::remote_chips` means no
+/// strip (single-remote setups render exactly today's sidebar).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteChipState {
+    pub name: String,
+    /// Identity hue index into `Palette::remote_hue`.
+    pub hue_index: usize,
+    /// Whether this remote is composed into the sidebar. Filtered-out
+    /// remotes stay connected and syncing; this is view membership only.
+    pub in_view: bool,
+    pub connection: RemoteChipConnection,
+}
+
+/// Per-space remote attribution shown when two or more remotes are in view:
+/// a hue gutter plus a dim remote-name token. Parallel to
+/// `AppState::workspaces` when non-empty; empty in single-remote views.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteTag {
+    pub name: String,
+    pub hue_index: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -775,6 +848,13 @@ pub enum ViewLayout {
 pub struct ViewState {
     pub layout: ViewLayout,
     pub sidebar_rect: Rect,
+    /// Rows reserved atop the sidebar for the fleet chip strip; empty when
+    /// no strip is shown.
+    pub remote_chip_strip_rect: Rect,
+    /// Per-chip hit rects, parallel to `AppState::remote_chips`.
+    pub remote_chip_hit_areas: Vec<Rect>,
+    /// The `add` affordance in the strip header.
+    pub remote_add_hit_area: Rect,
     pub workspace_card_areas: Vec<WorkspaceCardArea>,
     pub tab_bar_rect: Rect,
     pub tab_hit_areas: Vec<Rect>,
@@ -1417,6 +1497,16 @@ pub struct AppState {
     pub selected: usize,
     pub mode: Mode,
     pub should_quit: bool,
+    /// True when this AppState is composed by the pure fleet client: menu
+    /// entries whose effects only exist server-side (settings, reload
+    /// config) are omitted, and detach means "exit the fleet client".
+    pub pure_client: bool,
+    /// True when the composed fleet is the one described by the fleet config
+    /// file, so saving a remote is a config edit the running fleet can be
+    /// reconciled against. False for an ephemeral `--remote` fleet-of-one:
+    /// its single remote is not in the config and lives at index 0, where a
+    /// reconcile puts the local runtime, so remotes cannot be added there.
+    pub fleet_config_backed: bool,
     /// In monolithic --no-session mode, detach exits the app because there is no server to detach from.
     pub detach_exits: bool,
     /// Set when the current client should detach from the persistent session.
@@ -1432,6 +1522,11 @@ pub struct AppState {
     pub request_submit_worktree_open: bool,
     pub request_submit_worktree_remove: bool,
     pub request_reload_config: bool,
+    /// Set when the user asked to add a fleet remote from the global menu.
+    /// The add-remote dialog is client chrome that `AppState` cannot reach,
+    /// so the owning pure-client loop drains this into the dialog. Only the
+    /// pure client offers the entry that sets it.
+    pub request_add_remote: bool,
     /// Set when the headless server should ask attached clients to reload
     /// their client-local sound config from disk.
     pub request_client_config_reload: bool,
@@ -1447,6 +1542,11 @@ pub struct AppState {
     pub worktree_remove: Option<WorktreeRemoveState>,
     pub worktree_directory: std::path::PathBuf,
     pub collapsed_space_keys: std::collections::HashSet<String>,
+    /// Fleet chip strip model (pure client only). Empty means no strip.
+    pub remote_chips: Vec<RemoteChipState>,
+    /// Per-space remote attribution, parallel to `workspaces` when two or
+    /// more remotes are in view. Empty means no attribution (today's look).
+    pub workspace_remote_tags: Vec<RemoteTag>,
     pub request_complete_onboarding: bool,
     pub name_input: String,
     pub name_input_replace_on_type: bool,
@@ -1711,6 +1811,109 @@ impl AppState {
         terminal_runtimes.get(terminal_id)
     }
 
+    /// Read-only pane content lookup for the UI layer: same resolution as
+    /// [`Self::runtime_for_pane_in_workspace`], but through the
+    /// [`crate::terminal::PaneContentSource`] seam so callers do not name the
+    /// runtime registry.
+    pub(crate) fn content_for_pane_in_workspace<'a>(
+        &'a self,
+        content: &'a dyn crate::terminal::PaneContentSource,
+        ws_idx: usize,
+        pane_id: crate::layout::PaneId,
+    ) -> Option<&'a dyn crate::terminal::PaneContent> {
+        #[cfg(test)]
+        if let Some(runtime) = self.workspaces.get(ws_idx)?.test_runtimes.get(&pane_id) {
+            return Some(runtime);
+        }
+        #[cfg(test)]
+        if let Some(runtime) = self
+            .workspaces
+            .get(ws_idx)?
+            .tabs
+            .iter()
+            .find_map(|tab| tab.runtimes.get(&pane_id))
+        {
+            return Some(runtime);
+        }
+        let terminal_id = self.workspaces.get(ws_idx)?.terminal_id(pane_id)?;
+        content.pane_content(terminal_id)
+    }
+
+    /// Applies pane resizes planned by `compute_view` to live runtimes.
+    ///
+    /// In tests, panes backed by test runtimes are resized through the same
+    /// lookup `compute_view` used, so geometry-driven resize semantics stay
+    /// identical to when `compute_view` resized panes itself.
+    pub(crate) fn apply_pane_resize_requests(
+        &self,
+        terminal_runtimes: &crate::terminal::TerminalRuntimeRegistry,
+        requests: &[crate::terminal::PaneResizeRequest],
+        cell_size: crate::kitty_graphics::HostCellSize,
+    ) {
+        for request in requests {
+            #[cfg(test)]
+            if let Some(runtime) = self.test_runtime_for_terminal(&request.terminal_id) {
+                runtime.resize(
+                    request.rows,
+                    request.cols,
+                    cell_size.width_px,
+                    cell_size.height_px,
+                );
+                continue;
+            }
+            if let Some(runtime) = terminal_runtimes.get(&request.terminal_id) {
+                runtime.resize(
+                    request.rows,
+                    request.cols,
+                    cell_size.width_px,
+                    cell_size.height_px,
+                );
+            }
+        }
+    }
+
+    /// Applies planned pane resizes to test runtimes only, for pure-state
+    /// tests that call `compute_view` without a runtime registry.
+    #[cfg(test)]
+    pub(crate) fn apply_pane_resize_requests_to_test_runtimes(
+        &self,
+        requests: &[crate::terminal::PaneResizeRequest],
+    ) {
+        let cell_size = crate::kitty_graphics::HostCellSize::default();
+        for request in requests {
+            if let Some(runtime) = self.test_runtime_for_terminal(&request.terminal_id) {
+                runtime.resize(
+                    request.rows,
+                    request.cols,
+                    cell_size.width_px,
+                    cell_size.height_px,
+                );
+            }
+        }
+    }
+
+    /// Test-runtime lookup by terminal id, mirroring the pane-id based test
+    /// fallbacks in [`Self::runtime_for_pane_in_workspace`].
+    #[cfg(test)]
+    fn test_runtime_for_terminal(
+        &self,
+        terminal_id: &crate::terminal::TerminalId,
+    ) -> Option<&crate::terminal::TerminalRuntime> {
+        self.workspaces.iter().find_map(|ws| {
+            ws.tabs.iter().find_map(|tab| {
+                tab.layout.pane_ids().into_iter().find_map(|pane_id| {
+                    (tab.terminal_id(pane_id) == Some(terminal_id))
+                        .then(|| {
+                            ws.test_runtimes
+                                .get(&pane_id)
+                                .or_else(|| tab.runtimes.get(&pane_id))
+                        })
+                        .flatten()
+                })
+            })
+        })
+    }
+
     #[cfg(test)]
     pub(crate) fn runtime_for_pane<'a>(
         &'a self,
@@ -1779,10 +1982,14 @@ pub fn key_matches(
 // Test helpers
 // ---------------------------------------------------------------------------
 
-#[cfg(test)]
 impl AppState {
-    /// Create an AppState for testing — no channels, no PTYs.
-    pub fn test_new() -> Self {
+    /// Plain empty AppState with default chrome and the dark palette — no
+    /// channels, no PTYs. Base state for tests, and for the pure client,
+    /// which projects the server catalog into it and applies config-derived
+    /// presentation on top.
+    // Consumed in production only by the unix-only pure-client run path (#20).
+    #[cfg_attr(windows, allow(dead_code))]
+    pub(crate) fn empty() -> Self {
         Self {
             terminals: std::collections::HashMap::new(),
             direct_attach_resize_locks: std::collections::HashSet::new(),
@@ -1794,6 +2001,8 @@ impl AppState {
             selected: 0,
             mode: Mode::Navigate,
             should_quit: false,
+            pure_client: false,
+            fleet_config_backed: false,
             detach_exits: false,
             detach_requested: false,
             request_new_workspace: false,
@@ -1806,6 +2015,7 @@ impl AppState {
             request_submit_worktree_open: false,
             request_submit_worktree_remove: false,
             request_reload_config: false,
+            request_add_remote: false,
             request_client_config_reload: false,
             request_clipboard_write: None,
             creating_new_tab: false,
@@ -1817,6 +2027,8 @@ impl AppState {
             worktree_remove: None,
             worktree_directory: std::path::PathBuf::from("/tmp/herdr-worktrees"),
             collapsed_space_keys: std::collections::HashSet::new(),
+            remote_chips: Vec::new(),
+            workspace_remote_tags: Vec::new(),
             request_complete_onboarding: false,
             name_input: String::new(),
             name_input_replace_on_type: false,
@@ -1833,6 +2045,9 @@ impl AppState {
             view: ViewState {
                 layout: ViewLayout::Desktop,
                 sidebar_rect: Rect::default(),
+                remote_chip_strip_rect: Rect::default(),
+                remote_chip_hit_areas: Vec::new(),
+                remote_add_hit_area: Rect::default(),
                 workspace_card_areas: Vec::new(),
                 tab_bar_rect: Rect::default(),
                 tab_hit_areas: Vec::new(),
@@ -1950,7 +2165,14 @@ impl AppState {
             terminal_runtime_shutdowns: Vec::new(),
         }
     }
+}
 
+#[cfg(test)]
+impl AppState {
+    /// Create an AppState for testing — no channels, no PTYs.
+    pub fn test_new() -> Self {
+        Self::empty()
+    }
     /// Populate missing `TerminalState` entries for every pane so tests that
     /// read or write terminal metadata don't need to manually create them.
     pub fn ensure_test_terminals(&mut self) {

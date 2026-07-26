@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::fmt;
-use std::io::{self, IsTerminal, Read, Write};
+use std::io::{self, IsTerminal, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -203,7 +203,7 @@ fn plugin_install(args: &[String]) -> std::io::Result<i32> {
         let mut source_info =
             source.to_source_info(requested_ref, resolved_commit, None, current_unix_ms());
         print_install_preview(&preview_plugin, &source_info, existing.as_ref());
-        if !yes && !confirm("Install this plugin?")? {
+        if !yes && !super::confirm("Install this plugin?")? {
             eprintln!("plugin install cancelled");
             return Ok(0);
         }
@@ -1548,14 +1548,6 @@ fn plugin_platform_name(platform: PluginPlatform) -> &'static str {
     }
 }
 
-fn confirm(prompt: &str) -> std::io::Result<bool> {
-    eprint!("{prompt} [y/N] ");
-    io::stderr().flush()?;
-    let mut line = String::new();
-    io::stdin().read_line(&mut line)?;
-    Ok(matches!(line.trim(), "y" | "Y" | "yes" | "YES" | "Yes"))
-}
-
 fn create_plugin_temp_dir(label: &str) -> std::io::Result<PathBuf> {
     let path = crate::plugin_paths::managed_plugins_dir().join(format!(
         ".tmp-{label}-{}-{}",
@@ -1618,7 +1610,7 @@ fn current_unix_ms() -> u64 {
         .unwrap_or(0)
 }
 
-fn is_connection_error(err: &std::io::Error) -> bool {
+pub(super) fn is_connection_error(err: &std::io::Error) -> bool {
     matches!(
         err.kind(),
         std::io::ErrorKind::NotFound

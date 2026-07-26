@@ -16,6 +16,7 @@ mod notification;
 mod pane;
 mod plugin;
 mod protocol_guard;
+mod remote;
 mod runtime;
 mod server;
 mod spec;
@@ -50,6 +51,17 @@ pub(crate) fn parse_env_assignment(raw: &str) -> Result<(String, String), String
         return Err("env must not contain NUL bytes".into());
     }
     Ok((key.to_string(), value.to_string()))
+}
+
+/// Shared yes/no prompt for commands that change something on disk or on a
+/// remote host. Defaults to no.
+pub(crate) fn confirm(prompt: &str) -> std::io::Result<bool> {
+    use std::io::Write as _;
+    eprint!("{prompt} [y/N] ");
+    std::io::stderr().flush()?;
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line)?;
+    Ok(matches!(line.trim(), "y" | "Y" | "yes" | "YES" | "Yes"))
 }
 
 pub enum CommandOutcome {
@@ -99,6 +111,7 @@ pub fn maybe_run(args: &[String]) -> std::io::Result<CommandOutcome> {
         "plugin" => plugin::run_plugin_command(&args[2..])?,
         "integration" => integration::run_integration_command(&args[2..])?,
         "session" => run_session_command(&args[2..])?,
+        "remote" => remote::run_remote_command(&args[2..])?,
         _ => return Ok(CommandOutcome::NotCli),
     };
 

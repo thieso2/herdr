@@ -313,6 +313,21 @@ pub struct TerminalScrollbar {
     pub len: usize,
 }
 
+/// Seed material for a pane stream client replica: a state-carrying ANSI
+/// snapshot of the active screen area plus the content-only, unwrapped
+/// scrollback history above it. See [`Terminal::stream_seed`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TerminalStreamSeed {
+    /// Active screen area with mode/cursor/style state appended.
+    pub snapshot: String,
+    /// Unwrapped, content-only scrollback above the active area.
+    pub history: String,
+    /// Terminal width at capture time.
+    pub cols: u16,
+    /// Terminal height at capture time.
+    pub rows: u16,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CursorViewport {
     pub x: u16,
@@ -1129,6 +1144,98 @@ impl Terminal {
         )
     }
 
+    /// Reads a screen range as VT output plus terminal state reconstruction
+    /// sequences: non-default modes are emitted before the content and the
+    /// cursor position, SGR style, hyperlink, charset, keyboard, and
+    /// scrolling-region state after it, so replaying the result into a fresh
+    /// terminal of the same size reproduces both content and live state.
+    ///
+    /// The host palette and pwd are intentionally excluded: replicas apply
+    /// their own theme, and pwd tracking stays with the authoritative pane.
+    pub fn read_ansi_screen_with_state(
+        &self,
+        start: (u16, u32),
+        end: (u16, u32),
+        unwrap: bool,
+    ) -> Result<String, Error> {
+        let extra = ffi::GhosttyFormatterTerminalExtra {
+            size: mem::size_of::<ffi::GhosttyFormatterTerminalExtra>(),
+            palette: false,
+            modes: true,
+            scrolling_region: true,
+            tabstops: false,
+            pwd: false,
+            keyboard: true,
+            screen: ffi::GhosttyFormatterScreenExtra {
+                size: mem::size_of::<ffi::GhosttyFormatterScreenExtra>(),
+                cursor: true,
+                style: true,
+                hyperlink: true,
+                protection: true,
+                kitty_keyboard: true,
+                charsets: true,
+            },
+        };
+        self.read_formatted_selection_with_extra(
+            ghostty_screen_point(start.0, start.1),
+            ghostty_screen_point(end.0, end.1),
+            false,
+            FormatterFormat::Vt,
+            unwrap,
+            true,
+            extra,
+        )
+    }
+
+    /// Captures the seed a pane stream client needs to replicate this
+    /// terminal: a state-carrying snapshot of the active screen area and the
+    /// content-only, unwrapped scrollback history above it.
+    ///
+    /// The snapshot alone carries mode/cursor state; the history never
+    /// re-asserts modes, so prepending it during a replica rebuild cannot
+    /// disturb live terminal state. History is unwrapped so rebuilds reflow
+    /// correctly after width changes. On the alternate screen the history is
+    /// empty: the alternate screen has no scrollback.
+    pub fn stream_seed(&self) -> Result<TerminalStreamSeed, Error> {
+        let cols = self.cols()?;
+        let rows = self.rows()?;
+        if cols == 0 || rows == 0 {
+            return Ok(TerminalStreamSeed {
+                snapshot: String::new(),
+                history: String::new(),
+                cols,
+                rows,
+            });
+        }
+        let scrollbar = self.scrollbar()?;
+        let active_top = scrollbar.total.saturating_sub(scrollbar.len);
+        let last_row = u32::try_from(scrollbar.total.saturating_sub(1)).unwrap_or(u32::MAX);
+        let snapshot = self.read_ansi_screen_with_state(
+            (0, u32::try_from(active_top).unwrap_or(u32::MAX)),
+            (cols.saturating_sub(1), last_row),
+            true,
+        )?;
+        let history = if active_top > 0 {
+            self.read_ansi_screen(
+                (0, 0),
+                (
+                    cols.saturating_sub(1),
+                    u32::try_from(active_top - 1).unwrap_or(u32::MAX),
+                ),
+                false,
+                true,
+            )?
+        } else {
+            String::new()
+        };
+        Ok(TerminalStreamSeed {
+            snapshot,
+            history,
+            cols,
+            rows,
+        })
+    }
+
     pub fn keyboard_state_ansi(&self) -> Result<String, Error> {
         self.format_keyboard_state_ansi(false)
     }
@@ -1196,6 +1303,28 @@ impl Terminal {
         unwrap: bool,
         trim: bool,
     ) -> Result<String, Error> {
+        let extra = ffi::GhosttyFormatterTerminalExtra {
+            size: mem::size_of::<ffi::GhosttyFormatterTerminalExtra>(),
+            screen: ffi::GhosttyFormatterScreenExtra {
+                size: mem::size_of::<ffi::GhosttyFormatterScreenExtra>(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        self.read_formatted_selection_with_extra(start, end, rectangle, format, unwrap, trim, extra)
+    }
+
+    #[allow(clippy::too_many_arguments)] // internal seam; public wrappers narrow it
+    fn read_formatted_selection_with_extra(
+        &self,
+        start: ffi::GhosttyPoint,
+        end: ffi::GhosttyPoint,
+        rectangle: bool,
+        format: FormatterFormat,
+        unwrap: bool,
+        trim: bool,
+        extra: ffi::GhosttyFormatterTerminalExtra,
+    ) -> Result<String, Error> {
         let mut start_ref = ffi::GhosttyGridRef {
             size: mem::size_of::<ffi::GhosttyGridRef>(),
             ..Default::default()
@@ -1221,14 +1350,7 @@ impl Terminal {
             emit: format.as_raw(),
             unwrap,
             trim,
-            extra: ffi::GhosttyFormatterTerminalExtra {
-                size: mem::size_of::<ffi::GhosttyFormatterTerminalExtra>(),
-                screen: ffi::GhosttyFormatterScreenExtra {
-                    size: mem::size_of::<ffi::GhosttyFormatterScreenExtra>(),
-                    ..Default::default()
-                },
-                ..Default::default()
-            },
+            extra,
             selection: &selection,
         };
         unsafe {
@@ -3620,6 +3742,53 @@ mod tests {
             terminal.viewport_hyperlink_uri(0, 0).unwrap().as_deref(),
             Some("https://example.com")
         );
+    }
+
+    #[test]
+    fn stream_seed_splits_state_carrying_snapshot_from_content_only_history() {
+        let mut terminal = Terminal::new(20, 3, 1_000_000).unwrap();
+        write_numbered_lines(&mut terminal, 50);
+        terminal.write(b"\x1b[?2004h\x1b[31mred");
+        let seed = terminal.stream_seed().unwrap();
+        assert_eq!((seed.cols, seed.rows), (20, 3));
+
+        // The snapshot alone re-asserts modes; history never does.
+        assert!(seed.snapshot.contains("\x1b[?2004h"));
+        assert!(!seed.history.contains("\x1b[?"));
+        assert!(seed.history.starts_with("000000\r\n"));
+        // History covers exactly the scrolled-out rows: nothing from the
+        // active area, nothing missing above it. The 50 numbered lines plus
+        // the "red" row put rows 000000..000047 above the 3-row screen.
+        assert!(!seed.history.contains("red"));
+        assert!(seed.history.contains("000047"));
+        assert!(!seed.history.contains("000048"));
+
+        // Replaying the seed into a fresh terminal reproduces screen text
+        // and live modes.
+        let mut replica = Terminal::new(20, 3, 1_000_000).unwrap();
+        replica.write(seed.snapshot.as_bytes());
+        assert!(replica.mode_get(2004).unwrap());
+        assert_eq!(
+            replica.read_text_viewport((0, 0), (19, 2), false).unwrap(),
+            terminal.read_text_viewport((0, 0), (19, 2), false).unwrap()
+        );
+
+        // On the alternate screen the history is empty (alt has no
+        // scrollback) and the snapshot re-enters the alternate screen.
+        terminal.write(b"\x1b[?1049h\x1b[HALT");
+        let alt_seed = terminal.stream_seed().unwrap();
+        assert!(alt_seed.history.is_empty());
+        assert!(alt_seed.snapshot.contains("\x1b[?1049h"));
+        let mut alt_replica = Terminal::new(20, 3, 1_000_000).unwrap();
+        alt_replica.write(alt_seed.snapshot.as_bytes());
+        assert_eq!(
+            alt_replica.active_screen().unwrap(),
+            ActiveScreen::Alternate
+        );
+        assert!(alt_replica
+            .read_text_viewport((0, 0), (3, 0), false)
+            .unwrap()
+            .starts_with("ALT"));
     }
 
     #[test]

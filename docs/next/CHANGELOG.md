@@ -4,6 +4,7 @@
 
 ### Changed
 - Relicensed Herdr from AGPL-3.0-or-later to Apache-2.0.
+- `terminal attach`, `agent attach`, and `terminal session control|observe` now speak the framed runtime protocol on the API socket, streaming the pane snapshot and raw output tail instead of server-rendered frames. Writable attach ownership is a pane write grant that reports `pane_write_locked` instead of dropping the connection; `--takeover` revokes the previous holder without disturbing its connection. Older servers keep working through the previous attach path.
 
 ### Fixed
 - `ui.copy_on_select = false` now retains drag and double-click word selections without copying; `Ctrl+C`, or `Cmd+C` when the host terminal forwards it, copies and clears the selection.

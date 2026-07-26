@@ -135,6 +135,12 @@
           "type": "color",
           "default": "unset",
           "description": "Override the peach color token on top of the base theme. Accepts hex, named colors, rgb(r,g,b), or reset aliases."
+        },
+        {
+          "key": "theme.custom.remote_hues",
+          "type": "array of color",
+          "default": "unset",
+          "description": "Identity hues for fleet remotes, assigned by fleet config order (index 0 is the local runtime) and cycled when remotes outnumber hues. Each entry accepts hex, named colors, rgb(r,g,b), or reset aliases. When unset, a default list derived from the theme's non-state colors is used."
         }
       ]
     },
@@ -1082,6 +1088,12 @@
           "type": "boolean",
           "default": "false",
           "description": "Persist pane screen history to session-history.json."
+        },
+        {
+          "key": "experimental.pure_client",
+          "type": "boolean",
+          "default": "false",
+          "description": "Run the TUI as a pure client of the local server: the sidebar is driven by the server's session catalog, pane content renders from streamed replicas, and input is interpreted client-side into control-plane methods."
         },
         {
           "key": "experimental.reveal_hidden_cursor_for_cjk_ime",

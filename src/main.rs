@@ -62,9 +62,14 @@ mod build_info;
 mod checksum;
 mod cli;
 mod client;
+// The pure-client run path is unix-only; Windows compiles the mirror for
+// future use but has no production consumer of it yet (#20).
+#[cfg_attr(windows, allow(dead_code))]
+mod client_state;
 mod config;
 mod detect;
 mod events;
+mod fleet;
 mod ghostty;
 mod handoff_runtime;
 mod input;
@@ -396,6 +401,10 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # kitty_graphics = false
 # Save recent pane screen history across full server restarts.
 pane_history = false
+# Run the TUI as a pure client of the local server (unified protocol).
+# Unset uses the release default (currently the legacy client path); an
+# explicit true/false pins your choice across default changes.
+# pure_client = false
 # While prefix mode is active, temporarily switch the macOS host input
 # source to an ASCII-capable keyboard layout so prefix commands register
 # even when a CJK IME is active, then restore the previous input source
@@ -496,6 +505,11 @@ fn main() -> io::Result<()> {
         return remote::run_remote_client_bridge();
     }
 
+    // Far side of an SSH fleet bridge: pump stdio to the API socket.
+    if args.get(1).map(|s| s.as_str()) == Some("bridge") {
+        return fleet::bridge::run_bridge();
+    }
+
     if args.get(1).map(|s| s.as_str()) == Some("server") {
         return server::headless::run_server();
     }
@@ -556,6 +570,7 @@ fn main() -> io::Result<()> {
         println!("       herdr agent <subcommand> ...");
         println!("       herdr pane <subcommand> ...");
         println!("       herdr session <subcommand> ...");
+        println!("       herdr remote <subcommand> ...");
         println!("       herdr integration <subcommand> ...");
         println!();
         println!("Common commands:");
@@ -617,6 +632,10 @@ fn main() -> io::Result<()> {
                 "Manage named persistent sessions",
             ),
             (
+                "herdr remote <subcommand>",
+                "Manage fleet remotes and their connections",
+            ),
+            (
                 "herdr integration <subcommand>",
                 "Manage built-in agent integrations",
             ),
@@ -626,6 +645,10 @@ fn main() -> io::Result<()> {
         println!();
         println!("Advanced commands:");
         println!("  {:<32} Run as headless server", "herdr server");
+        println!(
+            "  {:<32} Far side of an SSH fleet bridge (run via ssh)",
+            "herdr bridge"
+        );
         println!();
         println!("Options:");
         println!("  --no-session        Run monolithically (no server/client, escape hatch)");
@@ -679,6 +702,8 @@ fn main() -> io::Result<()> {
                 "server",
                 "client",
                 "remote-client-bridge",
+                "bridge",
+                "remote",
                 "update",
                 "status",
                 "config",

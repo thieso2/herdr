@@ -5,7 +5,10 @@ use crate::{
     input::TerminalKey,
 };
 
-fn is_retained_selection_copy_key(key: TerminalKey) -> bool {
+/// The keyboard shortcut that copies a retained (finalized) selection when
+/// copy_on_select is off. Shared with the pure client's terminal-mode key
+/// interception so both clients copy on the same chords.
+pub(crate) fn is_retained_selection_copy_key(key: TerminalKey) -> bool {
     matches!(key.code, KeyCode::Char('c' | 'C'))
         && matches!(key.modifiers, KeyModifiers::CONTROL | KeyModifiers::SUPER)
 }

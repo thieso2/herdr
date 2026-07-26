@@ -12,7 +12,9 @@
 //! - Forwards OSC 52 clipboard writes from server to its own stdout
 //! - Displays sound/toast notifications forwarded from server
 
-mod input;
+mod framed_attach;
+mod host_terminal;
+pub(crate) mod input;
 
 use std::collections::HashSet;
 use std::io::{self, BufRead, Write as _};
@@ -21,20 +23,20 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use base64::Engine;
-use crossterm::event::{
-    DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
-    EnableFocusChange, EnableMouseCapture,
-};
 #[cfg(unix)]
 use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers, MouseEventKind};
-#[cfg(not(windows))]
-use crossterm::event::{PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags};
-use crossterm::execute;
-use crossterm::terminal::{DisableLineWrap, EnableLineWrap};
 use interprocess::local_socket::traits::Stream as _;
 use interprocess::TryClone as _;
 use tracing::{debug, info, warn};
 
+#[cfg(windows)]
+use self::host_terminal::{
+    enable_windows_virtual_terminal_input, windows_vti_input_backend_enabled,
+};
+use self::host_terminal::{
+    query_host_terminal_theme, restore_terminal_state, set_mouse_capture,
+    setup_direct_attach_terminal, setup_terminal, should_query_host_terminal_theme,
+};
 use crate::ipc::LocalStream;
 use crate::protocol::render_ansi;
 #[cfg(unix)]
@@ -328,136 +330,6 @@ impl From<protocol::FramingError> for ClientError {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Terminal setup / restore
-// ---------------------------------------------------------------------------
-
-/// Sets up the terminal for client mode (raw mode, optional mouse, keyboard enhancements).
-///
-/// Returns a guard that restores the terminal when dropped.
-fn setup_terminal(mouse_capture: bool) -> io::Result<TerminalGuard> {
-    setup_terminal_with_capabilities(true, mouse_capture)
-}
-
-/// Sets up a direct attach terminal.
-///
-/// Direct attach forwards stdin to the attached PTY. It enables mouse capture
-/// so wheel events can drive the attached viewport or be forwarded to child
-/// programs that requested mouse input.
-fn setup_direct_attach_terminal() -> io::Result<TerminalGuard> {
-    setup_terminal_with_capabilities(false, true)
-}
-
-fn setup_terminal_with_capabilities(
-    enable_client_protocols: bool,
-    mouse_capture: bool,
-) -> io::Result<TerminalGuard> {
-    ratatui::init();
-    crate::terminal_modes::clear_host_mouse_reporting(&mut io::stdout())?;
-    let host_color_scheme_reports =
-        should_enable_host_color_scheme_reports(enable_client_protocols);
-
-    if enable_client_protocols {
-        if mouse_capture {
-            set_mouse_capture(true)?;
-        } else {
-            set_mouse_capture(false)?;
-        }
-        execute!(io::stdout(), EnableBracketedPaste, EnableFocusChange)?;
-        if host_color_scheme_reports {
-            write_host_color_scheme_report_mode(&mut io::stdout(), true)?;
-        }
-        push_keyboard_enhancement_flags()?;
-    } else {
-        if should_query_host_terminal_theme() {
-            write_host_color_scheme_report_mode(&mut io::stdout(), false)?;
-        }
-        if mouse_capture {
-            set_mouse_capture(true)?;
-        } else {
-            set_mouse_capture(false)?;
-        }
-    }
-
-    #[cfg(windows)]
-    let windows_virtual_terminal_input =
-        if enable_client_protocols && windows_vti_input_backend_enabled() {
-            enable_windows_virtual_terminal_input()
-        } else {
-            WindowsVirtualTerminalInputSetup::default()
-        };
-
-    #[cfg(windows)]
-    if enable_client_protocols
-        && windows_vti_input_backend_enabled()
-        && windows_virtual_terminal_input.active
-        && windows_win32_input_mode_enabled()
-    {
-        if let Err(err) = enable_windows_win32_input_mode(&mut io::stdout()) {
-            if let Some(mode) = windows_virtual_terminal_input.restore_mode {
-                restore_windows_input_mode_value(mode);
-            }
-            return Err(err);
-        }
-    }
-
-    let modify_other_keys_mode = enable_client_protocols
-        .then(crate::input::host_modify_other_keys_mode)
-        .flatten();
-    if let Some(mode) = modify_other_keys_mode {
-        io::stdout().write_all(mode.set_sequence())?;
-        io::stdout().flush()?;
-    }
-
-    execute!(io::stdout(), DisableLineWrap)?;
-
-    Ok(TerminalGuard {
-        reset_modify_other_keys: modify_other_keys_mode.is_some(),
-        reset_host_color_scheme_reports: host_color_scheme_reports,
-        #[cfg(windows)]
-        restore_windows_input_mode: windows_virtual_terminal_input.restore_mode,
-    })
-}
-
-fn should_enable_host_color_scheme_reports(enable_client_protocols: bool) -> bool {
-    enable_client_protocols && should_query_host_terminal_theme()
-}
-
-/// Guard that restores the terminal when dropped.
-struct TerminalGuard {
-    reset_modify_other_keys: bool,
-    reset_host_color_scheme_reports: bool,
-    #[cfg(windows)]
-    restore_windows_input_mode: Option<u32>,
-}
-
-fn write_host_color_scheme_report_mode(
-    writer: &mut impl io::Write,
-    enabled: bool,
-) -> io::Result<()> {
-    let sequence = if enabled {
-        crate::terminal_theme::HOST_COLOR_SCHEME_REPORT_ENABLE_SEQUENCE
-    } else {
-        crate::terminal_theme::HOST_COLOR_SCHEME_REPORT_DISABLE_SEQUENCE
-    };
-    writer.write_all(sequence.as_bytes())?;
-    writer.flush()
-}
-
-fn write_terminal_restore_postlude(
-    writer: &mut impl io::Write,
-    reset_host_color_scheme_reports: bool,
-) -> io::Result<()> {
-    if reset_host_color_scheme_reports {
-        writer.write_all(
-            crate::terminal_theme::HOST_COLOR_SCHEME_REPORT_DISABLE_SEQUENCE.as_bytes(),
-        )?;
-    }
-    // Restore a visible cursor and reset DECSCUSR back to the terminal default.
-    writer.write_all(b"\x1b[?25h\x1b[0 q")?;
-    writer.flush()
-}
-
 fn should_draw_host_cursor(mode: crate::config::HostCursorModeConfig) -> bool {
     match mode {
         crate::config::HostCursorModeConfig::Auto => {
@@ -465,194 +337,6 @@ fn should_draw_host_cursor(mode: crate::config::HostCursorModeConfig) -> bool {
         }
         crate::config::HostCursorModeConfig::Native => false,
         crate::config::HostCursorModeConfig::Drawn => true,
-    }
-}
-
-#[cfg(windows)]
-#[derive(Default)]
-struct WindowsVirtualTerminalInputSetup {
-    active: bool,
-    restore_mode: Option<u32>,
-}
-
-#[cfg(windows)]
-fn enable_windows_virtual_terminal_input() -> WindowsVirtualTerminalInputSetup {
-    use windows_sys::Win32::Foundation::{HANDLE, INVALID_HANDLE_VALUE};
-    use windows_sys::Win32::System::Console::{
-        GetConsoleMode, GetStdHandle, SetConsoleMode, ENABLE_VIRTUAL_TERMINAL_INPUT,
-        STD_INPUT_HANDLE,
-    };
-
-    let handle: HANDLE = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
-    if handle.is_null() || handle == INVALID_HANDLE_VALUE {
-        tracing::warn!("failed to get Windows console input handle for VT input");
-        return WindowsVirtualTerminalInputSetup::default();
-    }
-
-    let mut mode = 0;
-    if unsafe { GetConsoleMode(handle, &mut mode) } == 0 {
-        tracing::warn!("failed to read Windows console input mode for VT input");
-        return WindowsVirtualTerminalInputSetup::default();
-    }
-
-    let desired = windows_virtual_terminal_input_mode(mode);
-    if desired == mode {
-        return WindowsVirtualTerminalInputSetup {
-            active: true,
-            restore_mode: None,
-        };
-    }
-
-    if unsafe { SetConsoleMode(handle, desired) } == 0 {
-        tracing::warn!("failed to enable Windows virtual terminal input");
-        return WindowsVirtualTerminalInputSetup::default();
-    }
-
-    let mut applied = 0;
-    if unsafe { GetConsoleMode(handle, &mut applied) } == 0 {
-        tracing::warn!("failed to verify Windows virtual terminal input mode");
-        let _ = unsafe { SetConsoleMode(handle, mode) };
-        return WindowsVirtualTerminalInputSetup::default();
-    }
-    if applied & ENABLE_VIRTUAL_TERMINAL_INPUT == 0 {
-        tracing::warn!("Windows virtual terminal input bit did not stick");
-        let _ = unsafe { SetConsoleMode(handle, mode) };
-        return WindowsVirtualTerminalInputSetup::default();
-    }
-
-    WindowsVirtualTerminalInputSetup {
-        active: true,
-        restore_mode: Some(mode),
-    }
-}
-
-#[cfg(windows)]
-fn windows_vti_input_backend_enabled() -> bool {
-    std::env::var("HERDR_WINDOWS_INPUT_BACKEND")
-        .map(|backend| !backend.eq_ignore_ascii_case("crossterm"))
-        .unwrap_or(true)
-}
-
-#[cfg(any(windows, test))]
-fn windows_virtual_terminal_input_mode(mode: u32) -> u32 {
-    mode | 0x0200
-}
-
-#[cfg(windows)]
-fn restore_windows_input_mode_value(mode: u32) {
-    use windows_sys::Win32::Foundation::{HANDLE, INVALID_HANDLE_VALUE};
-    use windows_sys::Win32::System::Console::{GetStdHandle, SetConsoleMode, STD_INPUT_HANDLE};
-
-    let handle: HANDLE = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
-    if handle.is_null() || handle == INVALID_HANDLE_VALUE {
-        return;
-    }
-    if unsafe { SetConsoleMode(handle, mode) } == 0 {
-        tracing::warn!("failed to restore Windows console input mode");
-    }
-}
-
-fn set_mouse_capture(enabled: bool) -> io::Result<()> {
-    crate::terminal_modes::clear_host_mouse_reporting(&mut io::stdout())?;
-    if enabled {
-        execute!(io::stdout(), EnableMouseCapture)
-    } else {
-        match execute!(io::stdout(), DisableMouseCapture) {
-            Ok(()) => Ok(()),
-            #[cfg(windows)]
-            Err(err) if err.to_string() == "Initial console modes not set" => Ok(()),
-            Err(err) => Err(err),
-        }
-    }
-}
-
-fn restore_terminal_state(
-    reset_modify_other_keys: bool,
-    reset_host_color_scheme_reports: bool,
-    #[cfg(windows)] restore_windows_input_mode: Option<u32>,
-) {
-    let _ = clear_received_kitty_graphics(&mut io::stdout());
-
-    // Reset modifyOtherKeys if we enabled it.
-    if reset_modify_other_keys {
-        let _ = io::stdout().write_all(b"\x1b[>4;0m");
-        let _ = io::stdout().flush();
-    }
-
-    let _ = pop_keyboard_enhancement_flags();
-
-    let _ = execute!(
-        io::stdout(),
-        EnableLineWrap,
-        DisableFocusChange,
-        DisableBracketedPaste,
-        DisableMouseCapture
-    );
-    let _ = crate::terminal_modes::clear_host_mouse_reporting(&mut io::stdout());
-    #[cfg(windows)]
-    if let Some(mode) = restore_windows_input_mode {
-        restore_windows_input_mode_value(mode);
-    }
-
-    ratatui::restore();
-    let _ = write_terminal_restore_postlude(&mut io::stdout(), reset_host_color_scheme_reports);
-
-    #[cfg(windows)]
-    if windows_vti_input_backend_enabled() && windows_win32_input_mode_enabled() {
-        let _ = disable_windows_win32_input_mode(&mut io::stdout());
-    }
-}
-
-#[cfg(not(windows))]
-fn push_keyboard_enhancement_flags() -> io::Result<()> {
-    execute!(
-        io::stdout(),
-        PushKeyboardEnhancementFlags(crate::input::ime_compatible_keyboard_enhancement_flags())
-    )
-}
-
-#[cfg(windows)]
-fn push_keyboard_enhancement_flags() -> io::Result<()> {
-    Ok(())
-}
-
-#[cfg(not(windows))]
-fn pop_keyboard_enhancement_flags() -> io::Result<()> {
-    execute!(io::stdout(), PopKeyboardEnhancementFlags)
-}
-
-#[cfg(windows)]
-fn pop_keyboard_enhancement_flags() -> io::Result<()> {
-    Ok(())
-}
-
-#[cfg(windows)]
-fn windows_win32_input_mode_enabled() -> bool {
-    std::env::var("HERDR_WINDOWS_INPUT_PROBE")
-        .map(|probe| probe.eq_ignore_ascii_case("win32"))
-        .unwrap_or(true)
-}
-
-#[cfg(windows)]
-fn enable_windows_win32_input_mode(writer: &mut impl std::io::Write) -> io::Result<()> {
-    writer.write_all(b"\x1b[?9001h")?;
-    writer.flush()
-}
-
-#[cfg(windows)]
-fn disable_windows_win32_input_mode(writer: &mut impl std::io::Write) -> io::Result<()> {
-    writer.write_all(b"\x1b[?9001l")?;
-    writer.flush()
-}
-
-impl Drop for TerminalGuard {
-    fn drop(&mut self) {
-        restore_terminal_state(
-            self.reset_modify_other_keys,
-            self.reset_host_color_scheme_reports,
-            #[cfg(windows)]
-            self.restore_windows_input_mode,
-        );
     }
 }
 
@@ -803,7 +487,7 @@ fn do_handshake(
 // ---------------------------------------------------------------------------
 
 /// Internal events for the client event loop.
-enum ClientLoopEvent {
+pub(crate) enum ClientLoopEvent {
     /// Raw input bytes from stdin.
     #[cfg(unix)]
     StdinInput(Vec<u8>),
@@ -834,14 +518,25 @@ pub fn run_client() -> io::Result<()> {
 }
 
 /// Runs a direct terminal attach client.
+///
+/// Attach speaks the framed pane-stream protocol on the API socket. A server
+/// that does not advertise the `pane-stream` capability (an older build during
+/// an upgrade) falls back to the legacy client-socket attach path.
 #[cfg(unix)]
 pub fn run_terminal_attach(terminal_id: String, takeover: bool) -> io::Result<()> {
-    run_client_with_mode(
-        RenderEncoding::TerminalAnsi,
-        Some((terminal_id, takeover)),
-        Some(AttachEscapeState::default()),
-        "attaching to terminal",
-    )
+    init_logging();
+    match framed_attach::run_framed_attach(&terminal_id, takeover)? {
+        framed_attach::FramedAttachOutcome::Finished => {
+            crate::logging::shutdown("client");
+            Ok(())
+        }
+        framed_attach::FramedAttachOutcome::Unsupported => run_client_with_mode(
+            RenderEncoding::TerminalAnsi,
+            Some((terminal_id, takeover)),
+            Some(AttachEscapeState::default()),
+            "attaching to terminal",
+        ),
+    }
 }
 
 /// Direct terminal attach is Unix raw-byte input only until Windows gets a semantic attach path.
@@ -854,8 +549,23 @@ pub fn run_terminal_attach(_terminal_id: String, _takeover: bool) -> io::Result<
     ))
 }
 
-/// Runs a read-only terminal session observer and prints one JSON envelope per frame.
+/// Runs a read-only terminal session observer and prints one JSON envelope per
+/// output record. Falls back to the legacy stream against servers without the
+/// framed pane-stream capability.
 pub fn run_terminal_session_observe(target: String, cols: u16, rows: u16) -> io::Result<()> {
+    init_logging();
+    match framed_attach::run_framed_session_observe(&target, cols, rows)? {
+        framed_attach::FramedAttachOutcome::Finished => {
+            crate::logging::shutdown("client");
+            Ok(())
+        }
+        framed_attach::FramedAttachOutcome::Unsupported => {
+            run_legacy_terminal_session_observe(target, cols, rows)
+        }
+    }
+}
+
+fn run_legacy_terminal_session_observe(target: String, cols: u16, rows: u16) -> io::Result<()> {
     let mut stream =
         connect_terminal_session_stream(target.clone(), cols, rows, "observing terminal session")?;
     write_to_server(&mut stream, &ClientMessage::ObserveTerminal { target })?;
@@ -864,6 +574,24 @@ pub fn run_terminal_session_observe(target: String, cols: u16, rows: u16) -> io:
 
 /// Runs a writable terminal session controller.
 pub fn run_terminal_session_control(
+    target: String,
+    takeover: bool,
+    cols: u16,
+    rows: u16,
+) -> io::Result<()> {
+    init_logging();
+    match framed_attach::run_framed_session_control(&target, takeover, cols, rows)? {
+        framed_attach::FramedAttachOutcome::Finished => {
+            crate::logging::shutdown("client");
+            Ok(())
+        }
+        framed_attach::FramedAttachOutcome::Unsupported => {
+            run_legacy_terminal_session_control(target, takeover, cols, rows)
+        }
+    }
+}
+
+fn run_legacy_terminal_session_control(
     target: String,
     takeover: bool,
     cols: u16,
@@ -1041,7 +769,47 @@ enum TerminalControlScrollSource {
     PageKey,
 }
 
-fn terminal_control_command_from_json(raw: &str) -> Result<ClientMessage, String> {
+/// Transport-neutral form of one terminal session control command, parsed
+/// from the stdin JSON vocabulary. The framed client turns these into
+/// control-plane requests; the legacy client turns them into wire messages.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum TerminalSessionCommand {
+    Input {
+        data: Vec<u8>,
+    },
+    Resize {
+        cols: u16,
+        rows: u16,
+        cell_width_px: u32,
+        cell_height_px: u32,
+    },
+    Scroll {
+        direction: TerminalSessionScrollDirection,
+        lines: u16,
+        source: TerminalSessionScrollSource,
+        column: Option<u16>,
+        row: Option<u16>,
+        modifiers: u8,
+    },
+    Release,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum TerminalSessionScrollDirection {
+    Up,
+    Down,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum TerminalSessionScrollSource {
+    Wheel,
+    PageKey,
+}
+
+/// Parses one line of the terminal session control JSON vocabulary.
+pub(super) fn terminal_control_command_from_json_value(
+    raw: &str,
+) -> Result<TerminalSessionCommand, String> {
     let command = serde_json::from_str::<TerminalControlCommand>(raw)
         .map_err(|err| format!("invalid json command: {err}"))?;
     match command {
@@ -1056,7 +824,7 @@ fn terminal_control_command_from_json(raw: &str) -> Result<ClientMessage, String
                     .map_err(|err| format!("invalid terminal.input bytes: {err}"))?,
                 (None, None) => Vec::new(),
             };
-            Ok(ClientMessage::Input { data })
+            Ok(TerminalSessionCommand::Input { data })
         }
         TerminalControlCommand::Resize {
             cols,
@@ -1067,7 +835,7 @@ fn terminal_control_command_from_json(raw: &str) -> Result<ClientMessage, String
             if cols == 0 || rows == 0 {
                 return Err("terminal.resize cols and rows must be greater than 0".into());
             }
-            Ok(ClientMessage::Resize {
+            Ok(TerminalSessionCommand::Resize {
                 cols,
                 rows,
                 cell_width_px,
@@ -1085,17 +853,63 @@ fn terminal_control_command_from_json(raw: &str) -> Result<ClientMessage, String
             if lines == 0 {
                 return Err("terminal.scroll lines must be greater than 0".into());
             }
+            Ok(TerminalSessionCommand::Scroll {
+                direction: match direction {
+                    TerminalControlScrollDirection::Up => TerminalSessionScrollDirection::Up,
+                    TerminalControlScrollDirection::Down => TerminalSessionScrollDirection::Down,
+                },
+                lines,
+                source: match source {
+                    TerminalControlScrollSource::Wheel => TerminalSessionScrollSource::Wheel,
+                    TerminalControlScrollSource::PageKey => TerminalSessionScrollSource::PageKey,
+                },
+                column,
+                row,
+                modifiers,
+            })
+        }
+        TerminalControlCommand::Release {} => Ok(TerminalSessionCommand::Release),
+    }
+}
+
+/// Legacy wire mapping of the same command vocabulary.
+fn terminal_control_command_from_json(raw: &str) -> Result<ClientMessage, String> {
+    match terminal_control_command_from_json_value(raw)? {
+        TerminalSessionCommand::Input { data } => Ok(ClientMessage::Input { data }),
+        TerminalSessionCommand::Resize {
+            cols,
+            rows,
+            cell_width_px,
+            cell_height_px,
+        } => Ok(ClientMessage::Resize {
+            cols,
+            rows,
+            cell_width_px,
+            cell_height_px,
+        }),
+        TerminalSessionCommand::Scroll {
+            direction,
+            lines,
+            source,
+            column,
+            row,
+            modifiers,
+        } => {
             let direction = match direction {
-                TerminalControlScrollDirection::Up => AttachScrollDirection::Up,
-                TerminalControlScrollDirection::Down => AttachScrollDirection::Down,
+                TerminalSessionScrollDirection::Up => AttachScrollDirection::Up,
+                TerminalSessionScrollDirection::Down => AttachScrollDirection::Down,
             };
             let source = match source {
-                TerminalControlScrollSource::Wheel => AttachScrollSource::Wheel,
-                TerminalControlScrollSource::PageKey => AttachScrollSource::PageKey {
-                    input: match direction {
-                        AttachScrollDirection::Up => b"\x1b[5~".to_vec(),
-                        AttachScrollDirection::Down => b"\x1b[6~".to_vec(),
-                    },
+                TerminalSessionScrollSource::Wheel => AttachScrollSource::Wheel,
+                TerminalSessionScrollSource::PageKey => AttachScrollSource::PageKey {
+                    input: crate::terminal::pane_scroll::page_key_input(match direction {
+                        AttachScrollDirection::Up => {
+                            crate::terminal::pane_scroll::PaneScrollDirection::Up
+                        }
+                        AttachScrollDirection::Down => {
+                            crate::terminal::pane_scroll::PaneScrollDirection::Down
+                        }
+                    }),
                 },
             };
             Ok(ClientMessage::AttachScroll {
@@ -1107,7 +921,7 @@ fn terminal_control_command_from_json(raw: &str) -> Result<ClientMessage, String
                 modifiers,
             })
         }
-        TerminalControlCommand::Release {} => Ok(ClientMessage::Detach),
+        TerminalSessionCommand::Release => Ok(ClientMessage::Detach),
     }
 }
 
@@ -1120,6 +934,12 @@ fn run_client_with_mode(
     init_logging();
 
     let loaded_config = crate::config::Config::load();
+    #[cfg(unix)]
+    if attach_request.is_none()
+        && crate::client_state::run::pure_client_enabled(&loaded_config.config)
+    {
+        return crate::client_state::run::run_pure_client(&loaded_config.config);
+    }
     crate::terminal_modes::clear_host_mouse_reporting(&mut io::stdout())?;
     let mouse_capture = loaded_config.config.ui.mouse_capture;
     let mouse_scroll_lines = loaded_config.config.ui.mouse_scroll_lines();
@@ -1840,7 +1660,7 @@ fn should_bridge_clipboard_image_paste(
 }
 
 #[cfg(unix)]
-fn read_image_file_from_terminal_drop(
+pub(crate) fn read_image_file_from_terminal_drop(
     data: &[u8],
     is_remote_client: bool,
 ) -> Option<crate::platform::ClipboardImage> {
@@ -1977,8 +1797,28 @@ fn window_title_osc(title: Option<&str>) -> Vec<u8> {
     format!("\x1b]0;{safe_title}\x07").into_bytes()
 }
 
-fn write_window_title(title: Option<&str>) {
+// Shared with the pure-client run path, which selects the focused
+// remote's title client-side.
+pub(crate) fn write_window_title(title: Option<&str>) {
     let _ = io::stdout().write_all(&window_title_osc(title));
+}
+
+/// Pure-client entry into the shared notification delivery policy: maps the
+/// framed event kind onto the legacy delivery kinds and applies the exact
+/// same sound/toast/system-toast handling.
+#[cfg(unix)]
+pub(crate) fn deliver_notification(
+    kind: crate::api::schema::events::NotificationEventKind,
+    message: &str,
+    body: Option<&str>,
+    sound_config: &crate::config::SoundConfig,
+) {
+    let kind = match kind {
+        crate::api::schema::events::NotificationEventKind::Sound => NotifyKind::Sound,
+        crate::api::schema::events::NotificationEventKind::Toast => NotifyKind::Toast,
+        crate::api::schema::events::NotificationEventKind::SystemToast => NotifyKind::SystemToast,
+    };
+    handle_notify(kind, message, body, sound_config);
 }
 
 // ---------------------------------------------------------------------------
@@ -2099,7 +1939,7 @@ fn current_terminal_geometry(kitty_graphics_enabled: bool) -> (u16, u16, u32, u3
 }
 
 /// Polls the terminal size and sends resize events when it changes.
-fn resize_poll_loop(
+pub(crate) fn resize_poll_loop(
     resize_tx: tokio::sync::mpsc::Sender<ClientLoopEvent>,
     initial_cols: u16,
     initial_rows: u16,
@@ -2136,20 +1976,6 @@ fn resize_poll_loop(
 // ---------------------------------------------------------------------------
 
 /// Initialize logging for the client process.
-fn query_host_terminal_theme() {
-    let _ = write_host_terminal_theme_query(io::stdout());
-}
-
-fn should_query_host_terminal_theme() -> bool {
-    !cfg!(windows)
-}
-
-fn write_host_terminal_theme_query(mut writer: impl io::Write) -> io::Result<()> {
-    let query = crate::terminal_theme::host_terminal_theme_query_sequence();
-    writer.write_all(query.as_bytes())?;
-    writer.flush()
-}
-
 fn init_logging() {
     crate::logging::init_file_logging("herdr-client.log");
 }
@@ -2194,12 +2020,6 @@ mod tests {
         fn drop(&mut self) {
             restore_env_var(self.key, self.previous.clone());
         }
-    }
-
-    #[test]
-    fn windows_virtual_terminal_input_mode_sets_only_vti_bit() {
-        assert_eq!(windows_virtual_terminal_input_mode(0x01f0), 0x03f0);
-        assert_eq!(windows_virtual_terminal_input_mode(0x03f0), 0x03f0);
     }
 
     struct EnvVarsRemovedGuard {
@@ -2418,72 +2238,12 @@ mod tests {
     }
 
     #[test]
-    fn write_host_terminal_theme_query_emits_osc_queries() {
-        let mut output = Vec::new();
-        write_host_terminal_theme_query(&mut output).unwrap();
-        assert_eq!(
-            output,
-            crate::terminal_theme::host_terminal_theme_query_sequence().as_bytes()
-        );
-    }
-
-    #[test]
-    fn write_host_color_scheme_report_mode_emits_mode_sequences() {
-        let mut output = Vec::new();
-        write_host_color_scheme_report_mode(&mut output, true).unwrap();
-        write_host_color_scheme_report_mode(&mut output, false).unwrap();
-
-        let mut expected = Vec::new();
-        expected.extend_from_slice(
-            crate::terminal_theme::HOST_COLOR_SCHEME_REPORT_ENABLE_SEQUENCE.as_bytes(),
-        );
-        expected.extend_from_slice(
-            crate::terminal_theme::HOST_COLOR_SCHEME_REPORT_DISABLE_SEQUENCE.as_bytes(),
-        );
-        assert_eq!(output, expected);
-    }
-
-    #[test]
     fn color_scheme_change_event_requests_host_theme_query() {
         let events = crate::raw_input::parse_raw_input_bytes_sync(b"\x1b[?997;1n");
 
         assert!(crate::raw_input::events_require_host_terminal_theme_query(
             &events
         ));
-    }
-
-    #[test]
-    fn host_terminal_theme_query_is_disabled_on_windows() {
-        assert_eq!(should_query_host_terminal_theme(), !cfg!(windows));
-    }
-
-    #[test]
-    fn color_scheme_reports_are_enabled_only_for_full_clients() {
-        assert_eq!(
-            should_enable_host_color_scheme_reports(true),
-            !cfg!(windows)
-        );
-        assert!(!should_enable_host_color_scheme_reports(false));
-    }
-
-    #[test]
-    fn terminal_restore_postlude_restores_visible_default_cursor() {
-        let mut output = Vec::new();
-        write_terminal_restore_postlude(&mut output, false).unwrap();
-        assert_eq!(output, b"\x1b[?25h\x1b[0 q");
-    }
-
-    #[test]
-    fn terminal_restore_postlude_disables_color_scheme_reports_when_enabled() {
-        let mut output = Vec::new();
-        write_terminal_restore_postlude(&mut output, true).unwrap();
-
-        let mut expected = Vec::new();
-        expected.extend_from_slice(
-            crate::terminal_theme::HOST_COLOR_SCHEME_REPORT_DISABLE_SEQUENCE.as_bytes(),
-        );
-        expected.extend_from_slice(b"\x1b[?25h\x1b[0 q");
-        assert_eq!(output, expected);
     }
 
     #[cfg(unix)]

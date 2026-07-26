@@ -1,5 +1,7 @@
 # herdr task runner
 
+import 'overherdr.just'
+
 # Run tests
 test:
     cargo nextest run --locked --status-level fail --final-status-level fail --failure-output final --success-output never

@@ -87,6 +87,10 @@ fn spawn_pure_client(
     runtime_dir: &Path,
     api_socket: &Path,
 ) -> SpawnedPureClient {
+    // The fleet is exactly what remotes.toml configures, so the client needs
+    // an entry naming the local runtime or it opens an empty fleet and never
+    // reaches the server this test spawned.
+    support::write_local_remote(config_home);
     let pair = native_pty_system()
         .openpty(PtySize {
             rows: 24,
@@ -154,11 +158,13 @@ fn unique_test_dir() -> PathBuf {
 }
 
 fn spawn_server(config_home: &Path, runtime_dir: &Path, api_socket: &Path) -> SpawnedHerdr {
-    fs::create_dir_all(config_home.join("herdr")).unwrap();
+    fs::create_dir_all(config_home.join(support::app_dir_name())).unwrap();
     fs::create_dir_all(runtime_dir).unwrap();
     register_runtime_dir(runtime_dir);
     fs::write(
-        config_home.join("herdr/config.toml"),
+        config_home
+            .join(support::app_dir_name())
+            .join("config.toml"),
         "onboarding = false\n",
     )
     .unwrap();

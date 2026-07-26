@@ -159,6 +159,11 @@ fn spawn_client_process(
     let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_herdr"));
     cmd.arg("client");
     cmd.env("HERDR_DISABLE_SOUND", "1");
+    // This file exercises the thin-client protocol on the client socket -
+    // raw handshakes, the server's "client connected" accounting. The pure
+    // client speaks the framed API session instead and never appears in that
+    // accounting, so the spawned peer is pinned to the legacy path.
+    cmd.env("HERDR_PURE_CLIENT", "0");
     cmd.env("XDG_CONFIG_HOME", config_home);
     cmd.env("XDG_RUNTIME_DIR", runtime_dir);
     cmd.env("HERDR_SOCKET_PATH", api_socket_path);

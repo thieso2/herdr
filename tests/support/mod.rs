@@ -40,6 +40,34 @@ pub fn unregister_spawned_herdr_pid(pid: Option<u32>) {
     }
 }
 
+/// The config subdirectory the binary under test actually reads, mirroring
+/// `crate::config::app_dir_name()`. Debug builds brand themselves `-dev`, and
+/// integration tests run the debug binary, so a test writing plain `herdr/`
+/// writes a file nothing ever reads.
+pub fn app_dir_name() -> &'static str {
+    if cfg!(debug_assertions) {
+        "overherdr-dev"
+    } else {
+        "overherdr"
+    }
+}
+
+/// Writes `remotes.toml` describing a single local runtime. Since the fleet
+/// became exactly what `remotes.toml` configures, a client with no such file
+/// opens an empty fleet and connects to nothing - including the server a test
+/// just spawned for it.
+pub fn write_local_remote(config_home: &Path) {
+    let dir = config_home.join(app_dir_name());
+    fs::create_dir_all(&dir).expect("create config dir");
+    // No `target` key: this machine's API socket, no ssh. The default session
+    // resolves through the HERDR_SOCKET_PATH override the tests set.
+    fs::write(
+        dir.join("remotes.toml"),
+        "[[remote]]\nname = \"local\"\nsession = \"default\"\nenabled = true\n",
+    )
+    .expect("write remotes.toml");
+}
+
 pub fn register_runtime_dir(path: &Path) {
     ensure_cleanup_hooks();
 

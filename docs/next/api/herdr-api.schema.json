@@ -1101,6 +1101,31 @@
             "focused": {
               "type": "boolean"
             },
+            "git_ahead": {
+              "description": "Commits ahead of the upstream branch, when known.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "git_behind": {
+              "description": "Commits behind the upstream branch, when known.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "git_branch": {
+              "description": "Current git branch of the workspace directory, when known.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "label": {
               "type": "string"
             },
@@ -10044,6 +10069,31 @@
             },
             "focused": {
               "type": "boolean"
+            },
+            "git_ahead": {
+              "description": "Commits ahead of the upstream branch, when known.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "git_behind": {
+              "description": "Commits behind the upstream branch, when known.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "git_branch": {
+              "description": "Current git branch of the workspace directory, when known.",
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "label": {
               "type": "string"

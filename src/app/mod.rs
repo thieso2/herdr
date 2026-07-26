@@ -2248,6 +2248,93 @@ mod tests {
     }
 
     #[test]
+    fn git_status_change_emits_workspace_updated_catalog_event() {
+        let mut app = test_app();
+        app.state.workspaces.push(Workspace::test_new("one"));
+        let workspace_id = app.state.workspaces[0].id.clone();
+        let resolved_identity_cwd = app.state.workspaces[0].resolved_identity_cwd().unwrap();
+        let sequence_before = app.event_hub.current_sequence();
+
+        app.handle_internal_event(AppEvent::GitStatusRefreshed {
+            results: vec![crate::workspace::WorkspaceGitStatus {
+                workspace_id,
+                resolved_identity_cwd: resolved_identity_cwd.clone(),
+                status_cache_key: resolved_identity_cwd,
+                demand: crate::workspace::GitStatusRefreshDemand::ALL,
+                auto_label: "one".into(),
+                branch: Some("feature/x".into()),
+                ahead_behind: Some((2, 1)),
+                space: None,
+            }],
+            cache_updates: Vec::new(),
+        });
+
+        // A pure client mirrors the session catalog: without a
+        // workspace.updated event the branch change never leaves the server.
+        let events = app.event_hub.events_after(sequence_before);
+        let workspace = events
+            .iter()
+            .find_map(|(_, envelope)| match &envelope.data {
+                crate::api::schema::EventData::WorkspaceUpdated { workspace } => Some(workspace),
+                _ => None,
+            })
+            .expect("git status change emits workspace.updated");
+        assert_eq!(workspace.git_branch.as_deref(), Some("feature/x"));
+        assert_eq!(workspace.git_ahead, Some(2));
+        assert_eq!(workspace.git_behind, Some(1));
+
+        // An unchanged refresh emits nothing.
+        let sequence_before = app.event_hub.current_sequence();
+        app.handle_internal_event(AppEvent::GitStatusRefreshed {
+            results: Vec::new(),
+            cache_updates: Vec::new(),
+        });
+        assert!(app.event_hub.events_after(sequence_before).is_empty());
+    }
+
+    #[test]
+    fn terminal_cwd_report_emits_pane_and_workspace_catalog_events() {
+        let mut app = test_app();
+        app.state.workspaces.push(Workspace::test_new("one"));
+        app.state.ensure_test_terminals();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let cwd = unique_temp_path("cwd-report-catalog");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let sequence_before = app.event_hub.current_sequence();
+
+        app.handle_internal_event(AppEvent::TerminalCwdReported {
+            pane_id,
+            cwd: cwd.clone(),
+        });
+
+        let events = app.event_hub.events_after(sequence_before);
+        let pane = events
+            .iter()
+            .find_map(|(_, envelope)| match &envelope.data {
+                crate::api::schema::EventData::PaneUpdated { pane } => Some(pane),
+                _ => None,
+            })
+            .expect("cwd change emits pane.updated");
+        assert_eq!(pane.cwd.as_deref(), Some(cwd.display().to_string().as_str()));
+        assert!(
+            events.iter().any(|(_, envelope)| matches!(
+                &envelope.data,
+                crate::api::schema::EventData::WorkspaceUpdated { .. }
+            )),
+            "cwd change refreshes the cwd-derived workspace label"
+        );
+
+        // Re-reporting the same cwd emits nothing.
+        let sequence_before = app.event_hub.current_sequence();
+        app.handle_internal_event(AppEvent::TerminalCwdReported {
+            pane_id,
+            cwd: cwd.clone(),
+        });
+        assert!(app.event_hub.events_after(sequence_before).is_empty());
+        let _ = std::fs::remove_dir_all(cwd);
+    }
+
+    #[test]
     fn clipboard_write_event_shows_feedback_toast() {
         let mut app = test_app();
 

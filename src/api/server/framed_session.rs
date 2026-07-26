@@ -155,6 +155,13 @@ pub(super) fn serve(
         "framed session negotiated"
     );
 
+    // Catalog sessions count as attached clients for client-facing
+    // background work on the server (headless git status refresh); the
+    // guard is dropped on every exit path.
+    let _catalog_client_guard = session
+        .has_capability(CAPABILITY_CATALOG)
+        .then(|| event_hub.register_catalog_client());
+
     // Open pane streams, keyed by server-allocated stream id. Dropping an
     // entry detaches it from the pane tap, releases any write grant, and
     // releases its history capture.

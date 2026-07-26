@@ -212,6 +212,8 @@ impl Workspace {
         tabs: Vec<Tab>,
         active_tab: usize,
         public_pane_numbers: HashMap<PaneId, usize>,
+        git_branch: Option<String>,
+        git_ahead_behind: Option<(usize, usize)>,
     ) -> Self {
         let identity_cwd = PathBuf::from("/");
         let next_public_pane_number = public_pane_numbers
@@ -227,8 +229,8 @@ impl Workspace {
             cached_identity_cwd: identity_cwd.clone(),
             cached_auto_label: String::new(),
             cached_git_status_key: identity_cwd,
-            cached_git_branch: None,
-            cached_git_ahead_behind: None,
+            cached_git_branch: git_branch,
+            cached_git_ahead_behind: git_ahead_behind,
             cached_git_space: None,
             worktree_space: None,
             metadata_tokens: crate::metadata_tokens::MetadataTokens::default(),

@@ -1,6 +1,10 @@
 #[derive(Clone, Default)]
 pub struct EventHub {
     inner: std::sync::Arc<std::sync::Mutex<EventHubState>>,
+    /// Connected sessions that negotiated the catalog capability. Server
+    /// loops treat them like attached clients when deciding whether
+    /// client-facing background work (git status refresh) should run.
+    catalog_clients: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 #[derive(Default)]
@@ -54,11 +58,40 @@ impl EventHub {
         (events, lost)
     }
 
+    /// Registers a catalog-capable session for the guard's lifetime. The
+    /// count is panic-safe: dropping the guard on any exit path
+    /// decrements it.
+    pub fn register_catalog_client(&self) -> CatalogClientGuard {
+        self.catalog_clients
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        CatalogClientGuard {
+            catalog_clients: std::sync::Arc::clone(&self.catalog_clients),
+        }
+    }
+
+    /// Number of currently connected catalog-capable sessions.
+    pub fn catalog_client_count(&self) -> usize {
+        self.catalog_clients
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     pub fn current_sequence(&self) -> u64 {
         let Ok(state) = self.inner.lock() else {
             return 0;
         };
         state.next_sequence
+    }
+}
+
+/// RAII registration of one catalog-capable session on an [`EventHub`].
+pub struct CatalogClientGuard {
+    catalog_clients: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl Drop for CatalogClientGuard {
+    fn drop(&mut self) {
+        self.catalog_clients
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
     }
 }
 

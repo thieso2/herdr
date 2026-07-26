@@ -649,7 +649,7 @@ impl HeadlessServer {
                 .next_headless_loop_deadline_with_git_refresh(
                     now,
                     needs_render,
-                    self.has_app_client(),
+                    self.git_refresh_consumer_connected(),
                 )
                 .map(|deadline| deadline.min(now + CLIENT_ACCEPT_POLL_INTERVAL))
                 .or(Some(now + CLIENT_ACCEPT_POLL_INTERVAL));
@@ -1380,6 +1380,13 @@ impl HeadlessServer {
 
     fn has_app_client(&self) -> bool {
         self.app_client_count() > 0
+    }
+
+    /// Whether any connected client consumes workspace git facts: a legacy
+    /// full app client on the private socket, or a catalog-capable framed
+    /// API session (the pure fleet client mirroring the session catalog).
+    fn git_refresh_consumer_connected(&self) -> bool {
+        self.has_app_client() || self.app.event_hub.catalog_client_count() > 0
     }
 
     fn remove_client(&mut self, client_id: u64) -> bool {
@@ -4084,7 +4091,7 @@ impl HeadlessServer {
 
         changed |= self.app.clear_due_selection_highlight(now);
 
-        if self.has_app_client() {
+        if self.git_refresh_consumer_connected() {
             self.app.start_git_status_refresh_if_due(now);
         }
 
@@ -5807,6 +5814,45 @@ next_tab = ""
     #[test]
     fn terminal_ansi_app_client_enables_headless_git_refresh() {
         app_client_marks_git_refresh_due_on_first_attach(RenderEncoding::TerminalAnsi);
+    }
+
+    #[test]
+    fn catalog_session_enables_headless_git_refresh() {
+        let mut server = test_headless_server();
+        server
+            .app
+            .state
+            .workspaces
+            .push(crate::workspace::Workspace::test_new("test"));
+
+        // No legacy app client, no catalog session: refresh stays off.
+        assert!(!server.has_app_client());
+        assert!(!server.git_refresh_consumer_connected());
+        assert_eq!(
+            server.app.next_headless_loop_deadline_with_git_refresh(
+                Instant::now(),
+                false,
+                server.git_refresh_consumer_connected()
+            ),
+            None
+        );
+
+        // A catalog-capable framed session (the pure fleet client) counts
+        // as a consumer of workspace git facts.
+        let guard = server.app.event_hub.register_catalog_client();
+        assert!(server.git_refresh_consumer_connected());
+        assert!(server
+            .app
+            .next_headless_loop_deadline_with_git_refresh(
+                Instant::now(),
+                false,
+                server.git_refresh_consumer_connected()
+            )
+            .is_some());
+
+        // Dropping the session turns the refresh loop back off.
+        drop(guard);
+        assert!(!server.git_refresh_consumer_connected());
     }
 
     #[test]

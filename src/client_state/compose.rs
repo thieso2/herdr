@@ -178,6 +178,10 @@ fn project_mirror(
             tabs,
             active_tab,
             public_pane_numbers,
+            workspace_info.git_branch.clone(),
+            workspace_info.git_ahead.zip(workspace_info.git_behind).map(
+                |(ahead, behind)| (ahead as usize, behind as usize),
+            ),
         ));
     }
 
@@ -702,6 +706,37 @@ mod tests {
         let mut app2 = AppState::test_new();
         compose_into(&mirror, &chrome, &mut ids, &mut app2);
         assert_eq!(app2.workspaces[0].tabs[0].layout.pane_ids(), before);
+    }
+
+    #[tokio::test]
+    async fn compose_carries_workspace_git_facts_into_the_projection() {
+        let mut mirror = mirror_with_layout();
+        {
+            let workspace = mirror
+                .catalog
+                .workspaces
+                .iter_mut()
+                .find(|workspace| workspace.workspace_id == "ws_2")
+                .expect("ws_2 in catalog");
+            workspace.git_branch = Some("main".into());
+            workspace.git_ahead = Some(2);
+            workspace.git_behind = Some(1);
+        }
+        let chrome = GlobalChrome::new();
+        let mut ids = ComposeIds::new();
+        let mut app = AppState::test_new();
+
+        compose_into(&mirror, &chrome, &mut ids, &mut app);
+
+        // The sidebar {branch} and {git_status} tokens read exactly these
+        // caches; without them the tokens are permanently empty in the
+        // pure client.
+        assert_eq!(app.workspaces[0].branch().as_deref(), Some("main"));
+        assert_eq!(app.workspaces[0].git_ahead_behind(), Some((2, 1)));
+
+        // Workspaces without git facts stay bare.
+        assert_eq!(app.workspaces[1].branch(), None);
+        assert_eq!(app.workspaces[1].git_ahead_behind(), None);
     }
 
     #[tokio::test]

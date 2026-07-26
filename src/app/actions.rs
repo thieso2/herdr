@@ -2580,12 +2580,15 @@ fn is_trailing_token_wrapper(ch: char) -> bool {
 // ---------------------------------------------------------------------------
 
 impl AppState {
+    /// Applies refreshed git facts to the matching workspaces. Returns the
+    /// indices of workspaces whose user-visible git identity (label, branch,
+    /// ahead/behind, space) actually changed.
     pub fn apply_workspace_git_statuses(
         &mut self,
         terminal_runtimes: &crate::terminal::TerminalRuntimeRegistry,
         results: Vec<WorkspaceGitStatus>,
-    ) -> bool {
-        let mut changed = false;
+    ) -> Vec<usize> {
+        let mut changed_indices = Vec::new();
         for result in results {
             let Some(ws_idx) = self
                 .workspaces
@@ -2604,6 +2607,7 @@ impl AppState {
             }
 
             let ws = &mut self.workspaces[ws_idx];
+            let mut changed = false;
             if ws.cached_identity_cwd != result.resolved_identity_cwd {
                 ws.cached_identity_cwd = result.resolved_identity_cwd;
             }
@@ -2626,8 +2630,11 @@ impl AppState {
                 ws.cached_git_space = result.space;
                 changed = true;
             }
+            if changed {
+                changed_indices.push(ws_idx);
+            }
         }
-        changed
+        changed_indices
     }
 
     pub fn handle_app_event(&mut self, event: AppEvent) -> Vec<PaneStateUpdate> {
@@ -3922,7 +3929,7 @@ mod tests {
             }],
         );
 
-        assert!(changed);
+        assert_eq!(changed, vec![0], "the matching workspace index is reported");
         assert_eq!(state.workspaces[0].branch().as_deref(), Some("main"));
         assert_eq!(state.workspaces[0].git_ahead_behind(), Some((2, 1)));
         assert_eq!(state.workspaces[1].id, second_id);
@@ -3951,7 +3958,7 @@ mod tests {
             }],
         );
 
-        assert!(!changed);
+        assert!(changed.is_empty());
         assert_eq!(state.workspaces[0].branch().as_deref(), Some("old"));
         assert_eq!(state.workspaces[0].git_ahead_behind(), Some((1, 0)));
     }
@@ -3982,7 +3989,7 @@ mod tests {
             }],
         );
 
-        assert!(!changed);
+        assert!(changed.is_empty());
         assert_eq!(state.workspaces[0].branch().as_deref(), Some("old"));
     }
 
@@ -4009,7 +4016,7 @@ mod tests {
             }],
         );
 
-        assert!(changed);
+        assert_eq!(changed, vec![0]);
         assert_eq!(state.workspaces[0].branch(), None);
         assert_eq!(state.workspaces[0].git_ahead_behind(), None);
     }
@@ -4043,7 +4050,7 @@ mod tests {
             }],
         );
 
-        assert!(changed);
+        assert!(!changed.is_empty());
         assert_eq!(state.workspaces[0].worktree_space().cloned(), membership);
     }
 

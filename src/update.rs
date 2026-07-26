@@ -23,8 +23,14 @@ use std::time::{Duration, Instant};
 use interprocess::local_socket::traits::Stream as _;
 use serde::{Deserialize, Deserializer};
 
-const STABLE_UPDATE_MANIFEST_URL: &str = "https://herdr.dev/latest.json";
-const PREVIEW_UPDATE_MANIFEST_URL: &str = "https://herdr.dev/preview.json";
+// Fork-owned manifests. Same schema and deserializers as upstream's; only the
+// host differs. They live in `dist/` rather than `website/` so `website/` stays
+// byte-identical to upstream, whose release CI regenerates `website/latest.json`
+// on every release.
+const STABLE_UPDATE_MANIFEST_URL: &str =
+    "https://raw.githubusercontent.com/thieso2/herdr/master/dist/latest.json";
+const PREVIEW_UPDATE_MANIFEST_URL: &str =
+    "https://raw.githubusercontent.com/thieso2/herdr/master/dist/preview.json";
 const HOMEBREW_FORMULA_API_URL: &str = "https://formulae.brew.sh/api/formula/herdr.json";
 const HERDR_UPDATE_COMMAND: &str = "herdr update";
 const HOMEBREW_UPDATE_COMMAND: &str = "brew update && brew upgrade herdr";
@@ -3446,40 +3452,61 @@ mod tests {
         assert_eq!(release.sha256.as_deref(), Some("deadbeef"));
     }
 
-    #[test]
-    fn checked_in_website_manifest_matches_update_schema() {
-        let manifest: UpdateManifest = serde_json::from_str(include_str!("../website/latest.json"))
-            .expect("website/latest.json should match updater schema");
+    const FORK_MANIFEST_TARGETS: [&str; 4] = [
+        "linux-x86_64",
+        "linux-aarch64",
+        "macos-x86_64",
+        "macos-aarch64",
+    ];
 
+    #[test]
+    fn checked_in_fork_manifest_matches_update_schema() {
+        let manifest: UpdateManifest = serde_json::from_str(include_str!("../dist/latest.json"))
+            .expect("dist/latest.json should match updater schema");
+        let version =
+            Version::parse(&manifest.version).expect("fork manifest version should be semver");
+
+        // The manifest is seeded at 0.0.0 with no assets before the fork's
+        // first tag and rewritten by the release workflow afterwards. Both
+        // states must parse; only a released manifest is fully constrained.
+        if manifest.assets.is_empty() {
+            assert_eq!(version, Version::parse("0.0.0").expect("seed version"));
+            assert!(manifest.notes.is_empty(), "seed must archive nothing");
+            assert!(manifest.releases.is_empty(), "seed must archive nothing");
+            return;
+        }
+
+        assert!(
+            version.patch >= crate::identity::FORK_PATCH_FLOOR,
+            "released fork manifest must carry the offset patch: {version}"
+        );
+        assert!(manifest.protocol.is_some());
+        assert_eq!(manifest.assets.len(), FORK_MANIFEST_TARGETS.len());
+        assert!(manifest.releases.contains_key(&manifest.version));
         assert!(!manifest
-            .metadata_for_version(&Version::parse(&manifest.version).unwrap())
+            .metadata_for_version(&version)
             .expect("metadata")
             .notes_body()
             .is_empty());
-        // website/latest.json describes the latest released binaries, not the
-        // current unreleased checkout. Its protocol is updated by the release
-        // flow together with the release assets.
-        assert!(manifest.protocol.is_some());
-        assert_eq!(manifest.assets.len(), 4);
-        assert!(manifest.releases.contains_key(&manifest.version));
 
-        for target in [
-            "linux-x86_64",
-            "linux-aarch64",
-            "macos-x86_64",
-            "macos-aarch64",
-        ] {
+        let tag_prefix = crate::identity::RELEASE_TAG_PREFIX;
+        let brand = crate::identity::BRAND;
+
+        for target in FORK_MANIFEST_TARGETS {
             let url = &manifest
                 .assets
                 .get(target)
                 .unwrap_or_else(|| panic!("missing asset URL for {target}"))
                 .url;
             assert!(
-                url.contains(&format!("/releases/download/v{}/", manifest.version)),
+                url.contains(&format!(
+                    "/releases/download/{tag_prefix}{}/",
+                    manifest.version
+                )),
                 "unexpected release URL for {target}: {url}"
             );
             assert!(
-                url.ends_with(&format!("herdr-{target}")),
+                url.ends_with(&format!("{brand}-{target}")),
                 "unexpected asset name for {target}: {url}"
             );
         }
@@ -3489,22 +3516,17 @@ mod tests {
                 .get("assets")
                 .and_then(serde_json::Value::as_object)
                 .unwrap_or_else(|| panic!("missing assets for release {version}"));
-            for target in [
-                "linux-x86_64",
-                "linux-aarch64",
-                "macos-x86_64",
-                "macos-aarch64",
-            ] {
+            for target in FORK_MANIFEST_TARGETS {
                 let url = assets
                     .get(target)
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or_else(|| panic!("missing asset URL for {version} {target}"));
                 assert!(
-                    url.contains(&format!("/releases/download/v{version}/")),
+                    url.contains(&format!("/releases/download/{tag_prefix}{version}/")),
                     "unexpected release URL for {version} {target}: {url}"
                 );
                 assert!(
-                    url.ends_with(&format!("herdr-{target}")),
+                    url.ends_with(&format!("{brand}-{target}")),
                     "unexpected asset name for {version} {target}: {url}"
                 );
             }

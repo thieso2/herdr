@@ -1,0 +1,258 @@
+# Fork-owned release pipeline.
+#
+# Triggers on the fork tag prefix `overherdr-v*`, NEVER `v*`: upstream's
+# release.yml fires on `v*`, needs three secrets this fork does not have
+# (KANGAL_GITHUB_TOKEN, RELEASE_DEPLOY_KEY, CLOUDFLARE_PAGES_DEPLOY_HOOK) and
+# would build upstream-named assets. This fork already carries inherited v0.7.x
+# tags, so the prefixes must not overlap.
+#
+# Build steps are copied from build-artifacts-manual.yml so the proven Zig /
+# musl / cross setup stays in one shape. Dropped relative to upstream's
+# release.yml: flake-check, input validation, issue closing, and the whole
+# docs/website half of manifest publishing.
+name: overherdr release
+
+on:
+  push:
+    tags:
+      - "overherdr-v*"
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  RUST_TOOLCHAIN_VERSION: 1.96.1
+  LIBGHOSTTY_VT_OPTIMIZE: ReleaseSafe
+  LIBGHOSTTY_VT_SIMD: "false"
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      protocol: ${{ steps.version.outputs.protocol }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Resolve and guard version
+        id: version
+        run: |
+          set -eu
+          tag="${GITHUB_REF_NAME}"
+          version="${tag#overherdr-v}"
+          cargo_version="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)"
+          if [ "$version" != "$cargo_version" ]; then
+            echo "error: tag $tag implies $version but Cargo.toml says $cargo_version" >&2
+            exit 1
+          fi
+          patch="${version##*.}"
+          if [ "$patch" -lt 100 ]; then
+            echo "error: fork version $version must offset the patch by 100" >&2
+            exit 1
+          fi
+          protocol="$(sed -n 's/^pub const PROTOCOL_VERSION: u32 = \([0-9]*\);$/\1/p' src/protocol/wire.rs | head -n 1)"
+          [ -n "$protocol" ] || { echo "error: could not read PROTOCOL_VERSION" >&2; exit 1; }
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "protocol=$protocol" >> "$GITHUB_OUTPUT"
+
+  build-linux:
+    needs: verify
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            name: overherdr-linux-x86_64
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+            name: overherdr-linux-aarch64
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN_VERSION }}
+          targets: ${{ matrix.target }}
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.15.2
+
+      - name: Prefer official Ubuntu mirrors over Azure
+        run: |
+          if [ -f /etc/apt/apt-mirrors.txt ]; then
+            sudo sed -i '/azure.archive.ubuntu.com/d' /etc/apt/apt-mirrors.txt
+          fi
+
+      - name: Install Linux build tools
+        run: |
+          sudo find /etc/apt/sources.list.d -type f \( -iname '*microsoft*' -o -iname '*azure-cli*' \) -print -delete
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build musl-tools gcc-aarch64-linux-gnu crossbuild-essential-arm64
+
+      - name: Set Linux aarch64 linker
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        run: echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
+
+      - name: Remove Zig caches
+        run: rm -rf .zig-cache vendor/libghostty-vt/.zig-cache vendor/libghostty-vt/zig-out
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      # The crate and bin target are still named `herdr`; the fork name is
+      # applied to the artifact here, and argv[0] carries it at runtime.
+      - name: Package artifact
+        run: |
+          cp target/${{ matrix.target }}/release/herdr ${{ matrix.name }}
+          file ${{ matrix.name }} > BUILD_INFO.txt
+          ldd ${{ matrix.name }} 2>&1 | tee -a BUILD_INFO.txt
+          grep -q "statically linked" BUILD_INFO.txt
+          if nm -u ${{ matrix.name }} 2>/dev/null | grep -E '(__cxa|GLIBCXX|CXXABI|_ZSt)'; then
+            echo "error: Linux artifact has unresolved C++ runtime symbols" >&2
+            exit 1
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: ${{ matrix.name }}
+          path: ${{ matrix.name }}
+          retention-days: 7
+
+  build-macos:
+    needs: verify
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            name: overherdr-macos-x86_64
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            name: overherdr-macos-aarch64
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN_VERSION }}
+          targets: ${{ matrix.target }}
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.15.2
+
+      - name: Install macOS build tools
+        run: brew install cmake ninja
+
+      - name: Remove Zig caches
+        run: rm -rf .zig-cache vendor/libghostty-vt/.zig-cache vendor/libghostty-vt/zig-out
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package artifact
+        run: |
+          cp target/${{ matrix.target }}/release/herdr ${{ matrix.name }}
+          file ${{ matrix.name }} > BUILD_INFO.txt
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: ${{ matrix.name }}
+          path: ${{ matrix.name }}
+          retention-days: 7
+
+  release:
+    needs: [verify, build-linux, build-macos]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: master
+          fetch-depth: 0
+
+      - name: Download artifacts
+        uses: actions/download-artifact@448e3f862ab3ef47aa50ff917776823c9946035b # v5
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Collect release assets
+        run: |
+          set -eu
+          mkdir -p release
+          for name in overherdr-linux-x86_64 overherdr-linux-aarch64 \
+                      overherdr-macos-x86_64 overherdr-macos-aarch64; do
+            [ -f "artifacts/$name" ] || { echo "error: missing $name" >&2; exit 1; }
+            cp "artifacts/$name" "release/$name"
+            chmod 755 "release/$name"
+          done
+          ls -l release
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          set -eu
+          notes_file="$(mktemp)"
+          {
+            echo "overherdr $VERSION"
+            echo
+            echo "Fork of ogulcancelik/herdr. Install:"
+            echo
+            echo '```sh'
+            echo "curl -fsSL https://raw.githubusercontent.com/thieso2/herdr/master/install.sh | sh"
+            echo '```'
+          } > "$notes_file"
+          gh release create "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "overherdr $VERSION" \
+            --notes-file "$notes_file" \
+            release/*
+          echo "NOTES_FILE=$notes_file" >> "$GITHUB_ENV"
+
+      - name: Regenerate fork update manifest
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+          PROTOCOL: ${{ needs.verify.outputs.protocol }}
+        run: |
+          set -eu
+          python3 scripts/overherdr_manifest.py \
+            --version "$VERSION" \
+            --protocol "$PROTOCOL" \
+            --notes "$(cat "$NOTES_FILE")"
+
+      - name: Commit manifest to master
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          set -eu
+          if git diff --quiet -- dist/latest.json; then
+            echo "manifest already current"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add dist/latest.json
+          git commit -m "chore: publish overherdr $VERSION manifest"
+          git push origin HEAD:master

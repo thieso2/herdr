@@ -13,6 +13,9 @@ pub(crate) use unix::*;
 /// target", so an unreadable or hand-built remote binary is upgraded rather
 /// than silently left behind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// Remote attach and fleet upgrades are unix-only; the decision itself is
+// platform-neutral so it stays testable everywhere.
+#[cfg_attr(windows, allow(dead_code))]
 pub(crate) enum RemoteUpgradeDecision {
     /// Install the target version (the remote is older, absent, or unknown).
     Install,
@@ -23,6 +26,9 @@ pub(crate) enum RemoteUpgradeDecision {
 }
 
 /// Pure forward-only guard for one remote.
+// Remote attach and fleet upgrades are unix-only; the decision itself is
+// platform-neutral so it stays testable everywhere.
+#[cfg_attr(windows, allow(dead_code))]
 pub(crate) fn remote_upgrade_decision(
     remote_version: Option<&str>,
     target_version: &str,
@@ -51,6 +57,9 @@ pub(crate) fn remote_upgrade_decision(
 /// A default fleet remote name derived from an ssh target, for the
 /// save-this-target offer. Keeps the host part, drops the user and port, and
 /// maps anything outside the remote-name charset to `-`.
+// Remote attach and fleet upgrades are unix-only; the decision itself is
+// platform-neutral so it stays testable everywhere.
+#[cfg_attr(windows, allow(dead_code))]
 pub(crate) fn remote_name_from_target(target: &str) -> Option<String> {
     let host = target.rsplit('@').next().unwrap_or(target);
     // `host:port` and bracketed IPv6 literals both reduce to the host.
@@ -83,6 +92,9 @@ pub(crate) fn remote_name_from_target(target: &str) -> Option<String> {
 /// used as it is and left to the protocol window (`herdr remote upgrade`
 /// rolls it forward when the user asks for it).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// Remote attach and fleet upgrades are unix-only; the decision itself is
+// platform-neutral so it stays testable everywhere.
+#[cfg_attr(windows, allow(dead_code))]
 pub(crate) enum RemoteBootstrapAction {
     /// Use the herdr already installed over there, whatever version it is.
     UseInstalled,
@@ -91,6 +103,9 @@ pub(crate) enum RemoteBootstrapAction {
 }
 
 /// Pure fresh-install-only decision for a `--remote` launch.
+// Remote attach and fleet upgrades are unix-only; the decision itself is
+// platform-neutral so it stays testable everywhere.
+#[cfg_attr(windows, allow(dead_code))]
 pub(crate) fn remote_bootstrap_action(
     has_binary_override: bool,
     installed_version: Option<&str>,

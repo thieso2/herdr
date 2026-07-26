@@ -749,12 +749,16 @@ pub(crate) fn negotiate_version_windows(
 /// Capability flags a catalog-driving client cannot run without: without
 /// them the connection is functionally incompatible even though the version
 /// windows overlap. Checked with [`check_required_capabilities`].
+// Consumed by the unix-only pure-client run path.
+#[cfg_attr(windows, allow(dead_code))]
 pub const REQUIRED_CATALOG_CAPABILITIES: &[&str] = &[CAPABILITY_CATALOG];
 
 /// Rejects a negotiated welcome that is missing a capability the client
 /// cannot run without. Shaped like the version-window rejection so callers
 /// treat "too old to speak my version" and "too old to offer what I need"
 /// identically: both are terminal, and both name the side to upgrade.
+// Consumed by the unix-only pure-client run path.
+#[cfg_attr(windows, allow(dead_code))]
 pub fn check_required_capabilities(
     welcome: &SessionWelcome,
     required: &[&str],

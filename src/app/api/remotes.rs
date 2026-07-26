@@ -42,6 +42,23 @@ impl App {
         }
     }
 
+    /// Starts a server on one remote. Separate from `remote.reset` because
+    /// it writes a daemon to the far side: it is a user action, never
+    /// something the reconnect loop reaches on its own.
+    pub(crate) fn handle_remote_start(&mut self, id: String, params: RemoteTargetParams) -> String {
+        let Some(fleet) = self.fleet.as_mut() else {
+            return responses::encode_error(
+                id,
+                "fleet_not_running",
+                "no fleet connection manager is running in this process",
+            );
+        };
+        match fleet.start_remote(&params.name) {
+            Ok(()) => responses::encode_success(id, ResponseResult::Ok {}),
+            Err(err) => responses::encode_error(id, "remote_start_failed", err.to_string()),
+        }
+    }
+
     pub(crate) fn handle_remote_reload(&mut self, id: String) -> String {
         let entries = match crate::fleet::config::try_load() {
             Ok(entries) => entries,

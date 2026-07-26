@@ -508,8 +508,11 @@ fn main() -> io::Result<()> {
     }
 
     // Far side of an SSH fleet bridge: pump stdio to the API socket.
+    // `--start` is the only form that may spawn a server on this host; a
+    // plain bridge reports a stopped server instead of starting one.
     if args.get(1).map(|s| s.as_str()) == Some("bridge") {
-        return fleet::bridge::run_bridge();
+        let start = args[2..].iter().any(|arg| arg == "--start");
+        return fleet::bridge::run_bridge(start);
     }
 
     if args.get(1).map(|s| s.as_str()) == Some("server") {

@@ -1019,6 +1019,9 @@ impl App {
             Method::RemoteReset(params) => {
                 return self.handle_remote_reset(request.id, params);
             }
+            Method::RemoteStart(params) => {
+                return self.handle_remote_start(request.id, params);
+            }
             Method::RemoteReload(_) => return self.handle_remote_reload(request.id),
             Method::WorkspaceList(_) => return self.handle_workspace_list(request.id),
             Method::WorkspaceGet(target) => return self.handle_workspace_get(request.id, target),

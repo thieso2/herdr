@@ -10,6 +10,7 @@ pub(super) fn run_remote_command(args: &[String]) -> std::io::Result<i32> {
     match args.first().map(|arg| arg.as_str()) {
         Some("list") => remote_list(&args[1..]),
         Some("reset") => remote_reset(&args[1..]),
+        Some("start") => remote_start(&args[1..]),
         Some("reload") => remote_reload(&args[1..]),
         Some("upgrade") => remote_upgrade(&args[1..]),
         Some("help" | "--help" | "-h") => {
@@ -74,6 +75,30 @@ fn remote_reset(args: &[String]) -> std::io::Result<i32> {
         return super::print_response(&response);
     }
     println!("reset remote {name}; reconnecting now");
+    Ok(0)
+}
+
+/// Starts a server on one remote and reconnects to it.
+///
+/// Explicit by design: a remote whose herdr is installed but not running
+/// parks in `stopped` rather than having a daemon spawned on it behind the
+/// user's back, and this is how the user says yes.
+fn remote_start(args: &[String]) -> std::io::Result<i32> {
+    let (name, json) =
+        match super::parse_session_name_and_json(args, "usage: herdr remote start <name> [--json]")
+        {
+            Ok(parsed) => parsed,
+            Err(code) => return Ok(code),
+        };
+
+    let response = super::send_request(&Request {
+        id: "cli:remote:start".into(),
+        method: Method::RemoteStart(crate::api::schema::RemoteTargetParams { name: name.clone() }),
+    })?;
+    if json || response.get("error").is_some() {
+        return super::print_response(&response);
+    }
+    println!("started remote {name}; connecting now");
     Ok(0)
 }
 
@@ -326,6 +351,9 @@ fn print_remote_help() {
     eprintln!("herdr remote commands:");
     eprintln!("  herdr remote list [--json]    list fleet remotes and their connection state");
     eprintln!("  herdr remote reset <name>     drop a remote connection and reconnect now");
+    eprintln!(
+        "  herdr remote start <name>     start a stopped remote's server, then connect to it"
+    );
     eprintln!("  herdr remote reload [--json]  apply hand edits made to remotes.toml");
     eprintln!("  herdr remote upgrade <name-or-target> | --all [--yes] [--json]");
     eprintln!(

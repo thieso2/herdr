@@ -4603,6 +4603,22 @@
         {
           "properties": {
             "method": {
+              "const": "remote.start",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/RemoteTargetParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
               "const": "remote.reload",
               "type": "string"
             },
@@ -8699,7 +8715,7 @@
           "oneOf": [
             {
               "const": "local",
-              "description": "The implicit local runtime (remote `#0`).",
+              "description": "A local runtime: reached over this machine's API socket, so there is\nno bridge to connect and nothing to retry.",
               "type": "string"
             },
             {
@@ -8723,6 +8739,11 @@
               "type": "string"
             },
             {
+              "const": "stopped",
+              "description": "Reachable, with herdr installed, but no server running there. Starting\none writes to the host, so it never happens behind the user's back: the\nremote parks here until an explicit `remote start`.",
+              "type": "string"
+            },
+            {
               "const": "incompatible",
               "description": "The protocol version windows do not overlap; no automatic reconnects\nuntil one side is upgraded.",
               "type": "string"
@@ -8735,7 +8756,7 @@
           ]
         },
         "RemoteInfo": {
-          "description": "One fleet remote with its live connection state. The local runtime is the\nimplicit entry at index 0.",
+          "description": "One fleet remote with its live connection state, in fleet-config order.",
           "properties": {
             "attempt": {
               "description": "Reconnect attempt counter while offline or connecting.",

@@ -118,6 +118,10 @@ enum LoopEvent {
     /// generation drops results from threads whose link was reconciled
     /// away (or replaced) while they were connecting.
     Established(usize, u64, Box<RemoteEstablished>),
+    /// An explicit `bridge --start` finished. Carries the failure so the
+    /// prompt can show it; `Ok` means the daemon is up and the remote can
+    /// reconnect.
+    RemoteStarted(usize, Result<(), String>),
 }
 
 /// Outcome of a remote's connect-plus-handshake thread. On success the
@@ -140,6 +144,9 @@ enum RemoteEstablished {
         remedy: HelloRemedy,
         message: String,
     },
+    /// The far side has herdr but no running server. Terminal until the user
+    /// approves a start, so it is its own outcome and not a `Failed`.
+    Stopped(String),
     Failed(String),
 }
 
@@ -421,7 +428,7 @@ fn remote_connect_and_read(
     let Some(target) = descriptor.target.as_deref() else {
         return;
     };
-    let established = (|| {
+    let established: Result<_, String> = (|| {
         let (child, mut stdout, mut stdin) = BridgeChild::spawn_program(
             target,
             &descriptor.session,
@@ -433,6 +440,22 @@ fn remote_connect_and_read(
                 .unwrap_or(crate::identity::BRAND),
         )
         .map_err(|err| format!("ssh bridge spawn failed: {err}"))?;
+        // Every failure below has to carry the child's stderr tail, because
+        // that tail is where the far side's own report lives - including the
+        // "no server running" marker. A path that drops it silently
+        // downgrades a stopped remote into an ordinary retrying outage.
+        let with_tail = |message: String, child: &BridgeChild| -> String {
+            let tail = child
+                .stderr_tail()
+                .lock()
+                .map(|tail| tail.trim().replace('\n', "; "))
+                .unwrap_or_default();
+            if tail.is_empty() {
+                message
+            } else {
+                format!("{message} (ssh: {tail})")
+            }
+        };
         // Watchdog: the hello-answer read below is a blocking pipe read with
         // no native timeout, so a remote that accepts the connection but
         // never answers would wedge this thread and its link forever.
@@ -452,12 +475,12 @@ fn remote_connect_and_read(
         stdin
             .write_all(&FRAMED_MAGIC)
             .and_then(|()| stdin.flush())
-            .map_err(|err| format!("framed handshake failed: {err}"))?;
+            .map_err(|err| with_tail(format!("framed handshake failed: {err}"), &child))?;
         let hello = session_hello_request_with_capabilities("pure:hello:0", SESSION_CAPABILITIES);
         let payload =
             serde_json::to_vec(&hello).map_err(|err| format!("hello encode failed: {err}"))?;
         write_frame(&mut stdin, FrameType::Control, CONTROL_STREAM_ID, &payload)
-            .map_err(|err| format!("session.hello send failed: {err}"))?;
+            .map_err(|err| with_tail(format!("session.hello send failed: {err}"), &child))?;
         let response = loop {
             let frame = read_frame(&mut stdout).map_err(|err| {
                 if handshake_started.elapsed() >= REMOTE_HANDSHAKE_TIMEOUT {
@@ -466,16 +489,7 @@ fn remote_connect_and_read(
                         REMOTE_HANDSHAKE_TIMEOUT.as_secs()
                     );
                 }
-                let tail = child
-                    .stderr_tail()
-                    .lock()
-                    .map(|tail| tail.trim().replace('\n', "; "))
-                    .unwrap_or_default();
-                if tail.is_empty() {
-                    format!("session.hello failed: {err}")
-                } else {
-                    format!("session.hello failed: {err} (ssh: {tail})")
-                }
+                with_tail(format!("session.hello failed: {err}"), &child)
             })?;
             if frame.frame_type == FrameType::Control {
                 let response = serde_json::from_slice::<serde_json::Value>(&frame.payload)
@@ -491,10 +505,21 @@ fn remote_connect_and_read(
     let (child, stdout, stdin, response) = match established {
         Ok(parts) => parts,
         Err(message) => {
+            // "no server running there" is not an outage to retry: only an
+            // explicit start changes it, so it gets its own outcome.
+            let outcome = if crate::fleet::bridge_child::diagnostics_report_stopped_server(
+                message.as_str(),
+            ) {
+                RemoteEstablished::Stopped(crate::fleet::connection::stopped_status_line(
+                    &descriptor.name,
+                ))
+            } else {
+                RemoteEstablished::Failed(message)
+            };
             let _ = event_tx.send(LoopEvent::Established(
                 remote,
                 generation,
-                Box::new(RemoteEstablished::Failed(message)),
+                Box::new(outcome),
             ));
             return;
         }
@@ -729,6 +754,10 @@ pub(super) enum Link {
     Down {
         retry_at: Instant,
     },
+    /// Reachable, but nothing running there. Terminal like `Incompatible`,
+    /// and kept separate from it so the two dead ends stay tellable apart -
+    /// one is fixed by starting a server, the other by upgrading one.
+    Stopped,
     Incompatible,
 }
 
@@ -778,6 +807,9 @@ impl LoopCtx<'_> {
             }
             LoopEvent::Resize(cols, rows) => {
                 debug!(cols, rows, "host terminal resized");
+            }
+            LoopEvent::RemoteStarted(remote, result) => {
+                handle_remote_started(remote, result, self);
             }
             LoopEvent::Frame(remote, generation, frame) => {
                 if link_generation(self.links.get(&remote)) != Some(generation) {
@@ -927,13 +959,18 @@ fn run_loop(
             let mut resize_requests = Vec::new();
             let mut painted_area = ratatui::layout::Rect::default();
             let dialog = ctx.chrome.remote_edit.clone();
+            let start_prompt = ctx.chrome.remote_start.clone();
             terminal.draw(|frame| {
                 let source = MirrorPaneSource::for_view(ctx.mirrors, &in_view);
                 resize_requests =
                     crate::ui::compute_view_with_content(ctx.app, &source, frame.area());
                 ctx.app.sync_copy_mode_search_geometry();
                 crate::ui::render_with_content(ctx.app, &source, frame);
-                if let Some(dialog) = &dialog {
+                // At most one fleet modal is ever open; the start prompt
+                // wins if both somehow are, matching the key routing.
+                if let Some(prompt) = &start_prompt {
+                    crate::ui::render_remote_start_overlay(ctx.app, prompt, frame);
+                } else if let Some(dialog) = &dialog {
                     crate::ui::render_remote_edit_overlay(ctx.app, dialog, frame);
                 }
                 painted_area = frame.area();
@@ -1298,6 +1335,22 @@ fn handle_established(
             ctx.chrome.connection_status = Some(status);
             ctx.links.insert(remote, Link::Incompatible);
         }
+        RemoteEstablished::Stopped(status) => {
+            // Terminal like Incompatible: retrying cannot start a daemon on
+            // that host. The chip dims and the dialog offers the one action
+            // that can - starting it - so the user decides, not the loop.
+            info!(remote, status = %status, "fleet remote has no server running");
+            mirror.connection.stopped(status.clone());
+            ctx.chrome.connection_status = Some(status.clone());
+            ctx.chrome.remote_start = Some(super::remote_start::RemoteStartPrompt {
+                remote,
+                name: mirror.name.clone(),
+                status,
+                error: None,
+                starting: false,
+            });
+            ctx.links.insert(remote, Link::Stopped);
+        }
         RemoteEstablished::Failed(error) => {
             let attempt = match mirror.connection {
                 super::ClientConnectionState::Connecting { attempt } => attempt,
@@ -1428,7 +1481,10 @@ fn local_status_line_is_the_only_channel(app: &AppState, descriptors: &[RemoteDe
 
 /// Drops a remote's link after its transport died and schedules the retry.
 fn drop_link(remote: usize, ctx: &mut LoopCtx<'_>, why: &str) {
-    if matches!(ctx.links.get(&remote), Some(Link::Incompatible) | None) {
+    if matches!(
+        ctx.links.get(&remote),
+        Some(Link::Incompatible) | Some(Link::Stopped) | None
+    ) {
         return;
     }
     let Some(mirror) = ctx.mirrors.get_mut(remote) else {
@@ -2122,6 +2178,91 @@ fn interpret_raw_input(raw: crate::raw_input::RawInputEvent, ctx: &mut LoopCtx<'
     }
 }
 
+/// Approves the open start prompt: starts the remote's server over its own
+/// ssh bridge, off the run-loop thread.
+///
+/// Never blocking here is the point: an ssh spawn to a host that accepts the
+/// connection but stalls would otherwise freeze the render and every other
+/// remote with it. The prompt stays open showing progress until
+/// [`LoopEvent::RemoteStarted`] arrives.
+fn start_stopped_remote(ctx: &mut LoopCtx<'_>) {
+    let Some(prompt) = ctx.chrome.remote_start.as_ref() else {
+        return;
+    };
+    if prompt.starting {
+        return;
+    }
+    let remote = prompt.remote;
+    let Some(descriptor) = ctx
+        .descriptors
+        .iter()
+        .find(|descriptor| descriptor.index == remote)
+    else {
+        ctx.chrome.remote_start = None;
+        return;
+    };
+    // A local runtime has no remote daemon to start.
+    let Some(target) = descriptor.target.clone() else {
+        ctx.chrome.remote_start = None;
+        return;
+    };
+    let session = descriptor.session.clone();
+    // The same binary this remote connects with: starting a different one is
+    // how a host ends up serving a version nobody asked for.
+    let program = descriptor
+        .program
+        .clone()
+        .unwrap_or_else(|| crate::identity::BRAND.to_owned());
+
+    if let Some(prompt) = ctx.chrome.remote_start.as_mut() {
+        prompt.starting = true;
+        prompt.error = None;
+    }
+    let tx = ctx.event_tx.clone();
+    std::thread::spawn(move || {
+        let result = crate::fleet::bridge_child::start_remote_server(&target, &session, &program);
+        let _ = tx.send(LoopEvent::RemoteStarted(remote, result));
+    });
+}
+
+/// Applies the outcome of an explicit start.
+fn handle_remote_started(remote: usize, result: Result<(), String>, ctx: &mut LoopCtx<'_>) {
+    // The prompt may have been dismissed, or the fleet reconciled, while the
+    // start was in flight; a stale result must not resurrect either.
+    if ctx
+        .chrome
+        .remote_start
+        .as_ref()
+        .is_none_or(|prompt| prompt.remote != remote)
+    {
+        return;
+    }
+    match result {
+        Ok(()) => {
+            info!(remote, "started remote server; reconnecting");
+            ctx.chrome.remote_start = None;
+            ctx.chrome.connection_status = None;
+            if let Some(mirror) = ctx.mirrors.get_mut(remote) {
+                mirror.connection = super::ClientConnectionState::new();
+            }
+            // Leave the terminal link state so the loop reconnects at once.
+            ctx.links.insert(
+                remote,
+                Link::Down {
+                    retry_at: Instant::now(),
+                },
+            );
+        }
+        Err(err) => {
+            warn!(remote, err = %err, "starting the remote server failed");
+            if let Some(prompt) = ctx.chrome.remote_start.as_mut() {
+                prompt.starting = false;
+                prompt.error = Some(err);
+            }
+        }
+    }
+}
+
 /// The focused pane's owning remote and public pane id, when the pane is
 /// still present in that remote's catalog.
 fn focused_public_pane(
@@ -2138,6 +2279,28 @@ fn focused_public_pane(
 
 fn handle_key(key: crate::input::TerminalKey, ctx: &mut LoopCtx<'_>) {
     use crossterm::event::KeyCode;
+
+    // The start-a-stopped-remote confirmation captures the keyboard while
+    // open, ahead of the edit dialog: it is the more urgent of the two and
+    // they are never open together.
+    if ctx.chrome.remote_start.is_some() {
+        if key.kind == crossterm::event::KeyEventKind::Release {
+            return;
+        }
+        let decision = ctx
+            .chrome
+            .remote_start
+            .as_ref()
+            .map(|prompt| super::remote_start::remote_start_apply_key(prompt, key));
+        match decision.unwrap_or(super::remote_start::RemoteStartKeyResult::Ignored) {
+            super::remote_start::RemoteStartKeyResult::Start => start_stopped_remote(ctx),
+            super::remote_start::RemoteStartKeyResult::Dismiss => {
+                ctx.chrome.remote_start = None;
+            }
+            super::remote_start::RemoteStartKeyResult::Ignored => {}
+        }
+        return;
+    }
 
     // The add/edit-remote dialog captures the keyboard while open.
     if ctx.chrome.remote_edit.is_some() {
@@ -2595,6 +2758,13 @@ fn send_pane_bytes(links: &mut Links, remote: usize, pane_id: &str, bytes: &[u8]
 /// forwarded; remaining clicks resolve against the computed view into
 /// focus intents.
 fn handle_mouse(mouse: MouseEvent, ctx: &mut LoopCtx<'_>) {
+    // Herdr is mouse-first: both fleet modals swallow the mouse while open
+    // and only their own buttons act. The start prompt is checked first, in
+    // the same order as the key routing.
+    if ctx.chrome.remote_start.is_some() {
+        handle_start_prompt_click(mouse, ctx);
+        return;
+    }
     // The add/edit-remote dialog swallows the mouse while open; only its
     // buttons act.
     if ctx.chrome.remote_edit.is_some() {
@@ -2791,6 +2961,25 @@ fn handle_chip_click(
     };
     match button {
         crossterm::event::MouseButton::Left => {
+            // A dimmed, stopped chip re-offers the start. Without this,
+            // declining the prompt once would leave that remote dimmed for
+            // the rest of the session with nothing to click.
+            if matches!(ctx.links.get(&descriptor.index), Some(Link::Stopped)) {
+                if let Some(mirror) = ctx.mirrors.get(descriptor.index) {
+                    let status = match &mirror.connection {
+                        super::ClientConnectionState::Stopped { message } => message.clone(),
+                        _ => crate::fleet::connection::stopped_status_line(&descriptor.name),
+                    };
+                    ctx.chrome.remote_start = Some(super::remote_start::RemoteStartPrompt {
+                        remote: descriptor.index,
+                        name: descriptor.name.clone(),
+                        status,
+                        error: None,
+                        starting: false,
+                    });
+                    return;
+                }
+            }
             let now = Instant::now();
             let double = ctx.ui.last_chip_click.take().is_some_and(|(previous, at)| {
                 previous == chip_idx
@@ -2822,6 +3011,28 @@ fn handle_chip_click(
             ));
         }
         crossterm::event::MouseButton::Middle => {}
+    }
+}
+
+/// Routes a click inside the open start-remote confirmation to its buttons.
+fn handle_start_prompt_click(mouse: MouseEvent, ctx: &mut LoopCtx<'_>) {
+    if !matches!(
+        mouse.kind,
+        MouseEventKind::Down(crossterm::event::MouseButton::Left)
+    ) {
+        return;
+    }
+    let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+    let area = ratatui::layout::Rect::new(0, 0, cols, rows);
+    let Some(inner) = crate::ui::remote_start_inner_rect(area) else {
+        return;
+    };
+    let (start, cancel) = crate::ui::remote_start_button_rects(inner);
+    let position = ratatui::layout::Position::new(mouse.column, mouse.row);
+    if start.contains(position) {
+        start_stopped_remote(ctx);
+    } else if cancel.contains(position) {
+        ctx.chrome.remote_start = None;
     }
 }
 
@@ -3430,6 +3641,106 @@ mod tests {
             }
             _ => panic!("expected an incompatible rejection"),
         }
+    }
+
+    #[tokio::test]
+    async fn a_stopped_remote_dims_and_opens_the_start_prompt_instead_of_retrying() {
+        with_test_ctx(three_descriptors(), |ctx| {
+            ctx.links.insert(1, Link::Pending { generation: 1 });
+            handle_established(
+                1,
+                1,
+                RemoteEstablished::Stopped(crate::fleet::connection::stopped_status_line(
+                    "buildbox",
+                )),
+                ctx,
+            );
+
+            // Terminal link: the retry ladder must not run, because no
+            // number of reconnects can start a daemon on that host. Its own
+            // variant, not Incompatible's: the two dead ends have different
+            // fixes and must stay tellable apart.
+            assert!(
+                matches!(ctx.links.get(&1), Some(Link::Stopped)),
+                "a stopped remote must not be scheduled for retry"
+            );
+            let connection = ctx
+                .mirrors
+                .get(1)
+                .map(|mirror| mirror.connection.clone())
+                .expect("mirror");
+            assert!(connection.is_stopped(), "{connection:?}");
+            assert!(!connection.may_retry(), "stopped is terminal");
+
+            // The prompt names the remote and carries the actionable line.
+            let prompt = ctx.chrome.remote_start.as_ref().expect("start prompt");
+            assert_eq!(prompt.remote, 1);
+            assert_eq!(prompt.name, "buildbox");
+            assert!(
+                prompt.status.contains("remote start buildbox"),
+                "{prompt:?}"
+            );
+            assert_eq!(prompt.error, None);
+
+            // Declining leaves it stopped rather than starting anything.
+            ctx.chrome.remote_start = None;
+            assert!(ctx
+                .mirrors
+                .get(1)
+                .is_some_and(|mirror| mirror.connection.is_stopped()));
+            assert!(matches!(ctx.links.get(&1), Some(Link::Stopped)));
+
+            // ...but the dimmed chip re-offers it, so declining once does not
+            // strand the remote for the rest of the session.
+            handle_chip_click(1, crossterm::event::MouseButton::Left, ctx);
+            let reoffered = ctx.chrome.remote_start.as_ref().expect("re-offered");
+            assert_eq!(reoffered.remote, 1);
+            assert!(!reoffered.starting);
+            assert!(reoffered.status.contains("remote start buildbox"));
+        });
+    }
+
+    #[tokio::test]
+    async fn the_start_prompt_captures_input_ahead_of_the_edit_dialog() {
+        with_test_ctx(three_descriptors(), |ctx| {
+            ctx.chrome.remote_start = Some(super::super::remote_start::RemoteStartPrompt {
+                remote: 1,
+                name: "buildbox".into(),
+                status: "no server".into(),
+                error: None,
+                starting: false,
+            });
+            // A chip right-click would normally open the edit dialog; while
+            // the prompt is open `handle_mouse` routes to the prompt alone,
+            // so the click never reaches the chip strip.
+            handle_mouse(
+                MouseEvent {
+                    kind: MouseEventKind::Down(crossterm::event::MouseButton::Right),
+                    column: 0,
+                    row: 0,
+                    modifiers: KeyModifiers::empty(),
+                },
+                ctx,
+            );
+            assert!(
+                ctx.chrome.remote_edit.is_none(),
+                "the start prompt swallows the mouse while open"
+            );
+            assert!(ctx.chrome.remote_start.is_some(), "and stays open");
+
+            // Keys reach the prompt ahead of the edit dialog too: an open
+            // edit dialog must not steal the confirmation's Esc.
+            ctx.chrome.remote_edit = Some(super::super::remote_edit::RemoteEditState::add());
+            handle_key(key(KeyCode::Esc), ctx);
+            assert!(
+                ctx.chrome.remote_start.is_none(),
+                "Esc dismissed the prompt"
+            );
+            assert!(
+                ctx.chrome.remote_edit.is_some(),
+                "and left the edit dialog untouched"
+            );
+        });
     }
 
     #[tokio::test]

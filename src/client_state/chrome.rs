@@ -27,6 +27,8 @@ pub(crate) struct GlobalChrome {
     pub(crate) window_titles: std::collections::BTreeMap<usize, String>,
     /// The add/edit-remote dialog, when open.
     pub(crate) remote_edit: Option<super::remote_edit::RemoteEditState>,
+    /// The "start this stopped remote?" confirmation, when open.
+    pub(crate) remote_start: Option<super::remote_start::RemoteStartPrompt>,
     /// Double-click candidate for pane word selection, client-side mouse
     /// state exactly like the legacy `App::last_pane_click`.
     pub(crate) last_pane_click: Option<crate::app::PaneClickState>,

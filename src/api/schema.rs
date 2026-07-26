@@ -69,6 +69,8 @@ pub enum Method {
     RemoteList(EmptyParams),
     #[serde(rename = "remote.reset")]
     RemoteReset(RemoteTargetParams),
+    #[serde(rename = "remote.start")]
+    RemoteStart(RemoteTargetParams),
     #[serde(rename = "remote.reload")]
     RemoteReload(EmptyParams),
     #[serde(rename = "workspace.create")]

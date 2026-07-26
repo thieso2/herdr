@@ -18,6 +18,7 @@ pub(crate) mod fleet_view;
 #[cfg(unix)]
 pub(crate) mod intent;
 pub(crate) mod remote_edit;
+pub(crate) mod remote_start;
 #[cfg(unix)]
 pub(crate) mod run;
 

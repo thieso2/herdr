@@ -165,7 +165,12 @@ pub(crate) fn render_remote_chip_strip(app: &AppState, frame: &mut Frame) {
 
 fn render_chip(app: &AppState, chip: &RemoteChipState, rect: Rect, frame: &mut Frame) {
     let p = &app.palette;
-    let greyed = chip.connection == RemoteChipConnection::Incompatible;
+    // Both terminal states dim: neither is coming back on its own, and the
+    // user has to do something about it.
+    let greyed = matches!(
+        chip.connection,
+        RemoteChipConnection::Incompatible | RemoteChipConnection::Stopped
+    );
     let base = if chip.in_view && !greyed {
         Style::default().fg(p.text).bg(p.surface0)
     } else if chip.in_view {
@@ -189,6 +194,9 @@ fn render_chip(app: &AppState, chip: &RemoteChipState, rect: Rect, frame: &mut F
             crate::ui::spinner_frame(app.spinner_tick),
             if chip.in_view { p.yellow } else { p.overlay0 },
         ),
+        // A stopped remote is reachable but idle: a filled-but-dim dot
+        // reads as "there, not running", distinct from offline's hollow one.
+        RemoteChipConnection::Stopped => ("◍", p.overlay0),
         RemoteChipConnection::Offline | RemoteChipConnection::Incompatible => ("○", p.overlay0),
     };
     let dot_style = base.fg(dot_color);
@@ -212,6 +220,142 @@ fn render_chip(app: &AppState, chip: &RemoteChipState, rect: Rect, frame: &mut F
 const REMOTE_EDIT_POPUP_WIDTH: u16 = 52;
 #[cfg_attr(windows, allow(dead_code))]
 const REMOTE_EDIT_POPUP_HEIGHT: u16 = 14;
+
+/// Width and height of the start-a-stopped-remote confirmation.
+const REMOTE_START_POPUP_WIDTH: u16 = 52;
+const REMOTE_START_POPUP_HEIGHT: u16 = 10;
+
+/// Inner rect of the start-remote confirmation, for render and hit-testing.
+// Consumed only by the unix-only pure-client run path (#20/#23).
+#[cfg_attr(windows, allow(dead_code))]
+pub(crate) fn remote_start_inner_rect(area: Rect) -> Option<Rect> {
+    super::widgets::centered_popup_rect(area, REMOTE_START_POPUP_WIDTH, REMOTE_START_POPUP_HEIGHT)
+        .map(|popup| {
+            Rect::new(
+                popup.x + 1,
+                popup.y + 1,
+                popup.width.saturating_sub(2),
+                popup.height.saturating_sub(2),
+            )
+        })
+}
+
+/// (start, cancel) button rects inside the confirmation.
+// Consumed only by the unix-only pure-client run path (#20/#23).
+#[cfg_attr(windows, allow(dead_code))]
+pub(crate) fn remote_start_button_rects(inner: Rect) -> (Rect, Rect) {
+    let rects = super::widgets::action_button_row_rects(
+        inner,
+        &[
+            super::widgets::ActionButtonSpec {
+                hint: Some("↵"),
+                label: "start",
+            },
+            super::widgets::ActionButtonSpec {
+                hint: Some("esc"),
+                label: "not now",
+            },
+        ],
+        2,
+        inner.height.saturating_sub(1),
+    );
+    (rects[0], rects[1])
+}
+
+/// Draws the start-a-stopped-remote confirmation over the composed view.
+///
+/// Follows the add/edit dialog's shell, header and button row so the fleet's
+/// two modals read as one family.
+// Consumed only by the unix-only pure-client run path (#20/#23).
+#[cfg_attr(windows, allow(dead_code))]
+pub(crate) fn render_remote_start_overlay(
+    app: &AppState,
+    prompt: &crate::client_state::remote_start::RemoteStartPrompt,
+    frame: &mut Frame,
+) {
+    use ratatui::layout::{Constraint, Layout};
+    use ratatui::text::{Line, Span};
+    use ratatui::widgets::{Paragraph, Wrap};
+
+    let area = frame.area();
+    super::dim_background(frame, area);
+    let Some(inner) = super::widgets::render_modal_shell(
+        frame,
+        area,
+        REMOTE_START_POPUP_WIDTH,
+        REMOTE_START_POPUP_HEIGHT,
+        &app.palette,
+    ) else {
+        return;
+    };
+    if inner.height < 6 {
+        return;
+    }
+    let p = &app.palette;
+    let rows = Layout::vertical([
+        Constraint::Length(1), // header
+        Constraint::Length(1), // spacer
+        Constraint::Length(2), // body
+        Constraint::Length(2), // detail / error
+        Constraint::Min(0),
+    ])
+    .areas::<5>(inner);
+
+    super::widgets::render_modal_header(frame, rows[0], "start remote", p);
+
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(prompt.name.clone(), Style::default().fg(p.text)),
+            Span::styled(
+                format!(" has no {} server running.", crate::identity::BRAND),
+                Style::default().fg(p.subtext0),
+            ),
+        ]))
+        .wrap(Wrap { trim: true }),
+        rows[2],
+    );
+
+    // The failure of a previous attempt outranks the explanation: it is what
+    // the user needs to act on.
+    let (detail, detail_style) = match prompt.error.as_deref() {
+        Some(error) => (
+            format!("could not start it: {error}"),
+            Style::default().fg(p.red),
+        ),
+        None => (
+            "Starting one runs a herdr daemon on that machine.".to_owned(),
+            Style::default().fg(p.subtext0),
+        ),
+    };
+    frame.render_widget(
+        Paragraph::new(detail)
+            .style(detail_style)
+            .wrap(Wrap { trim: true }),
+        rows[3],
+    );
+
+    let (start_rect, cancel_rect) = remote_start_button_rects(inner);
+    super::widgets::render_action_button(
+        frame,
+        start_rect,
+        Some("↵"),
+        "start",
+        Style::default()
+            .fg(super::widgets::panel_contrast_fg(p))
+            .bg(p.accent)
+            .add_modifier(Modifier::BOLD),
+    );
+    super::widgets::render_action_button(
+        frame,
+        cancel_rect,
+        Some("esc"),
+        "not now",
+        Style::default()
+            .fg(p.text)
+            .bg(p.surface0)
+            .add_modifier(Modifier::BOLD),
+    );
+}
 
 /// Inner rect of the add/edit-remote dialog, for render and hit-testing.
 // Consumed only by the unix-only pure-client run path (#20/#23).

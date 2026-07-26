@@ -34,6 +34,12 @@ pub fn remote_infos_from_statuses(statuses: &[RemoteStatus]) -> Vec<RemoteInfo> 
                 Some(retry_in.as_millis().min(u128::from(u64::MAX)) as u64),
                 (!last_error.is_empty()).then(|| last_error.clone()),
             ),
+            RemoteStatusKind::Stopped { message } => (
+                RemoteConnectionStateInfo::Stopped,
+                None,
+                None,
+                (!message.is_empty()).then(|| message.clone()),
+            ),
             RemoteStatusKind::Incompatible { message } => (
                 RemoteConnectionStateInfo::Incompatible,
                 None,

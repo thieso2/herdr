@@ -667,6 +667,8 @@ pub enum RemoteChipConnection {
     Connected,
     Connecting,
     Offline,
+    /// Reachable, but nothing running there; the chip dims until started.
+    Stopped,
     /// Protocol windows do not overlap; the chip greys out.
     Incompatible,
 }

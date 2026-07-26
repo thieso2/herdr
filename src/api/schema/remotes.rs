@@ -4,7 +4,8 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum RemoteConnectionStateInfo {
-    /// The implicit local runtime (remote `#0`).
+    /// A local runtime: reached over this machine's API socket, so there is
+    /// no bridge to connect and nothing to retry.
     Local,
     /// A connect-plus-handshake attempt is in flight.
     Connecting,
@@ -15,6 +16,10 @@ pub enum RemoteConnectionStateInfo {
     Offline,
     /// Disabled in the fleet config; no connection is attempted.
     Disabled,
+    /// Reachable, with herdr installed, but no server running there. Starting
+    /// one writes to the host, so it never happens behind the user's back: the
+    /// remote parks here until an explicit `remote start`.
+    Stopped,
     /// The protocol version windows do not overlap; no automatic reconnects
     /// until one side is upgraded.
     Incompatible,
@@ -23,8 +28,7 @@ pub enum RemoteConnectionStateInfo {
     Unknown,
 }
 
-/// One fleet remote with its live connection state. The local runtime is the
-/// implicit entry at index 0.
+/// One fleet remote with its live connection state, in fleet-config order.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct RemoteInfo {
     pub index: usize,

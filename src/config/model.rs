@@ -891,10 +891,10 @@ pub struct ExperimentalConfig {
     /// control-plane methods.
     ///
     /// Unset resolves to the release default
-    /// (`crate::client_state::run::PURE_CLIENT_DEFAULT`, currently the
-    /// legacy path). An explicit `true`/`false` always wins over the
-    /// release default, so users who opted in or out keep their choice
-    /// when the default flips. Ignored on Windows.
+    /// (`crate::client_state::run::PURE_CLIENT_DEFAULT`, currently the pure
+    /// client). An explicit `true`/`false` always wins over the release
+    /// default, so users who opted in or out keep their choice when the
+    /// default flips. Ignored on Windows.
     pub pure_client: Option<bool>,
     /// Expose the focused pane's cursor anchor to the outer terminal even when
     /// the pane requested `?25l`, so macOS native input methods keep tracking

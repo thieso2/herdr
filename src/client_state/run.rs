@@ -57,16 +57,14 @@ const LOOP_TICK: Duration = Duration::from_millis(30);
 /// Release default of the pure-client mode when `[experimental]
 /// pure_client` is not set explicitly.
 ///
-/// FLIP PROCEDURE (release-gated): after the pure client has soaked on at
-/// least two preview releases, flip this constant to `true` in its own
-/// commit ("feat: default the tui to the pure client"). Nothing else
-/// changes: an explicit `pure_client = true`/`false` in the user's config
-/// always wins over this default (see [`pure_client_enabled`]), so early
-/// adopters and opt-outs keep their behavior, and the legacy path remains
-/// reachable with `pure_client = false` until it is deleted. Windows keeps
-/// ignoring the flag entirely (`run_client_with_mode` only consults it on
-/// unix) — flipping this constant does not change Windows behavior.
-pub(crate) const PURE_CLIENT_DEFAULT: bool = false;
+/// FLIPPED: the pure client is the default run path. An explicit
+/// `pure_client = true`/`false` in the user's config always wins over this
+/// default (see [`pure_client_enabled`]), so opt-outs keep their behavior,
+/// and the legacy path remains reachable with `pure_client = false` until
+/// it is deleted. Windows keeps ignoring the flag entirely
+/// (`run_client_with_mode` only consults it on unix), so this constant does
+/// not change Windows behavior.
+pub(crate) const PURE_CLIENT_DEFAULT: bool = true;
 
 /// Whether the pure-client run path is enabled for this process.
 ///
@@ -3791,8 +3789,8 @@ mod tests {
         );
         assert_eq!(pure_client_enabled(&config), PURE_CLIENT_DEFAULT);
         assert!(
-            !pure_client_enabled(&config),
-            "release-gated: the default stays legacy until the documented flip"
+            pure_client_enabled(&config),
+            "the pure client is the default run path"
         );
 
         // An explicit user setting always wins over the release default —

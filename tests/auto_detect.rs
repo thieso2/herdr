@@ -595,9 +595,9 @@ fn auto_detect_default_socket_path_from_config_dir() {
     // Don't set HERDR_SOCKET_PATH or HERDR_CLIENT_SOCKET_PATH.
     // The default paths should come from the app config directory, not XDG_RUNTIME_DIR.
     let app_dir_name = if cfg!(debug_assertions) {
-        "herdr-dev"
+        "overherdr-dev"
     } else {
-        "herdr"
+        "overherdr"
     };
     let api_socket = config_home.join(app_dir_name).join("herdr.sock");
     let client_socket = config_home.join(app_dir_name).join("herdr-client.sock");
@@ -675,9 +675,9 @@ fn auto_detect_writes_client_and_server_logs_to_separate_files() {
     wait_for_socket(&client_socket, Duration::from_secs(10));
 
     let app_dir_name = if cfg!(debug_assertions) {
-        "herdr-dev"
+        "overherdr-dev"
     } else {
-        "herdr"
+        "overherdr"
     };
     let log_dir = config_home.join(app_dir_name);
     let client_log = log_dir.join("herdr-client.log");
@@ -716,9 +716,9 @@ fn no_session_writes_startup_logs_to_monolith_file() {
     wait_for_socket(&api_socket, Duration::from_secs(10));
 
     let app_dir_name = if cfg!(debug_assertions) {
-        "herdr-dev"
+        "overherdr-dev"
     } else {
-        "herdr"
+        "overherdr"
     };
     let log_dir = config_home.join(app_dir_name);
     let monolith_log = log_dir.join("herdr.log");

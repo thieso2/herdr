@@ -994,7 +994,10 @@ impl Default for KeysConfig {
 impl Default for WorktreesConfig {
     fn default() -> Self {
         Self {
-            directory: "~/.herdr/worktrees".into(),
+            // Always BRAND, never BRAND_DEV: upstream uses one worktrees tree
+            // for debug and release alike, and splitting it would strand work
+            // created by a `cargo run` session.
+            directory: format!("~/.{}/worktrees", crate::identity::BRAND),
         }
     }
 }
@@ -1270,7 +1273,10 @@ hide_tab_bar_when_single_tab = true
     #[test]
     fn worktrees_directory_defaults_and_parses() {
         let default_config = Config::default();
-        assert_eq!(default_config.worktrees.directory, "~/.herdr/worktrees");
+        assert_eq!(
+            default_config.worktrees.directory,
+            format!("~/.{}/worktrees", crate::identity::BRAND)
+        );
 
         let toml = r#"
 [worktrees]

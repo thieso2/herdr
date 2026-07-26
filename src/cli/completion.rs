@@ -2,6 +2,10 @@ use std::io::Write;
 
 use clap_complete::{generate, Shell};
 
+/// Bin name embedded in generated completion scripts (`#compdef <name>`), so
+/// the installed `overherdr` command completes.
+pub(crate) const COMPLETION_BIN_NAME: &str = crate::identity::BRAND;
+
 pub(super) const SUPPORTED_SHELLS: [&str; 5] = ["bash", "elvish", "fish", "powershell", "zsh"];
 
 pub(super) fn supported_shells_usage() -> String {
@@ -31,13 +35,18 @@ pub(super) fn run_completion_command(args: &[String]) -> std::io::Result<i32> {
     let mut command = super::spec::command();
     if matches!(shell, Shell::Zsh) {
         let mut output = Vec::new();
-        generate(shell, &mut command, "herdr", &mut output);
+        generate(shell, &mut command, COMPLETION_BIN_NAME, &mut output);
         let script = String::from_utf8(output).map_err(|err| {
             std::io::Error::new(std::io::ErrorKind::InvalidData, err.utf8_error())
         })?;
         std::io::stdout().write_all(space_separated_zsh_long_options(&script).as_bytes())?;
     } else {
-        generate(shell, &mut command, "herdr", &mut std::io::stdout());
+        generate(
+            shell,
+            &mut command,
+            COMPLETION_BIN_NAME,
+            &mut std::io::stdout(),
+        );
     }
     Ok(0)
 }

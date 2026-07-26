@@ -72,6 +72,7 @@ mod events;
 mod fleet;
 mod ghostty;
 mod handoff_runtime;
+mod identity;
 mod input;
 mod integration;
 mod ipc;
@@ -111,7 +112,7 @@ fn init_logging() {
 }
 
 const DEFAULT_CONFIG: &str = r##"# herdr configuration
-# Place this file at ~/.config/herdr/config.toml
+# Place this file at ~/.config/overherdr/config.toml
 
 # Show first-run notification setup on startup.
 # Missing also shows onboarding; set false after you've chosen.
@@ -247,7 +248,7 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # agents = ""     # e.g. "alt" makes alt+1..9 focus agent rows directly
 
 # [worktrees]
-# directory = "~/.herdr/worktrees"
+# directory = "~/.overherdr/worktrees"
 
 [ui]
 # Sidebar width (auto-scaled based on workspace names, this sets the default)

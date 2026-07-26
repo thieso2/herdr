@@ -9,7 +9,7 @@ Seeds a running herdr server with navigator demo workspaces, tabs, panes,
 and fake agent states for recording the session navigator.
 
 Environment:
-  HERDR_NAV_SOCKET_PATH  API socket to target. Defaults to $HOME/.config/herdr-dev/herdr.sock.
+  HERDR_NAV_SOCKET_PATH  API socket to target. Defaults to $HOME/.config/overherdr-dev/herdr.sock.
   HERDR_NAV_CWD          Workspace cwd for created panes. Defaults to the repo root.
   HERDR_NAV_BIN          Herdr binary to call. Defaults to cargo run from the repo.
 USAGE
@@ -38,8 +38,8 @@ script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo_dir="$(cd -- "$script_dir/.." && pwd)"
 workspace_cwd="${HERDR_NAV_CWD:-$repo_dir}"
 config_home="${XDG_CONFIG_HOME:-$HOME/.config}"
-dev_socket="$config_home/herdr-dev/herdr.sock"
-main_socket="$config_home/herdr/herdr.sock"
+dev_socket="$config_home/overherdr-dev/herdr.sock"
+main_socket="$config_home/overherdr/herdr.sock"
 export HERDR_SOCKET_PATH="${HERDR_NAV_SOCKET_PATH:-$dev_socket}"
 
 if [[ "$allow_main" != 1 && "$HERDR_SOCKET_PATH" == "$main_socket" ]]; then

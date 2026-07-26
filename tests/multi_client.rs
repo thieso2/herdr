@@ -179,9 +179,9 @@ fn spawn_client_process(
 
 fn server_log_path(config_home: &Path) -> PathBuf {
     let app_dir = if cfg!(debug_assertions) {
-        "herdr-dev"
+        "overherdr-dev"
     } else {
-        "herdr"
+        "overherdr"
     };
     config_home.join(app_dir).join("herdr-server.log")
 }

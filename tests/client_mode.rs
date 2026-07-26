@@ -199,9 +199,9 @@ fn first_pane_id_in_workspace(socket_path: &PathBuf, workspace_id: &str) -> Stri
 
 fn app_dir_name() -> &'static str {
     if cfg!(debug_assertions) {
-        "herdr-dev"
+        "overherdr-dev"
     } else {
-        "herdr"
+        "overherdr"
     }
 }
 
@@ -340,9 +340,9 @@ fn client_sees_headless_startup_config_diagnostic() {
     let client_socket = runtime_dir.join("herdr-client.sock");
 
     let app_dir = if cfg!(debug_assertions) {
-        "herdr-dev"
+        "overherdr-dev"
     } else {
-        "herdr"
+        "overherdr"
     };
     fs::create_dir_all(config_home.join(app_dir)).unwrap();
     fs::write(

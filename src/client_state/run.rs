@@ -802,6 +802,7 @@ fn run_loop(
     // `--remote` fleet-of-one.
     for descriptor in descriptors.iter() {
         let link = establish_for(descriptor, mirrors, &mut ui, event_tx, should_quit);
+        note_local_handshake(descriptor, descriptors, chrome);
         links.insert(descriptor.index, link);
     }
     let mut ctx = LoopCtx {
@@ -859,6 +860,7 @@ fn run_loop(
                 ctx.event_tx,
                 ctx.should_quit,
             );
+            note_local_handshake(&descriptor, ctx.descriptors, ctx.chrome);
             ctx.links.insert(remote, link);
             dirty = true;
         }
@@ -985,6 +987,23 @@ fn apply_window_title(ctx: &mut LoopCtx<'_>) {
     if desired != ctx.ui.last_window_title {
         crate::client::write_window_title(desired.as_deref());
         ctx.ui.last_window_title = desired;
+    }
+}
+
+/// Says that the local handshake is in flight while it is the only thing
+/// on screen. The local connect runs off-thread now, so the first frame is
+/// drawn before the socket has answered: a fleet spins the local chip
+/// through `Connecting`, but a single-remote client renders no strip at
+/// all and would otherwise show a live-looking empty view - with the
+/// "press prefix+shift+n" hint it cannot yet honour, since intents are
+/// dropped until the link is up.
+fn note_local_handshake(
+    descriptor: &RemoteDescriptor,
+    descriptors: &[RemoteDescriptor],
+    chrome: &mut GlobalChrome,
+) {
+    if descriptor.target.is_none() && no_chip_strip_is_composed(descriptors) {
+        chrome.connection_status = Some("connecting to the local server".to_owned());
     }
 }
 
@@ -1147,7 +1166,7 @@ fn handle_established(
             // the only source of truth for this connection.
             mirror.begin_resync();
             ctx.ui.ever_connected = true;
-            if local_status_line_is_the_only_channel(ctx.descriptors) {
+            if local_status_line_is_the_only_channel(ctx.app, ctx.descriptors) {
                 ctx.chrome.connection_status = None;
             }
             let mut session = *session;
@@ -1247,7 +1266,7 @@ fn handle_established(
                 _ => 1,
             };
             debug!(remote, error = %error, "remote connect failed");
-            if is_local && local_status_line_is_the_only_channel(ctx.descriptors) {
+            if is_local && local_status_line_is_the_only_channel(ctx.app, ctx.descriptors) {
                 ctx.chrome.connection_status =
                     Some(format!("local server unreachable; retrying: {error}"));
             }
@@ -1276,25 +1295,19 @@ fn link_generation(link: Option<&Link>) -> Option<u64> {
     }
 }
 
-/// Sends heartbeat pings on established fleet links and fails links whose
-/// remote has been silent past the pong timeout, so a silently dead
-/// transport cannot keep a connected chip dot. The local socket is exempt,
-/// matching the legacy client — and locality follows the descriptor, not
-/// the index: an ephemeral `--remote` fleet-of-one puts an ssh transport at
-/// index 0, and that link needs heartbeats like any other remote. Returns
-/// true when a link changed state.
+/// Sends heartbeat pings on every established link and fails links whose
+/// peer has been silent past the pong timeout, so a silently dead
+/// transport cannot keep a connected chip dot. The local socket is no
+/// exception: now that its chip carries connection state like any fleet
+/// member's, a wedged local server (one that keeps the socket open and
+/// answers nothing) must go hollow on the same clock as the ssh remotes
+/// beside it - only a clean EOF is detected without a heartbeat. Every
+/// framed session answers `ping`, whatever the transport. Returns true
+/// when a link changed state.
 fn service_remote_heartbeats(ctx: &mut LoopCtx<'_>) -> bool {
     let now = Instant::now();
     let mut dead: Vec<usize> = Vec::new();
     for (remote, link) in ctx.links.iter_mut() {
-        let is_local = ctx
-            .descriptors
-            .iter()
-            .find(|descriptor| descriptor.index == *remote)
-            .is_none_or(|descriptor| descriptor.target.is_none());
-        if is_local {
-            continue;
-        }
         let Link::Up(session) = link else {
             continue;
         };
@@ -1357,15 +1370,25 @@ fn service_ui_ticks(ctx: &mut LoopCtx<'_>) -> bool {
     dirty
 }
 
-/// Drops a remote's link after its transport died and schedules the retry.
-/// Whether the local transport's state has nowhere to go but the status
-/// line. A fleet shows every member's connection - the local runtime
-/// included - on its chip dot; the single-remote pure client renders no
-/// chip strip, so it keeps today's status line.
-fn local_status_line_is_the_only_channel(descriptors: &[RemoteDescriptor]) -> bool {
+/// Whether a chip strip is composed at all. `compose_fleet_into` only
+/// populates chips for a configured fleet, so a single-remote client can
+/// never carry connection state on a dot, whatever the layout does.
+fn no_chip_strip_is_composed(descriptors: &[RemoteDescriptor]) -> bool {
     descriptors.len() < 2
 }
 
+/// Whether the local transport's state has nowhere to go but the status
+/// line. A fleet shows every member's connection - the local runtime
+/// included - on its chip dot, but only while that strip is on screen: it
+/// is composed away for a single remote, and laid out away by a collapsed
+/// sidebar, a sidebar too small to spare rows, or the mobile layout, which
+/// never renders one. Whenever the dot is not there, the status line is
+/// the only channel left.
+fn local_status_line_is_the_only_channel(app: &AppState, descriptors: &[RemoteDescriptor]) -> bool {
+    no_chip_strip_is_composed(descriptors) || app.view.remote_chip_strip_rect.height == 0
+}
+
+/// Drops a remote's link after its transport died and schedules the retry.
 fn drop_link(remote: usize, ctx: &mut LoopCtx<'_>, why: &str) {
     if matches!(ctx.links.get(&remote), Some(Link::Incompatible) | None) {
         return;
@@ -1375,7 +1398,9 @@ fn drop_link(remote: usize, ctx: &mut LoopCtx<'_>, why: &str) {
         return;
     };
     mirror.connection_lost(why);
-    if remote == LOCAL_REMOTE_INDEX && local_status_line_is_the_only_channel(ctx.descriptors) {
+    if remote == LOCAL_REMOTE_INDEX
+        && local_status_line_is_the_only_channel(ctx.app, ctx.descriptors)
+    {
         ctx.chrome.connection_status = Some(format!("{why}; reconnecting"));
     }
     ctx.links.insert(
@@ -1384,6 +1409,23 @@ fn drop_link(remote: usize, ctx: &mut LoopCtx<'_>, why: &str) {
             retry_at: Instant::now() + Duration::from_millis(500),
         },
     );
+}
+
+/// The bindings navigate mode does not run leaderlessly. Legacy parity:
+/// directional pane focus stays prefix-only there because the arrow keys
+/// belong to the workspace selection.
+fn navigate_mode_excludes(
+    keybinds: &crate::config::Keybinds,
+    key: crate::input::TerminalKey,
+) -> bool {
+    [
+        &keybinds.focus_pane_left,
+        &keybinds.focus_pane_down,
+        &keybinds.focus_pane_up,
+        &keybinds.focus_pane_right,
+    ]
+    .iter()
+    .any(|binding| binding.matches_prefix_key(key))
 }
 
 /// Keeps app.mode consistent with the composed catalog without clobbering
@@ -1651,7 +1693,10 @@ fn handle_server_frame(remote: usize, frame: Frame, ctx: &mut LoopCtx<'_>) {
                                     session.read_only.remove(&stream_id);
                                 }
                                 if remote == LOCAL_REMOTE_INDEX
-                                    && local_status_line_is_the_only_channel(ctx.descriptors)
+                                    && local_status_line_is_the_only_channel(
+                                        ctx.app,
+                                        ctx.descriptors,
+                                    )
                                 {
                                     ctx.chrome.connection_status = None;
                                 }
@@ -2085,7 +2130,28 @@ fn handle_key(key: crate::input::TerminalKey, ctx: &mut LoopCtx<'_>) {
             }
             if key.code == KeyCode::Char('q') {
                 ctx.app.should_quit = true;
+                return;
             }
+            // Navigate is the leaderless twin of prefix mode, exactly as
+            // in the legacy client (`handle_navigate_key` resolves keys
+            // through `BindingDispatch::Prefix`): every binding the
+            // NAVIGATE bar advertises - new tab, splits, close, zoom - has
+            // to act on a bare press, or the bar names keys that do
+            // nothing. Pane-focus directions are the one exclusion the
+            // legacy mode makes, because the arrows steer the workspace
+            // selection there.
+            if navigate_mode_excludes(&ctx.app.keybinds, key) {
+                return;
+            }
+            super::intent::dispatch_prefix_intent(
+                key,
+                ctx.links,
+                ctx.mirrors,
+                ctx.ids,
+                ctx.descriptors,
+                ctx.app,
+                ctx.chrome,
+            );
         }
         Mode::Copy => {
             if ctx.app.is_prefix_key(key) {
@@ -2855,6 +2921,10 @@ mod tests {
                 "an empty catalog focuses nothing"
             );
 
+            let (session, mut server) = session_pair();
+            ctx.links
+                .insert(LOCAL_REMOTE_INDEX, Link::Up(Box::new(session)));
+
             // The default prefix is ctrl+b.
             handle_key(
                 crate::input::TerminalKey::new(KeyCode::Char('b'), KeyModifiers::CONTROL),
@@ -2866,13 +2936,57 @@ mod tests {
                 "the empty screen tells the user to press prefix+shift+n"
             );
 
-            // ...and the following key reaches intent dispatch instead of
-            // being swallowed: prefix mode is consumed by it.
+            // ...and the whole user-visible path runs: the following key
+            // reaches intent dispatch and its method leaves the link. The
+            // mode alone proves nothing - the prefix arm consumes the mode
+            // before it matches any binding.
             handle_key(
                 crate::input::TerminalKey::new(KeyCode::Char('N'), KeyModifiers::SHIFT),
                 ctx,
             );
-            assert_ne!(ctx.app.mode, Mode::Prefix, "prefix mode is consumed");
+            let frame = try_read_control(&mut server).expect("prefix+shift+n reaches the wire");
+            assert_eq!(frame["method"], "api.request");
+            assert_eq!(
+                frame["params"]["request"]["method"], "workspace.create",
+                "{frame}"
+            );
+        });
+    }
+
+    /// Navigate is the leaderless twin of prefix mode, like the legacy
+    /// client's: the NAVIGATE bar on the empty screen names bare keys, so a
+    /// bare press has to run the same intent the prefix chord runs, or the
+    /// bar advertises keys that do nothing. Directional pane focus is the
+    /// one exclusion legacy makes.
+    #[tokio::test]
+    async fn navigate_mode_runs_prefix_intents_without_the_prefix() {
+        with_test_ctx(vec![RemoteDescriptor::local()], |ctx| {
+            compose_into(ctx.mirrors.local(), ctx.chrome, ctx.ids, ctx.app);
+            sync_mode(ctx.app);
+            assert_eq!(ctx.app.mode, Mode::Navigate);
+            let (session, mut server) = session_pair();
+            ctx.links
+                .insert(LOCAL_REMOTE_INDEX, Link::Up(Box::new(session)));
+
+            // Bare shift+N is the default new-workspace binding's RHS.
+            handle_key(
+                crate::input::TerminalKey::new(KeyCode::Char('N'), KeyModifiers::SHIFT),
+                ctx,
+            );
+            let frame =
+                try_read_control(&mut server).expect("a bare binding acts in navigate mode");
+            assert_eq!(
+                frame["params"]["request"]["method"], "workspace.create",
+                "{frame}"
+            );
+
+            // ...but the arrows and their vi twins steer the selection in
+            // navigate mode, so directional pane focus stays prefix-only.
+            handle_key(key(KeyCode::Char('h')), ctx);
+            assert!(
+                try_read_control(&mut server).is_none(),
+                "directional pane focus is prefix-only in navigate mode"
+            );
         });
     }
 
@@ -3199,6 +3313,19 @@ mod tests {
         });
     }
 
+    /// Composes the fleet and lays out a desktop frame, so the chip strip
+    /// geometry the status-line fallback reads is the real one.
+    fn render_chip_strip(ctx: &mut LoopCtx<'_>, width: u16, height: u16) {
+        super::super::compose::compose_fleet_into(
+            ctx.mirrors,
+            ctx.descriptors,
+            ctx.chrome,
+            ctx.ids,
+            ctx.app,
+        );
+        crate::ui::compute_view(ctx.app, ratatui::layout::Rect::new(0, 0, width, height));
+    }
+
     /// A fleet reads every member's transport state off its chip dot. The
     /// local runtime is no exception: dropping its link must not raise a
     /// status line no other remote gets.
@@ -3208,6 +3335,11 @@ mod tests {
             let (session, _rx) = threaded_session(1, 8);
             ctx.links
                 .insert(LOCAL_REMOTE_INDEX, Link::Up(Box::new(session)));
+            render_chip_strip(ctx, 106, 30);
+            assert!(
+                ctx.app.view.remote_chip_strip_rect.height > 0,
+                "the strip is on screen to carry the dot"
+            );
 
             drop_link(LOCAL_REMOTE_INDEX, ctx, "connection closed");
 
@@ -3241,6 +3373,7 @@ mod tests {
             let (session, _rx) = threaded_session(1, 8);
             ctx.links
                 .insert(LOCAL_REMOTE_INDEX, Link::Up(Box::new(session)));
+            render_chip_strip(ctx, 106, 30);
 
             drop_link(LOCAL_REMOTE_INDEX, ctx, "connection closed");
 
@@ -3248,6 +3381,75 @@ mod tests {
                 ctx.chrome.connection_status.as_deref(),
                 Some("connection closed; reconnecting"),
                 "with no chip strip the status line is the only channel"
+            );
+        });
+    }
+
+    /// A configured fleet is not the same fact as a visible chip strip: a
+    /// collapsed sidebar and the mobile layout both lay the strip away, and
+    /// with it the only place local's transport state was being reported.
+    /// The status line has to come back whenever the dot is not on screen.
+    #[tokio::test]
+    async fn a_hidden_chip_strip_sends_local_transport_loss_back_to_the_status_line() {
+        // Sidebar collapsed: chips are composed, the strip is not laid out.
+        with_test_ctx(three_descriptors(), |ctx| {
+            let (session, _rx) = threaded_session(1, 8);
+            ctx.links
+                .insert(LOCAL_REMOTE_INDEX, Link::Up(Box::new(session)));
+            ctx.chrome.sidebar_collapsed = true;
+            render_chip_strip(ctx, 106, 30);
+            assert!(
+                !ctx.app.remote_chips.is_empty(),
+                "the fleet still has chips"
+            );
+            assert_eq!(ctx.app.view.remote_chip_strip_rect.height, 0);
+
+            drop_link(LOCAL_REMOTE_INDEX, ctx, "connection closed");
+
+            assert_eq!(
+                ctx.chrome.connection_status.as_deref(),
+                Some("connection closed; reconnecting"),
+                "a collapsed sidebar hides the dot, so the toast is the only channel"
+            );
+        });
+
+        // Mobile: no strip is rendered at any width.
+        with_test_ctx(three_descriptors(), |ctx| {
+            let (session, _rx) = threaded_session(1, 8);
+            ctx.links
+                .insert(LOCAL_REMOTE_INDEX, Link::Up(Box::new(session)));
+            render_chip_strip(ctx, 40, 24);
+            assert_eq!(ctx.app.view.layout, crate::app::state::ViewLayout::Mobile);
+            assert_eq!(ctx.app.view.remote_chip_strip_rect.height, 0);
+
+            drop_link(LOCAL_REMOTE_INDEX, ctx, "connection closed");
+
+            assert_eq!(
+                ctx.chrome.connection_status.as_deref(),
+                Some("connection closed; reconnecting"),
+                "the mobile layout renders no chips, so the toast is the only channel"
+            );
+        });
+    }
+
+    /// The local connect runs off-thread now, so the first frame is drawn
+    /// before the socket answers. A fleet spins the local chip; a
+    /// single-remote client has no chip to spin and must say so, or the
+    /// empty view looks live while every intent is dropped.
+    #[tokio::test]
+    async fn the_single_remote_client_says_the_local_handshake_is_in_flight() {
+        with_test_ctx(vec![RemoteDescriptor::local()], |ctx| {
+            note_local_handshake(&ctx.descriptors[0].clone(), ctx.descriptors, ctx.chrome);
+            assert_eq!(
+                ctx.chrome.connection_status.as_deref(),
+                Some("connecting to the local server")
+            );
+        });
+        with_test_ctx(three_descriptors(), |ctx| {
+            note_local_handshake(&ctx.descriptors[0].clone(), ctx.descriptors, ctx.chrome);
+            assert_eq!(
+                ctx.chrome.connection_status, None,
+                "a fleet spins the local chip instead"
             );
         });
     }
@@ -3338,19 +3540,42 @@ mod tests {
         });
     }
 
+    /// A wedged local server - socket open, nothing answered - has to go
+    /// hollow on the same clock as the ssh remotes beside it, now that its
+    /// chip carries connection state like theirs. Without a heartbeat only
+    /// a clean EOF is ever detected, so a stopped-but-not-closed server
+    /// would keep a filled dot forever while its keystrokes vanish.
     #[tokio::test]
-    async fn the_local_socket_descriptor_stays_exempt_from_heartbeats() {
-        with_test_ctx(vec![RemoteDescriptor::local()], |ctx| {
-            let (mut session, _rx) = threaded_session(1, 8);
-            session.last_inbound = Instant::now() - REMOTE_PONG_TIMEOUT * 2;
+    async fn a_silent_local_socket_fails_the_heartbeat_like_any_remote() {
+        with_test_ctx(three_descriptors(), |ctx| {
+            let (mut session, rx) = threaded_session(1, 8);
+            session.next_ping = Instant::now();
             ctx.links
                 .insert(LOCAL_REMOTE_INDEX, Link::Up(Box::new(session)));
 
+            // Alive but idle: local is pinged like every other member.
             assert!(!service_remote_heartbeats(ctx));
+            assert!(rx.try_recv().is_ok(), "the local link is pinged too");
+
+            // Silent past the pong timeout: the link drops and the chip
+            // goes hollow.
+            if let Some(Link::Up(session)) = ctx.links.get_mut(&LOCAL_REMOTE_INDEX) {
+                session.last_inbound = Instant::now() - REMOTE_PONG_TIMEOUT;
+            }
+            assert!(service_remote_heartbeats(ctx), "a dead link changed state");
             assert!(matches!(
                 ctx.links.get(&LOCAL_REMOTE_INDEX),
-                Some(Link::Up(_))
+                Some(Link::Down { .. })
             ));
+            let chips = super::super::fleet_view::remote_chip_states(
+                ctx.mirrors,
+                ctx.descriptors,
+                &ctx.chrome.selection,
+            );
+            assert_eq!(
+                chips[0].connection,
+                crate::app::state::RemoteChipConnection::Offline
+            );
         });
     }
 

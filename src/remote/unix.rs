@@ -440,7 +440,9 @@ struct RemoteHerdr {
 
 impl RemoteHerdr {
     fn for_platform(platform: RemotePlatform) -> Self {
-        let install_suffix = ".local/bin/herdr".to_string();
+        // Unconditionally BRAND, never BRAND_DEV: a debug client must
+        // bootstrap a remote exactly the way a release client does.
+        let install_suffix = format!(".local/bin/{}", crate::identity::BRAND);
         let shell_path = format!("\"$HOME/{install_suffix}\"");
         Self {
             install_suffix,
@@ -1124,87 +1126,24 @@ fn remote_binary_candidates(
     let mut candidates = Vec::new();
 
     if let Some(path_candidate) = remote_binary_on_path_any(ssh, remote_herdr)? {
-        push_if_new_remote_binary_candidate(&mut candidates, path_candidate);
+        candidates.push(path_candidate);
     }
 
-    let output = ssh.sh_output(&known_remote_binary_candidate_script(
-        &remote_herdr.platform,
-    ))?;
-    if !output.status.success() {
-        return Err(command_failed("remote binary discovery failed", &output));
-    }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    for candidate in remote_herdrs_from_path_discovery(remote_herdr, &stdout) {
-        push_if_new_remote_binary_candidate(&mut candidates, candidate);
-    }
-
+    // The managed install path is the final fallback; callers chain it
+    // already. Package-manager discovery used to run a second SSH round trip
+    // to emit Homebrew/mise/Nix paths, all of which are out of scope for the
+    // fork, plus this same managed path.
     Ok(candidates)
-}
-
-fn push_if_new_remote_binary_candidate(candidates: &mut Vec<RemoteHerdr>, candidate: RemoteHerdr) {
-    if !candidates
-        .iter()
-        .any(|existing| existing.shell_path == candidate.shell_path)
-    {
-        candidates.push(candidate);
-    }
-}
-
-fn known_remote_binary_candidate_script(platform: &RemotePlatform) -> String {
-    let mut script = String::from(
-        r#"home=${HOME:-}
-user=${USER:-}
-version="#,
-    );
-    script.push_str(&shell_quote(&current_version()));
-    script.push_str(
-        r#"
-emit() {
-    path=$1
-    if [ -n "$path" ] && [ -x "$path" ]; then
-        printf '%s\n' "$path"
-    fi
-}
-if [ -n "$home" ]; then
-    emit "$home/.local/bin/herdr"
-fi
-"#,
-    );
-    if platform.os == "macos" {
-        script.push_str(
-            r#"    emit "/opt/homebrew/bin/herdr"
-    emit "/usr/local/bin/herdr"
-"#,
-        );
-    } else if platform.os == "linux" {
-        script.push_str(
-            r#"    emit "/home/linuxbrew/.linuxbrew/bin/herdr"
-"#,
-        );
-    }
-    script.push_str(
-        r#"if [ -n "$home" ]; then
-    emit "$home/.local/share/mise/installs/herdr/$version/bin/herdr"
-    emit "$home/.local/share/mise/installs/herdr/$version/herdr"
-    emit "$home/.local/share/mise/installs/github-ogulcancelik-herdr/$version/herdr"
-    emit "$home/.nix-profile/bin/herdr"
-fi
-if [ -n "$user" ]; then
-    emit "/etc/profiles/per-user/$user/bin/herdr"
-fi
-emit "/nix/var/nix/profiles/default/bin/herdr"
-emit "/run/current-system/sw/bin/herdr"
-"#,
-    );
-
-    script
 }
 
 fn remote_binary_on_path_any(
     ssh: &RemoteSsh,
     remote_herdr: &RemoteHerdr,
 ) -> io::Result<Option<RemoteHerdr>> {
-    let output = ssh.user_shell_output("command -v herdr")?;
+    // Probe for the fork's own name only. An upstream `herdr` on the same host
+    // is invisible: never adopted, never overwritten.
+    let probe = format!("command -v {}", crate::identity::BRAND);
+    let output = ssh.user_shell_output(&probe)?;
     if output.status.success() {
         let stdout = String::from_utf8_lossy(&output.stdout);
         if let Some(candidate) = remote_herdr_from_path_discovery(remote_herdr, &stdout) {
@@ -1214,20 +1153,13 @@ fn remote_binary_on_path_any(
 
     // Non-POSIX login shells such as xonsh reject `command -v`; retry through
     // /bin/sh while retaining the login-shell probe for shell-initialized PATHs.
-    let output = ssh.sh_output("command -v herdr\n")?;
+    let output = ssh.sh_output(&format!("{probe}\n"))?;
     if !output.status.success() {
         return Ok(None);
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     Ok(remote_herdr_from_path_discovery(remote_herdr, &stdout))
-}
-
-fn remote_herdrs_from_path_discovery(remote_herdr: &RemoteHerdr, stdout: &str) -> Vec<RemoteHerdr> {
-    stdout
-        .lines()
-        .filter_map(|path| remote_herdr_from_path(remote_herdr, path))
-        .collect()
 }
 
 fn remote_herdr_from_path_discovery(
@@ -1244,14 +1176,7 @@ fn remote_herdr_from_path(remote_herdr: &RemoteHerdr, path: &str) -> Option<Remo
     if !path.starts_with('/') {
         return None;
     }
-    if is_mise_shim_path(path) {
-        return None;
-    }
     Some(remote_herdr.clone().with_shell_path(shell_quote(path)))
-}
-
-fn is_mise_shim_path(path: &str) -> bool {
-    path.ends_with("/mise/shims/herdr")
 }
 
 /// What a remote herdr binary reports about itself.
@@ -1860,7 +1785,8 @@ fn version_label(version: Option<&str>) -> &str {
 }
 
 fn warn_if_remote_bin_not_on_path(ssh: &RemoteSsh) -> io::Result<()> {
-    let output = ssh.user_shell_output("command -v herdr")?;
+    let brand = crate::identity::BRAND;
+    let output = ssh.user_shell_output(&format!("command -v {brand}"))?;
     if output.status.success()
         && remote_shell_resolves_managed_install(&String::from_utf8_lossy(&output.stdout))
     {
@@ -1868,17 +1794,20 @@ fn warn_if_remote_bin_not_on_path(ssh: &RemoteSsh) -> io::Result<()> {
     }
 
     eprintln!(
-        "herdr: installed remote binary to ~/.local/bin/herdr, but the remote shell does not resolve `herdr` to that path"
+        "{brand}: installed remote binary to ~/.local/bin/{brand}, but the remote shell does not resolve `{brand}` to that path"
     );
     Ok(())
 }
 
 fn remote_shell_resolves_managed_install(stdout: &str) -> bool {
+    // Must track the warning above: if this checks a different path than the
+    // one we install to, the warning fires on every successful install.
+    let managed_suffix = format!("/.local/bin/{}", crate::identity::BRAND);
     stdout
         .lines()
         .next()
         .map(str::trim)
-        .is_some_and(|path| path.ends_with("/.local/bin/herdr"))
+        .is_some_and(|path| path.ends_with(&managed_suffix))
 }
 
 fn download_release_asset(
@@ -2938,7 +2867,10 @@ mod tests {
         });
         assert_eq!(
             remote_bridge_command(&remote_herdr, crate::session::DEFAULT_SESSION_NAME),
-            "exec \"$HOME/.local/bin/herdr\" remote-client-bridge"
+            format!(
+                "exec \"$HOME/.local/bin/{}\" remote-client-bridge",
+                crate::identity::BRAND
+            )
         );
     }
 
@@ -2991,73 +2923,35 @@ mod tests {
     }
 
     #[test]
-    fn remote_path_discovery_reads_multiple_absolute_paths() {
+    fn remote_install_path_and_probe_use_the_fork_brand() {
         let remote_herdr = RemoteHerdr::for_platform(RemotePlatform {
             os: "linux",
             arch: "x86_64",
         });
-        let candidates = remote_herdrs_from_path_discovery(
-            &remote_herdr,
-            "/usr/bin/herdr\nbin/herdr\n /opt/herdr bin/herdr\n",
-        );
 
-        assert_eq!(candidates.len(), 2);
-        assert_eq!(candidates[0].shell_path, "/usr/bin/herdr");
-        assert_eq!(candidates[1].shell_path, "'/opt/herdr bin/herdr'");
-    }
-
-    #[test]
-    fn remote_path_discovery_ignores_mise_shims() {
-        let remote_herdr = RemoteHerdr::for_platform(RemotePlatform {
-            os: "linux",
-            arch: "x86_64",
-        });
-        let candidates = remote_herdrs_from_path_discovery(
-            &remote_herdr,
-            "/home/can/.local/share/mise/shims/herdr\n/home/can/.local/share/mise/installs/herdr/0.7.1/bin/herdr\n",
-        );
-
-        assert_eq!(candidates.len(), 1);
+        // Unconditionally BRAND, never BRAND_DEV, so a debug client
+        // bootstraps a remote the same way a release client does.
         assert_eq!(
-            candidates[0].shell_path,
-            "/home/can/.local/share/mise/installs/herdr/0.7.1/bin/herdr"
+            remote_herdr.install_suffix,
+            format!(".local/bin/{}", crate::identity::BRAND)
         );
-    }
+        assert!(remote_herdr
+            .install_suffix
+            .ends_with(crate::identity::BRAND));
+        assert!(!remote_herdr
+            .install_suffix
+            .contains(crate::identity::BRAND_DEV));
 
-    #[test]
-    fn known_remote_binary_candidate_script_includes_mise_and_nix_paths() {
-        let script = known_remote_binary_candidate_script(&RemotePlatform {
-            os: "linux",
-            arch: "x86_64",
-        });
-
-        assert!(script.contains("emit \"$home/.local/bin/herdr\""));
-        assert!(!script.contains("mise/shims/herdr"));
-        assert!(script.contains(&format!("version={}", shell_quote(&current_version()))));
-        assert!(
-            script.contains("emit \"$home/.local/share/mise/installs/herdr/$version/bin/herdr\"")
-        );
-        assert!(script.contains("emit \"$home/.local/share/mise/installs/herdr/$version/herdr\""));
-        assert!(script.contains(
-            "emit \"$home/.local/share/mise/installs/github-ogulcancelik-herdr/$version/herdr\""
+        // The warning's gate must accept the path we actually install to,
+        // otherwise it fires after every successful install.
+        assert!(remote_shell_resolves_managed_install(&format!(
+            "/home/someone/{}\n",
+            remote_herdr.install_suffix
+        )));
+        // An upstream herdr on the same host must not satisfy it.
+        assert!(!remote_shell_resolves_managed_install(
+            "/home/someone/.local/bin/herdr\n"
         ));
-        assert!(script.contains("emit \"$home/.nix-profile/bin/herdr\""));
-        assert!(script.contains("emit \"/etc/profiles/per-user/$user/bin/herdr\""));
-        assert!(script.contains("emit \"/run/current-system/sw/bin/herdr\""));
-        assert!(script.contains("emit \"/home/linuxbrew/.linuxbrew/bin/herdr\""));
-        assert!(!script.contains("emit \"/opt/homebrew/bin/herdr\""));
-    }
-
-    #[test]
-    fn known_remote_binary_candidate_script_includes_macos_homebrew_paths() {
-        let script = known_remote_binary_candidate_script(&RemotePlatform {
-            os: "macos",
-            arch: "aarch64",
-        });
-
-        assert!(script.contains("emit \"/opt/homebrew/bin/herdr\""));
-        assert!(script.contains("emit \"/usr/local/bin/herdr\""));
-        assert!(!script.contains("emit \"/home/linuxbrew/.linuxbrew/bin/herdr\""));
     }
 
     #[test]
@@ -3100,14 +2994,19 @@ mod tests {
 
     #[test]
     fn remote_shell_path_warning_accepts_managed_install() {
-        assert!(remote_shell_resolves_managed_install(
-            "/home/can/.local/bin/herdr\n"
-        ));
-        assert!(remote_shell_resolves_managed_install(
-            "/Users/can/.local/bin/herdr\n"
-        ));
+        let brand = crate::identity::BRAND;
+        assert!(remote_shell_resolves_managed_install(&format!(
+            "/home/can/.local/bin/{brand}\n"
+        )));
+        assert!(remote_shell_resolves_managed_install(&format!(
+            "/Users/can/.local/bin/{brand}\n"
+        )));
+        assert!(!remote_shell_resolves_managed_install(&format!(
+            "/usr/local/bin/{brand}\n"
+        )));
+        // An upstream herdr in the managed location is still not ours.
         assert!(!remote_shell_resolves_managed_install(
-            "/usr/local/bin/herdr\n"
+            "/home/can/.local/bin/herdr\n"
         ));
         assert!(!remote_shell_resolves_managed_install(""));
     }

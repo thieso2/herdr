@@ -83,6 +83,27 @@ impl RemoteMirror {
     /// re-opened streams are the only source of truth. This is what makes
     /// ghost or duplicate panes impossible across reconnects.
     pub(crate) fn begin_resync(&mut self) {
+        self.clear_mirrored_state();
+    }
+
+    /// Drops everything mirrored from a session that is gone for good.
+    ///
+    /// Distinct from [`Self::connection_lost`], which keeps the catalog: an
+    /// offline remote is expected back and resyncs in full, so holding its
+    /// spaces avoids flicker across a blip. A remote that announced its stop
+    /// is not coming back on its own, and keeping its catalog left its spaces
+    /// and panes composed into the view — a machine on screen that is gone.
+    ///
+    /// Leaves the connection state alone: the caller decides what parked it.
+    pub(crate) fn session_ended(&mut self) {
+        self.clear_mirrored_state();
+    }
+
+    /// Everything this client mirrors from the far session: the catalog, the
+    /// pane replicas, and the stream ids that address them. Shared by the two
+    /// callers that drop the lot — a resync about to rebuild it, and a session
+    /// that has ended.
+    fn clear_mirrored_state(&mut self) {
         self.catalog = SessionCatalog::new();
         self.replicas.clear();
         self.pane_streams.clear();

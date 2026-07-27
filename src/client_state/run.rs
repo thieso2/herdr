@@ -1866,6 +1866,12 @@ fn handle_server_frame(remote: usize, frame: Frame, ctx: &mut LoopCtx<'_>) {
                         );
                         info!(remote, reason, "fleet remote server announced a stop");
                         mirror.connection.stopped(status.clone());
+                        // The spaces and panes behind this remote are gone
+                        // with it. Nothing else drops them: `drop_link`
+                        // early-returns on a stopped link, so the EOF that
+                        // follows cannot clean up either, and the composed
+                        // view kept listing a machine that had exited.
+                        mirror.session_ended();
                         ctx.chrome.connection_status = Some(status.clone());
                         ctx.chrome.remote_start = Some(super::remote_start::RemoteStartPrompt {
                             remote,
@@ -4257,6 +4263,73 @@ mod tests {
             stream_id: CONTROL_STREAM_ID,
             payload,
         }
+    }
+
+    /// Stopping a remote from the remotes dialog left its spaces and its pane
+    /// on screen: the announced stop parked the chip but nothing dropped what
+    /// the client had mirrored, so a machine that had exited kept contributing
+    /// rows to the spaces panel and a replica to the pane area.
+    #[tokio::test]
+    async fn an_announced_stop_drops_the_remotes_spaces_and_panes_from_the_view() {
+        with_test_ctx(three_descriptors(), |ctx| {
+            ctx.links.insert(1, Link::Pending { generation: 1 });
+            let snapshot: crate::api::schema::SessionSnapshot =
+                serde_json::from_value(serde_json::json!({
+                    "version": "test",
+                    "protocol": 3,
+                    "focused_workspace_id": "ws_1",
+                    "focused_tab_id": "t_1_1",
+                    "focused_pane_id": "p_1_1",
+                    "workspaces": [{
+                        "workspace_id": "ws_1", "number": 1, "label": "buildbox-repo",
+                        "focused": true, "pane_count": 1, "tab_count": 1,
+                        "active_tab_id": "t_1_1", "agent_status": "idle"
+                    }],
+                    "tabs": [{
+                        "tab_id": "t_1_1", "workspace_id": "ws_1", "number": 1,
+                        "label": "shell", "focused": true, "pane_count": 1,
+                        "agent_status": "idle"
+                    }],
+                    "panes": [{
+                        "pane_id": "p_1_1", "terminal_id": "term_1",
+                        "workspace_id": "ws_1", "tab_id": "t_1_1", "focused": true,
+                        "agent_status": "idle", "revision": 1
+                    }],
+                    "layouts": [], "agents": []
+                }))
+                .expect("snapshot");
+            if let Some(mirror) = ctx.mirrors.get_mut(1) {
+                mirror.catalog.resync(&snapshot, 1);
+            }
+
+            // The remote is contributing a space before the stop.
+            render_chip_strip(ctx, 106, 30);
+            let composed_before = ctx.app.workspaces.len();
+            assert!(
+                composed_before > 0,
+                "the remote's space is composed to begin with"
+            );
+
+            handle_server_frame(
+                1,
+                server_stopping_frame(crate::protocol::framed::SERVER_STOPPING_REASON_REQUESTED),
+                ctx,
+            );
+
+            // Nothing mirrored from the dead session survives...
+            let mirror = ctx.mirrors.get(1).expect("mirror");
+            assert!(mirror.catalog.workspaces.is_empty(), "catalog cleared");
+            assert!(mirror.replicas.is_empty(), "replicas cleared");
+            assert!(mirror.pane_streams.is_empty(), "streams cleared");
+
+            // ...so the next compose drops its space from the panel.
+            render_chip_strip(ctx, 106, 30);
+            assert!(
+                ctx.app.workspaces.len() < composed_before,
+                "a stopped remote must not keep a space on screen (before {composed_before}, after {})",
+                ctx.app.workspaces.len()
+            );
+        });
     }
 
     #[tokio::test]

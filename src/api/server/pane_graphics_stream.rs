@@ -1007,8 +1007,11 @@ mod tests {
 
         let (close_tx, close_rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || close_tx.send(api_rx.blocking_recv()).unwrap());
+        // Generous: this asserts that a close is dispatched at all, not how
+        // fast. A one-second deadline turns a loaded CI runner into a
+        // failure that says nothing about the code.
         let close = close_rx
-            .recv_timeout(Duration::from_secs(1))
+            .recv_timeout(Duration::from_secs(30))
             .expect("canceled idle stream should dispatch a close")
             .expect("API request channel should remain open");
         match &close.request.method {
@@ -1158,10 +1161,11 @@ mod tests {
 
         let (close_tx, close_rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || close_tx.send(api_rx.blocking_recv()).unwrap());
+        // Same reason as above: presence, not latency.
         let close = close_rx
-            .recv_timeout(Duration::from_secs(1))
-            .unwrap()
-            .unwrap();
+            .recv_timeout(Duration::from_secs(30))
+            .expect("a timed-out stream should dispatch a close")
+            .expect("API request channel should remain open");
         match &close.request.method {
             Method::PaneGraphicsStreamClose(params) => {
                 assert_eq!(params.pane_id, "pane_1");

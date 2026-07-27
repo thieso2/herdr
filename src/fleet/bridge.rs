@@ -16,6 +16,8 @@
 
 /// Exit code for "herdr is here, but no server is running". Distinct from
 /// the resolver's 127 (no binary at all) so the two are never conflated.
+// Only the unix bridge below reports it; the Windows stub cannot run one yet.
+#[cfg_attr(windows, allow(dead_code))]
 pub const BRIDGE_NO_SERVER_EXIT: i32 = 3;
 
 #[cfg(unix)]
@@ -80,7 +82,11 @@ mod unix {
     /// Whether a server is available to pump against. Only `start` may bring
     /// one up; otherwise a missing server is reported, never fixed.
     fn ensure_server_running(start: bool) -> io::Result<bool> {
-        if crate::server::autodetect::is_server_listening() {
+        // The API socket, not the client socket: that is what this bridge
+        // pumps against, and the server binds it first. Probing the client
+        // socket parked a live remote as `stopped` whenever the bridge
+        // arrived in the window between the two binds.
+        if crate::server::autodetect::is_api_server_listening() {
             return Ok(true);
         }
         if !start {

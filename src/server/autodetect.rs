@@ -48,6 +48,18 @@ pub fn is_server_listening() -> bool {
     is_server_listening_at(&client_socket_path())
 }
 
+/// Checks whether a herdr server is listening on the JSON API socket.
+///
+/// Distinct from [`is_server_listening`], which probes the client socket. A
+/// caller that goes on to speak the framed protocol must ask about the API
+/// socket: the server binds the API socket first and the client socket a
+/// moment later, so a client-socket probe answers "no server" for a window in
+/// which the API socket is already serving.
+#[cfg(unix)]
+pub fn is_api_server_listening() -> bool {
+    is_server_listening_at(&crate::api::socket_path())
+}
+
 /// Checks whether a herdr server is listening at a specific socket path.
 fn is_server_listening_at(socket_path: &Path) -> bool {
     #[cfg(windows)]
@@ -404,6 +416,43 @@ test "$sid" = "$$"
 
         let _listener = UnixListener::bind(&path).unwrap();
         assert!(is_server_listening_at(&path));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn the_api_socket_probe_sees_a_server_the_client_socket_probe_misses() {
+        // Regression: `herdr bridge` gated on the client socket but pumped
+        // against the API socket. The server binds the API socket first, so a
+        // bridge arriving in between reported "no server running" and parked a
+        // live remote as `stopped`.
+        let _guard = env_lock().lock().unwrap();
+        let dir = unique_test_dir("api-only");
+        std::fs::create_dir_all(&dir).unwrap();
+        let api_path = dir.join("herdr.sock");
+
+        std::env::set_var(crate::api::SOCKET_PATH_ENV_VAR, &api_path);
+        std::env::remove_var("HERDR_CLIENT_SOCKET_PATH");
+        std::env::remove_var(crate::session::SESSION_ENV_VAR);
+        crate::session::clear_explicit_session_for_test();
+
+        // Only the API socket is bound, exactly as during server startup.
+        let _listener = UnixListener::bind(&api_path).unwrap();
+        assert!(
+            !client_socket_path().exists(),
+            "client socket must be absent"
+        );
+
+        assert!(
+            is_api_server_listening(),
+            "the API socket is serving, so the bridge's probe must say so"
+        );
+        assert!(
+            !is_server_listening(),
+            "the client-socket probe is the one that misses it"
+        );
+
+        std::env::remove_var(crate::api::SOCKET_PATH_ENV_VAR);
+        crate::session::clear_explicit_session_for_test();
         let _ = std::fs::remove_dir_all(dir);
     }
 

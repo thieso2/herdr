@@ -115,12 +115,10 @@ fn bridge_subcommand_pumps_the_framed_protocol_to_the_api_socket() {
     let runtime_dir = base.join("runtime");
     let socket_path = base.join("herdr.sock");
     let spawned = spawn_herdr(&config_home, &runtime_dir, &socket_path);
+    // Only the API socket: that is what the bridge pumps against, and it is
+    // bound before the client socket. Arriving in that window is exactly the
+    // race that used to make the bridge report "no server" and exit.
     wait_for_socket(&socket_path, Duration::from_secs(10));
-    // The bridge decides a server is running by probing the *client* socket,
-    // which the server binds after the API socket. Waiting only for the API
-    // socket races it: a bridge that wins reports "no server" and exits, and
-    // its stderr is discarded here, so the failure reads as a bare EOF.
-    wait_for_socket(&base.join("herdr-client.sock"), Duration::from_secs(10));
 
     let mut bridge = Command::new(env!("CARGO_BIN_EXE_herdr"))
         .arg("bridge")

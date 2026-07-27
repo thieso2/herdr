@@ -782,7 +782,6 @@ fn app_for_mouse_test() -> App {
         app.state.view.sidebar_rect,
         ratatui::layout::Rect::default(),
         app.state.sidebar_collapsed,
-        false,
         app.state.sidebar_section_split,
     );
     app.state.view.sidebar_remotes_header_rect = remotes;

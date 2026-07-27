@@ -97,13 +97,14 @@ pub(crate) fn sidebar_section_header_rects(
     sidebar_area: Rect,
     strip_rect: Rect,
     sidebar_collapsed: bool,
-    has_chips: bool,
     split_ratio: f32,
 ) -> (Rect, Rect, Rect) {
     if sidebar_collapsed {
         return (Rect::default(), Rect::default(), Rect::default());
     }
-    let remotes = if strip_rect.width > 1 && strip_rect.height > 0 && has_chips {
+    // A composed strip is the whole condition: whether it holds chips says
+    // nothing about whether its header is on screen.
+    let remotes = if strip_rect.width > 1 && strip_rect.height > 0 {
         Rect::new(
             strip_rect.x,
             strip_rect.y,

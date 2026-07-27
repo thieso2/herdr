@@ -234,8 +234,12 @@ fn compute_view_internal(
     // Fleet chip strip: reserve rows atop the sidebar. `remote_chips` is
     // only populated by the pure client's fleet composition, so every other
     // path keeps today's geometry untouched.
-    let (chip_strip, sidebar_area) =
-        split_sidebar_for_chip_strip(&app.remote_chips, sidebar_area, app.sidebar_collapsed);
+    let (chip_strip, sidebar_area) = split_sidebar_for_chip_strip(
+        &app.remote_chips,
+        sidebar_area,
+        app.sidebar_collapsed,
+        app.pure_client,
+    );
 
     let (tab_bar_rect, terminal_area) = app
         .active
@@ -268,7 +272,6 @@ fn compute_view_internal(
             sidebar_area,
             chip_strip.strip_rect,
             app.sidebar_collapsed,
-            !app.remote_chips.is_empty(),
             app.sidebar_section_split,
         );
 

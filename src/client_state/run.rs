@@ -3745,6 +3745,36 @@ mod tests {
         });
     }
 
+    /// The bootstrap hole one step further in than a fleet of one: a fresh
+    /// install has no `remotes.toml` at all, so the fleet is empty, and a
+    /// strip composed only when it has a chip to show left that user with no
+    /// remotes section and nowhere to add their first remote.
+    #[tokio::test]
+    async fn an_empty_fleet_still_composes_the_remotes_strip() {
+        with_test_ctx(vec![], |ctx| {
+            ctx.app.pure_client = true;
+            ctx.app.fleet_config_backed = true;
+            render_chip_strip(ctx, 106, 30);
+
+            assert!(
+                ctx.app.remote_chips.is_empty(),
+                "nothing is configured, so there is no chip"
+            );
+            assert!(
+                ctx.app.view.remote_chip_strip_rect.height > 0,
+                "the strip is still on screen"
+            );
+            assert!(
+                ctx.app.view.sidebar_remotes_header_rect.width > 0,
+                "and its header, which owns adding, is reachable"
+            );
+            assert!(
+                ctx.app.global_menu_labels().contains(&"add remote"),
+                "a fleet with nothing in it is exactly where adding must work"
+            );
+        });
+    }
+
     #[tokio::test]
     async fn the_menu_adds_a_remote_from_the_keyboard_too() {
         with_test_ctx(vec![RemoteDescriptor::local()], |ctx| {

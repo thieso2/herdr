@@ -1863,6 +1863,18 @@ fn events_subscribe_streams_tab_and_workspace_close_events() {
     assert_eq!(workspace_renamed["data"]["workspace_id"], workspace_id);
     assert_eq!(workspace_renamed["data"]["label"], "renamed");
 
+    // Keep the catalog non-empty across the close. A server whose last space
+    // goes now exits, which would take the socket with it before the
+    // workspace_closed event could be read - this test is about the event,
+    // not about the exit.
+    send_request(
+        &socket_path,
+        &format!(
+            r#"{{"id":"req_tc_keepalive","method":"workspace.create","params":{{"cwd":"{}","focus":false}}}}"#,
+            base.display()
+        ),
+    );
+
     let closed_ws = send_request(
         &socket_path,
         r#"{"id":"req_tc_5","method":"workspace.close","params":{"workspace_id":"1"}}"#,

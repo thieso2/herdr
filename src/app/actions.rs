@@ -1641,6 +1641,10 @@ impl AppState {
             self.workspace_scroll = 0;
             self.tab_scroll = 0;
             self.tab_scroll_follow_active = true;
+            // Closing the last space leaves nothing to keep alive. On a
+            // server this asks for shutdown; everywhere else the latch is
+            // never armed, so this is a no-op.
+            self.request_exit_if_catalog_empty();
         } else {
             if self.selected >= self.workspaces.len() {
                 self.selected = self.workspaces.len() - 1;
@@ -3261,6 +3265,9 @@ impl AppState {
                 if self.mode == Mode::Terminal {
                     self.mode = Mode::Navigate;
                 }
+                // A pane whose process exited empties the catalog exactly
+                // like an explicit close does, so both trigger identically.
+                self.request_exit_if_catalog_empty();
             } else {
                 if let Some(active) = self.active {
                     if active >= self.workspaces.len() {
@@ -5735,6 +5742,50 @@ mod tests {
         assert_eq!(state.workspaces.len(), 1);
         assert_eq!(state.workspaces[0].display_name(), "selected");
         assert!(!state.terminals.contains_key(&active_terminal_id));
+        state.assert_invariants_for_test();
+    }
+
+    #[test]
+    fn closing_the_last_space_requests_exit_once_the_catalog_has_been_armed() {
+        let mut state = app_with_workspaces(&["only"]);
+        state.note_catalog_populated();
+
+        state.close_pane();
+
+        assert!(state.workspaces.is_empty());
+        assert!(
+            state.should_quit,
+            "closing the last space asks the server to go"
+        );
+        state.assert_invariants_for_test();
+    }
+
+    #[test]
+    fn a_pane_dying_empties_the_catalog_the_same_way_a_close_does() {
+        // Both removal paths must trigger identically: a closed pane and an
+        // exited shell are the same moment, not two candidate triggers.
+        let mut state = app_with_workspaces(&["only"]);
+        state.note_catalog_populated();
+        let pane = state.workspaces[0].tabs[0].root_pane;
+
+        state.handle_pane_died(pane);
+
+        assert!(state.workspaces.is_empty());
+        assert!(state.should_quit, "an exited process empties it too");
+        state.assert_invariants_for_test();
+    }
+
+    #[test]
+    fn an_unarmed_catalog_never_requests_exit() {
+        // The pure client composes this same state and exits on the same
+        // flag, so nothing may fire where the latch was never set.
+        let mut state = app_with_workspaces(&["only"]);
+        assert!(!state.catalog_ever_held_space);
+
+        state.close_pane();
+
+        assert!(state.workspaces.is_empty());
+        assert!(!state.should_quit, "a client must not be killed by this");
         state.assert_invariants_for_test();
     }
 

@@ -837,6 +837,10 @@ impl App {
             self.state.workspaces.remove(source_ws_idx);
             closed_workspace_id = Some(previous_workspace_id.clone());
             if self.state.workspaces.is_empty() {
+                // Deliberately no exit-on-empty request here, unlike the two
+                // removal paths: this is a cross-workspace *move*, so the
+                // destination workspace still holds the pane and this branch
+                // is unreachable. A move must never stop the server.
                 self.state.active = None;
                 self.state.selected = 0;
             } else {

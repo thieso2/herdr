@@ -1499,6 +1499,18 @@ pub struct AppState {
     pub selected: usize,
     pub mode: Mode,
     pub should_quit: bool,
+    /// Whether the catalog has held at least one space since this server
+    /// started. Arms the exit-on-empty rule: without it a fresh server with
+    /// no startup cwd and no restored session starts empty and would exit
+    /// before the startup seed or a client got a chance.
+    ///
+    /// Server runtime state, never persisted and never set client-side —
+    /// the pure client exits on the same `should_quit` field, so a latch it
+    /// could set would kill the client.
+    pub(crate) catalog_ever_held_space: bool,
+    /// Mirrors the server's shutdown-in-progress and live-handoff windows,
+    /// during which emptying the catalog must not request another exit.
+    pub(crate) exit_on_empty_suppressed: bool,
     /// True when this AppState is composed by the pure fleet client: menu
     /// entries whose effects only exist server-side (settings, reload
     /// config) are omitted, and detach means "exit the fleet client".
@@ -1705,6 +1717,45 @@ pub struct AppState {
 }
 
 impl AppState {
+    /// Arms the exit-on-empty rule once the catalog has actually held a
+    /// space. Never un-latches: a server that has hosted work and then lost
+    /// all of it is exactly the case the rule exists for.
+    ///
+    /// Called only from the server loop — the pure client shares this state
+    /// and exits on the same `should_quit`.
+    pub(crate) fn note_catalog_populated(&mut self) {
+        if !self.workspaces.is_empty() {
+            self.catalog_ever_held_space = true;
+        }
+    }
+
+    /// Whether this server should exit because nothing is left in it.
+    ///
+    /// A pure predicate over server-side state, so the run loop only has to
+    /// call it. Note what is deliberately absent: any notion of attached
+    /// clients. The fleet client holds a live session to every enabled
+    /// remote, so a "do not stop while a client is attached" veto would mean
+    /// the stop never fires for exactly the users it exists for.
+    pub(crate) fn should_exit_because_catalog_empty(&self) -> bool {
+        self.workspaces.is_empty()
+            && self.catalog_ever_held_space
+            && !self.exit_on_empty_suppressed
+            && !self.should_quit
+    }
+
+    /// Requests shutdown when the catalog just went empty; returns whether
+    /// it did. Setting `should_quit` rather than shutting down directly is
+    /// what keeps clients notified: the server loop turns the flag into the
+    /// shutdown-initiation path, which announces before it goes.
+    pub(crate) fn request_exit_if_catalog_empty(&mut self) -> bool {
+        if self.should_exit_because_catalog_empty() {
+            self.should_quit = true;
+            true
+        } else {
+            false
+        }
+    }
+
     pub(crate) fn mark_session_dirty(&mut self) {
         self.session_dirty = true;
     }
@@ -2058,6 +2109,8 @@ impl AppState {
             selected: 0,
             mode: Mode::Navigate,
             should_quit: false,
+            catalog_ever_held_space: false,
+            exit_on_empty_suppressed: false,
             pure_client: false,
             fleet_config_backed: false,
             detach_exits: false,
@@ -2590,6 +2643,68 @@ mod tests {
             scan_cols: 80,
             scan_screen: crate::ghostty::ActiveScreen::Primary,
         }
+    }
+
+    #[test]
+    fn exit_on_empty_needs_a_catalog_that_once_held_a_space() {
+        // A fresh server with no startup cwd and no restored session starts
+        // empty; without the latch it would exit before the startup seed or
+        // a client got a chance.
+        let mut state = AppState::test_new();
+        assert!(state.workspaces.is_empty());
+        assert!(
+            !state.should_exit_because_catalog_empty(),
+            "never held a space"
+        );
+
+        state.note_catalog_populated();
+        assert!(
+            !state.catalog_ever_held_space,
+            "an empty catalog does not arm the rule"
+        );
+
+        state
+            .workspaces
+            .push(crate::workspace::Workspace::test_new("one"));
+        state.note_catalog_populated();
+        assert!(state.catalog_ever_held_space);
+        assert!(
+            !state.should_exit_because_catalog_empty(),
+            "a catalog that still holds a space stays"
+        );
+
+        state.workspaces.clear();
+        assert!(
+            state.should_exit_because_catalog_empty(),
+            "held one, holds none: exit"
+        );
+        state.note_catalog_populated();
+        assert!(state.catalog_ever_held_space, "the latch never un-latches");
+    }
+
+    #[test]
+    fn exit_on_empty_is_suppressed_during_shutdown_and_handoff() {
+        let mut state = AppState::test_new();
+        state
+            .workspaces
+            .push(crate::workspace::Workspace::test_new("one"));
+        state.note_catalog_populated();
+        state.workspaces.clear();
+
+        state.exit_on_empty_suppressed = true;
+        assert!(
+            !state.should_exit_because_catalog_empty(),
+            "a shutdown already in progress, or a live handoff, does not re-trigger"
+        );
+        assert!(!state.request_exit_if_catalog_empty());
+        assert!(!state.should_quit);
+
+        state.exit_on_empty_suppressed = false;
+        assert!(state.request_exit_if_catalog_empty());
+        assert!(state.should_quit, "the run loop turns this into a shutdown");
+
+        // Already going: asking again changes nothing.
+        assert!(!state.request_exit_if_catalog_empty());
     }
 
     #[test]

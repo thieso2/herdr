@@ -495,6 +495,11 @@ impl HeadlessServer {
                 continue;
             }
 
+            // Arm exit-on-empty once this server has actually held a space.
+            // Latching here rather than at startup covers the server that
+            // gets its first space from a client after starting empty.
+            self.app.state.note_catalog_populated();
+
             // 1. Check render_dirty flag from PTY reader tasks.
             if self.app.render_dirty.load(Ordering::Acquire) {
                 needs_render = true;
@@ -586,7 +591,13 @@ impl HeadlessServer {
                 needs_graphics_render = false;
             }
 
-            if latest_app_client(&self.clients).is_some() && self.app.ensure_default_workspace() {
+            // `!should_quit` matters: without it an attached client refills
+            // the catalog in the very pass that requested exit-on-empty, so
+            // the server would spawn a shell and immediately kill it.
+            if latest_app_client(&self.clients).is_some()
+                && !self.app.state.should_quit
+                && self.app.ensure_default_workspace()
+            {
                 needs_render = true;
                 needs_full_render = true;
                 needs_graphics_render = false;
@@ -1073,6 +1084,10 @@ impl HeadlessServer {
         }
 
         self.handoff_in_progress = true;
+        // A rollback can resume readers and let panes die; during the
+        // handoff window that must not be read as "the user emptied this
+        // server". Kept assigned together so the two flags cannot drift.
+        self.app.state.exit_on_empty_suppressed = true;
         self.disconnect_all_clients_for_handoff();
         let _ = reject_pending_client_connections(&self.client_listener);
 
@@ -1237,9 +1252,20 @@ impl HeadlessServer {
         Ok(())
     }
 
+    /// Ends the old server after a live handoff.
+    ///
+    /// This deliberately does NOT call [`Self::initiate_shutdown`], and the
+    /// difference is load-bearing rather than incidental. Setting
+    /// `shutting_down` directly lands on the earlier of the run loop's two
+    /// shutdown checks, so no shutdown is announced to clients: the fleet
+    /// client must retry and reconnect to the *replacement* server rather
+    /// than park the remote as stopped. Clients were already disconnected
+    /// for the handoff, and the replacement now owns the sockets and the
+    /// session file. A test pins the silence.
     fn finish_live_handoff_shutdown(&mut self) {
         self.shutting_down = true;
         self.app.state.should_quit = true;
+        self.app.state.exit_on_empty_suppressed = true;
         self.app.no_session = true;
         info!("live handoff completed; old server exiting");
     }
@@ -1306,6 +1332,9 @@ impl HeadlessServer {
             }
         }
         self.handoff_in_progress = false;
+        // The handoff did not happen, so this server keeps running and the
+        // ordinary exit-on-empty rule applies again.
+        self.app.state.exit_on_empty_suppressed = false;
         let _ = std::fs::remove_file(socket_path);
     }
 
@@ -3427,7 +3456,12 @@ impl HeadlessServer {
             }
         }
 
-        if !skip_default_workspace && latest_app_client(&self.clients).is_some() {
+        // Same reason as the loop-pass refill: once exit-on-empty has fired,
+        // an attached client must not repopulate the catalog behind it.
+        if !skip_default_workspace
+            && latest_app_client(&self.clients).is_some()
+            && !self.app.state.should_quit
+        {
             changed |= self.app.ensure_default_workspace();
         }
 
@@ -4147,6 +4181,9 @@ impl HeadlessServer {
         }
         info!("server shutdown initiated");
         self.shutting_down = true;
+        // A pane dying during the flush window below must not re-enter the
+        // exit-on-empty logic; we are already going.
+        self.app.state.exit_on_empty_suppressed = true;
 
         // Clear client-local host graphics, then send ServerShutdown to all connected clients.
         self.send_all_clients_graphics_cleanup();
@@ -4392,6 +4429,10 @@ pub fn run_server() -> io::Result<()> {
             event_hub,
         );
         seed_startup_workspace_if_empty(&mut app);
+        // A restored or seeded catalog arms exit-on-empty immediately, so a
+        // server that comes up with panes and loses them all exits without
+        // waiting for a loop pass to notice it once held something.
+        app.state.note_catalog_populated();
 
         // The server runs headless — disable local notification side effects.
         // Sound and terminal notifications are forwarded to connected clients
@@ -4505,6 +4546,9 @@ fn run_handoff_import_server(socket_path: &Path, token: &str) -> io::Result<()> 
         app.state.local_sound_playback = false;
         app.local_terminal_notifications = false;
         app.local_input_source_switch = false;
+        // The replacement server inherits a populated catalog, so it inherits
+        // the arming too - otherwise an upgrade would silently disarm it.
+        app.state.note_catalog_populated();
         crate::server::handoff::report_restored(&mut received.stream)?;
         if std::env::var("HERDR_TEST_HANDOFF_IMPORT_FAIL").as_deref() == Ok("after_restored") {
             return Err(io::Error::other(
@@ -5548,6 +5592,54 @@ next_tab = ""
                 2
             );
         });
+    }
+
+    #[test]
+    fn a_live_handoff_exits_without_announcing_a_shutdown() {
+        // The fleet client parks a remote as Stopped the moment its server
+        // announces a shutdown. A live handoff must therefore stay silent:
+        // the client has to retry and reconnect to the *replacement* server,
+        // or an upgrade would present itself as a machine going away.
+        //
+        // That silence is currently a consequence of which function handoff
+        // calls — it sets `shutting_down` directly and so lands on the
+        // earlier of the run loop's two shutdown checks. This test makes
+        // the accident load-bearing on purpose.
+        let mut server = test_headless_server();
+        let control_rx = connect_pending_terminal_client_with_control_rx(&mut server, 7);
+
+        server.finish_live_handoff_shutdown();
+
+        assert!(server.shutting_down);
+        assert!(server.app.state.should_quit);
+        assert!(server.app.no_session);
+        assert!(
+            server.app.state.exit_on_empty_suppressed,
+            "an emptied catalog during handoff must not request a second exit"
+        );
+        while let Ok(bytes) = control_rx.try_recv() {
+            assert!(
+                !matches!(
+                    read_server_message(bytes),
+                    ServerMessage::ServerShutdown { .. }
+                ),
+                "a live handoff must not announce a shutdown to attached clients"
+            );
+        }
+    }
+
+    #[test]
+    fn an_ordinary_shutdown_announces_itself_before_clients_go() {
+        // The contrast to the handoff case above: this is the path that
+        // lets a client tell an intentional stop from a crash.
+        let mut server = test_headless_server();
+        let control_rx = connect_pending_terminal_client_with_control_rx(&mut server, 7);
+
+        server.initiate_shutdown();
+
+        let reason = read_server_shutdown_reason(control_rx.recv().expect("shutdown message"));
+        assert_eq!(reason, Some("server is shutting down".to_owned()));
+        assert!(server.app.state.exit_on_empty_suppressed);
     }
 
     #[test]

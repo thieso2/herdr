@@ -566,6 +566,8 @@ impl App {
             selected,
             mode,
             should_quit: false,
+            catalog_ever_held_space: false,
+            exit_on_empty_suppressed: false,
             detach_exits: no_session,
             detach_requested: false,
             pure_client: false,

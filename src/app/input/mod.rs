@@ -50,7 +50,9 @@ mod terminal;
 #[cfg(unix)]
 pub(crate) use self::clipboard::is_retained_selection_copy_key;
 #[cfg(unix)]
-pub(crate) use self::modal::{pure_client_modal_key, pure_client_modal_mouse, PureModalIds};
+pub(crate) use self::modal::{
+    open_keybind_help, pure_client_modal_key, pure_client_modal_mouse, PureModalIds,
+};
 pub(crate) use self::mouse::MouseAction;
 pub(crate) use self::{
     modal::{

@@ -42,6 +42,15 @@ pub(super) fn dispatch_prefix_intent(
         return;
     }
 
+    // The keybind help is client chrome too, and it is the *only* way to
+    // read the keymap now that the global menu is gone. Without this it
+    // fell through to the API-method mapping, matched nothing, and
+    // `prefix ?` silently did nothing.
+    if app.keybinds.help.matches_prefix_key(key) {
+        crate::app::open_keybind_help(app);
+        return;
+    }
+
     // With nothing focused (for example a solo'd remote with no spaces
     // yet), creation still goes to the *effective* focused remote, never
     // silently to local — and never to a remote filtered out of view.
@@ -591,6 +600,38 @@ mod tests {
         );
         app.keybinds = crate::config::Config::default().keybinds();
         (mirrors, ids, app)
+    }
+
+    #[test]
+    fn prefix_help_opens_the_keybind_overlay_client_side() {
+        // Regression: `prefix ?` fell through to the API-method mapping,
+        // matched nothing, and did nothing at all. The keymap is client
+        // chrome - and now the only way to read it, the global menu having
+        // been removed - so it has to be handled here.
+        let (mut mirrors, mut ids, mut app) = composed();
+        let mut links = Links::new();
+        let mut chrome = GlobalChrome::new();
+        let descriptors =
+            super::super::fleet_view::remote_descriptors(&[crate::fleet::config::RemoteEntry {
+                name: "local".into(),
+                target: None,
+                session: "default".into(),
+                enabled: true,
+            }]);
+        assert_ne!(app.mode, crate::app::Mode::KeybindHelp);
+
+        dispatch_prefix_intent(
+            TerminalKey::new(KeyCode::Char('?'), KeyModifiers::SHIFT),
+            &mut links,
+            &mut mirrors,
+            &mut ids,
+            &descriptors,
+            &mut app,
+            &mut chrome,
+        );
+        assert_eq!(app.mode, crate::app::Mode::KeybindHelp);
+        // Client chrome only: nothing was sent to any remote.
+        assert!(links.is_empty(), "opening help must not hit the wire");
     }
 
     fn key(code: KeyCode) -> TerminalKey {

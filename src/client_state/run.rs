@@ -870,7 +870,7 @@ fn run_loop(
     // `--remote` fleet-of-one.
     for descriptor in descriptors.iter() {
         let link = establish_for(descriptor, mirrors, &mut ui, event_tx, should_quit);
-        note_local_handshake(descriptor, descriptors, chrome);
+        note_local_handshake(descriptor, descriptors, app, chrome);
         links.insert(descriptor.index, link);
     }
     let mut ctx = LoopCtx {
@@ -928,7 +928,7 @@ fn run_loop(
                 ctx.event_tx,
                 ctx.should_quit,
             );
-            note_local_handshake(&descriptor, ctx.descriptors, ctx.chrome);
+            note_local_handshake(&descriptor, ctx.descriptors, ctx.app, ctx.chrome);
             ctx.links.insert(remote, link);
             dirty = true;
         }
@@ -1073,9 +1073,15 @@ fn apply_window_title(ctx: &mut LoopCtx<'_>) {
 fn note_local_handshake(
     descriptor: &RemoteDescriptor,
     descriptors: &[RemoteDescriptor],
+    app: &AppState,
     chrome: &mut GlobalChrome,
 ) {
-    if descriptor.target.is_none() && no_chip_strip_is_composed(descriptors) {
+    // Same gate as every other connection-state report: the chip dot says
+    // it whenever the strip is on screen, and the status line only speaks
+    // where no chip can. This used to test `no_chip_strip_is_composed`
+    // alone, which silently stopped firing once a fleet of one composed a
+    // strip - leaving a collapsed sidebar with nothing to say at all.
+    if descriptor.target.is_none() && local_status_line_is_the_only_channel(app, descriptors) {
         chrome.connection_status = Some("connecting to the local server".to_owned());
     }
 }
@@ -1476,7 +1482,8 @@ fn service_ui_ticks(ctx: &mut LoopCtx<'_>) -> bool {
 /// populates chips for a configured fleet, so a single-remote client can
 /// never carry connection state on a dot, whatever the layout does.
 fn no_chip_strip_is_composed(descriptors: &[RemoteDescriptor]) -> bool {
-    descriptors.len() < 2
+    // Only a fleet with nothing in it composes no strip at all.
+    descriptors.is_empty()
 }
 
 /// Whether the local transport's state has nowhere to go but the status
@@ -3414,24 +3421,25 @@ mod tests {
         });
     }
 
-    /// The reported bootstrap hole: with only the local runtime configured
-    /// no chip strip is composed, so the strip's add affordance - the only
-    /// way to add a remote - does not exist. The global menu is always
-    /// reachable, so its "add remote" entry has to open the same dialog,
-    /// end to end through the real menu mouse path.
+    /// The reported bootstrap hole, closed at the source: a one-remote
+    /// fleet used to compose no strip, so the strip's add affordance - the
+    /// only way to add a remote - did not exist, and a menu entry had to
+    /// stand in for it. The strip is always composed now, so the affordance
+    /// is always there and the menu is not needed for this at all.
     #[tokio::test]
-    async fn the_menu_adds_the_first_remote_when_no_chip_strip_exists() {
+    async fn the_first_remote_can_be_added_from_a_one_remote_strip() {
         use crossterm::event::MouseButton;
         with_test_ctx(vec![RemoteDescriptor::local()], |ctx| {
             ctx.app.pure_client = true;
             ctx.app.fleet_config_backed = true;
             render_chip_strip(ctx, 106, 30);
-            assert!(
-                ctx.app.remote_chips.is_empty(),
-                "a local-only fleet composes no chips"
-            );
             assert_eq!(
-                ctx.app.view.remote_add_hit_area.width, 0,
+                ctx.app.remote_chips.len(),
+                1,
+                "a one-remote fleet still composes its strip"
+            );
+            assert!(
+                ctx.app.view.remote_add_hit_area.width > 0,
                 "and so the strip's add affordance is not on screen"
             );
 
@@ -3508,9 +3516,10 @@ mod tests {
         with_test_ctx(vec![ephemeral.clone()], |ctx| {
             ctx.app.pure_client = true;
             render_chip_strip(ctx, 106, 30);
-            assert!(
-                ctx.app.remote_chips.is_empty(),
-                "a fleet of one composes no chips"
+            assert_eq!(
+                ctx.app.remote_chips.len(),
+                1,
+                "the strip is composed even for a fleet of one"
             );
 
             assert!(
@@ -3986,23 +3995,39 @@ mod tests {
         });
     }
 
-    /// The single-remote pure client has no chip strip, so it keeps the
-    /// status line - this is the fence that the fleet symmetry above does
-    /// not change the flag-on, no-fleet view.
+    /// The strip is composed even for a fleet of one, so its dot carries
+    /// the connection state and the status line stays quiet - but a strip
+    /// laid out away (collapsed sidebar, mobile, too few rows) leaves the
+    /// status line as the only channel, and it must still speak there.
     #[tokio::test]
-    async fn a_single_remote_client_still_reports_transport_loss_in_the_status_line() {
+    async fn a_single_remote_reports_transport_loss_wherever_it_can_be_seen() {
         with_test_ctx(vec![RemoteDescriptor::local()], |ctx| {
             let (session, _rx) = threaded_session(1, 8);
             ctx.links
                 .insert(LOCAL_REMOTE_INDEX, Link::Up(Box::new(session)));
             render_chip_strip(ctx, 106, 30);
+            assert!(
+                ctx.app.view.remote_chip_strip_rect.height > 0,
+                "a fleet of one still composes its strip"
+            );
 
             drop_link(LOCAL_REMOTE_INDEX, ctx, "connection closed");
+            assert_eq!(
+                ctx.chrome.connection_status, None,
+                "with the strip on screen the chip dot is the channel"
+            );
 
+            // Lay the strip away: now the status line is all that is left.
+            ctx.app.view.remote_chip_strip_rect = ratatui::layout::Rect::default();
+            ctx.links.insert(
+                LOCAL_REMOTE_INDEX,
+                Link::Up(Box::new(threaded_session(1, 8).0)),
+            );
+            drop_link(LOCAL_REMOTE_INDEX, ctx, "connection closed");
             assert_eq!(
                 ctx.chrome.connection_status.as_deref(),
                 Some("connection closed; reconnecting"),
-                "with no chip strip the status line is the only channel"
+                "with no strip on screen the status line is the only channel"
             );
         });
     }
@@ -4055,20 +4080,46 @@ mod tests {
     }
 
     /// The local connect runs off-thread now, so the first frame is drawn
-    /// before the socket answers. A fleet spins the local chip; a
-    /// single-remote client has no chip to spin and must say so, or the
+    /// before the socket answers. Wherever a chip is on screen it spins and
+    /// says so; where no strip is laid out - the mobile layout, a collapsed
+    /// sidebar - the client must say it in the status line instead, or the
     /// empty view looks live while every intent is dropped.
     #[tokio::test]
-    async fn the_single_remote_client_says_the_local_handshake_is_in_flight() {
+    async fn the_client_says_the_local_handshake_is_in_flight_when_no_chip_can() {
         with_test_ctx(vec![RemoteDescriptor::local()], |ctx| {
-            note_local_handshake(&ctx.descriptors[0].clone(), ctx.descriptors, ctx.chrome);
+            // No strip laid out: the status line is the only channel.
+            ctx.app.view.remote_chip_strip_rect = ratatui::layout::Rect::default();
+            note_local_handshake(
+                &ctx.descriptors[0].clone(),
+                ctx.descriptors,
+                ctx.app,
+                ctx.chrome,
+            );
             assert_eq!(
                 ctx.chrome.connection_status.as_deref(),
                 Some("connecting to the local server")
             );
         });
+        with_test_ctx(vec![RemoteDescriptor::local()], |ctx| {
+            // Strip on screen: its dot spins, so the status line stays quiet.
+            render_chip_strip(ctx, 106, 30);
+            assert!(ctx.app.view.remote_chip_strip_rect.height > 0);
+            note_local_handshake(
+                &ctx.descriptors[0].clone(),
+                ctx.descriptors,
+                ctx.app,
+                ctx.chrome,
+            );
+            assert_eq!(ctx.chrome.connection_status, None);
+        });
         with_test_ctx(three_descriptors(), |ctx| {
-            note_local_handshake(&ctx.descriptors[0].clone(), ctx.descriptors, ctx.chrome);
+            render_chip_strip(ctx, 106, 30);
+            note_local_handshake(
+                &ctx.descriptors[0].clone(),
+                ctx.descriptors,
+                ctx.app,
+                ctx.chrome,
+            );
             assert_eq!(
                 ctx.chrome.connection_status, None,
                 "a fleet spins the local chip instead"

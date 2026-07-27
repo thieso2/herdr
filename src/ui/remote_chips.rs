@@ -51,6 +51,7 @@ pub(crate) fn split_sidebar_for_chip_strip(
     chips: &[RemoteChipState],
     sidebar_area: Rect,
     sidebar_collapsed: bool,
+    config_backed: bool,
 ) -> (RemoteChipStripLayout, Rect) {
     if chips.is_empty() || sidebar_collapsed || sidebar_area.width <= 2 {
         return (RemoteChipStripLayout::default(), sidebar_area);
@@ -96,13 +97,23 @@ pub(crate) fn split_sidebar_for_chip_strip(
     let chip_rows = placed_rows.max(1);
     let strip_h = chip_rows + STRIP_CHROME_ROWS;
     let strip_rect = Rect::new(sidebar_area.x, sidebar_area.y, sidebar_area.width, strip_h);
+    // The add affordance writes to `remotes.toml`, so it only exists for a
+    // config-backed fleet. An ephemeral `--remote` fleet-of-one has no file
+    // to write: saving there would leave the ssh link under a descriptor
+    // describing a different machine. It used to be suppressed as a side
+    // effect of composing no strip at all; the strip is always composed now,
+    // so the gate has to be explicit.
     let add_w = display_width_u16(ADD_LABEL);
-    let add_hit_area = Rect::new(
-        sidebar_area.x + content_w.saturating_sub(add_w + 1),
-        sidebar_area.y,
-        add_w,
-        1,
-    );
+    let add_hit_area = if config_backed {
+        Rect::new(
+            sidebar_area.x + content_w.saturating_sub(add_w + 1),
+            sidebar_area.y,
+            add_w,
+            1,
+        )
+    } else {
+        Rect::default()
+    };
     let rest = Rect::new(
         sidebar_area.x,
         sidebar_area.y + strip_h,
@@ -527,12 +538,12 @@ mod tests {
     #[test]
     fn no_chips_reserves_no_rows_and_keeps_the_sidebar_untouched() {
         let area = Rect::new(0, 0, 26, 20);
-        let (layout, rest) = split_sidebar_for_chip_strip(&[], area, false);
+        let (layout, rest) = split_sidebar_for_chip_strip(&[], area, false, true);
         assert_eq!(layout, RemoteChipStripLayout::default());
         assert_eq!(rest, area);
 
         // A collapsed sidebar never shows the strip either.
-        let (layout, rest) = split_sidebar_for_chip_strip(&[chip("a")], area, true);
+        let (layout, rest) = split_sidebar_for_chip_strip(&[chip("a")], area, true, true);
         assert_eq!(layout.strip_rect, Rect::default());
         assert_eq!(rest, area);
     }
@@ -541,7 +552,7 @@ mod tests {
     fn chips_wrap_across_rows_and_shift_the_sections_down() {
         let area = Rect::new(0, 0, 26, 24);
         let chips = vec![chip("local"), chip("buildbox"), chip("gpu-01")];
-        let (layout, rest) = split_sidebar_for_chip_strip(&chips, area, false);
+        let (layout, rest) = split_sidebar_for_chip_strip(&chips, area, false, true);
 
         // " ● local " (9) + gap + " ● buildbox " (12) = 22 <= 25 fits row 0;
         // gpu-01 wraps to row 1.
@@ -559,7 +570,8 @@ mod tests {
     #[test]
     fn a_tiny_sidebar_drops_the_strip_rather_than_the_sections() {
         let area = Rect::new(0, 0, 26, 7);
-        let (layout, rest) = split_sidebar_for_chip_strip(&[chip("a"), chip("b")], area, false);
+        let (layout, rest) =
+            split_sidebar_for_chip_strip(&[chip("a"), chip("b")], area, false, true);
         assert_eq!(layout.strip_rect, Rect::default());
         assert_eq!(rest, area);
     }
@@ -570,7 +582,7 @@ mod tests {
         // or is dropped, and the strip must not reserve a blank second row.
         let area = Rect::new(0, 0, 26, 9);
         let chips = vec![chip("local"), chip("buildbox"), chip("gpu-01")];
-        let (layout, rest) = split_sidebar_for_chip_strip(&chips, area, false);
+        let (layout, rest) = split_sidebar_for_chip_strip(&chips, area, false, true);
         assert!(layout.chip_hit_areas[0].width > 0);
         assert!(layout.chip_hit_areas[1].width > 0);
         assert_eq!(
@@ -587,7 +599,7 @@ mod tests {
     fn chip_hit_testing_resolves_by_index() {
         let area = Rect::new(0, 0, 26, 24);
         let chips = vec![chip("local"), chip("gpu-01")];
-        let (layout, _) = split_sidebar_for_chip_strip(&chips, area, false);
+        let (layout, _) = split_sidebar_for_chip_strip(&chips, area, false, true);
         let mut app = crate::app::AppState::test_new();
         app.remote_chips = chips;
         app.view.remote_chip_hit_areas = layout.chip_hit_areas;

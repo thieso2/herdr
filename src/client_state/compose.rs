@@ -374,11 +374,13 @@ pub(crate) fn compose_fleet_into(
         app,
     );
     app.workspace_remote_tags = if in_view.len() >= 2 { tags } else { Vec::new() };
-    app.remote_chips = if descriptors.len() >= 2 {
-        super::fleet_view::remote_chip_states(mirrors, descriptors, &chrome.selection)
-    } else {
-        Vec::new()
-    };
+    // The remotes strip is always composed in the pure client, even for a
+    // fleet of one: it is where remotes are added, edited and started, so
+    // hiding it below two entries left a one-remote fleet with no way to
+    // reach any of that. The per-space remote tags still need two remotes in
+    // view to mean anything, so they keep their own threshold above.
+    app.remote_chips =
+        super::fleet_view::remote_chip_states(mirrors, descriptors, &chrome.selection);
 }
 
 /// Maps a catalog pane to the plain terminal metadata the sidebar reads.
@@ -1103,9 +1105,11 @@ mod tests {
 
     #[tokio::test]
     async fn single_remote_fleet_composition_renders_exactly_todays_sidebar() {
-        // Only the local runtime is configured: the fleet composition must
-        // be byte-identical to the single-mirror composition — no strip, no
-        // gutter, no tokens.
+        // Only one runtime is configured. The remotes strip is composed
+        // anyway - it is where remotes are added, edited and started, so a
+        // fleet of one must not hide it - but nothing else changes: no
+        // gutter and no per-space remote tokens, which need two remotes in
+        // view to mean anything.
         let mut mirrors = crate::client_state::RemoteMirrors::with_local();
         *mirrors.local_mut() = crate::client_state::RemoteMirror::test_with_adversarial_catalog();
         let descriptors = crate::client_state::fleet_view::remote_descriptors(&[
@@ -1127,7 +1131,7 @@ mod tests {
             &mut fleet_ids,
             &mut fleet_app,
         );
-        assert!(fleet_app.remote_chips.is_empty());
+        assert_eq!(fleet_app.remote_chips.len(), 1);
         assert!(fleet_app.workspace_remote_tags.is_empty());
 
         let mut local_ids = ComposeIds::new();
@@ -1142,11 +1146,30 @@ mod tests {
                 .expect("render");
             terminal.backend().buffer().clone()
         };
-        assert_eq!(
-            render(&mut fleet_app),
-            render(&mut local_app),
-            "single-remote fleet view must be exactly today's render"
+        // The strip is on screen, and it is the only difference: below it
+        // the sidebar is still exactly today's render.
+        crate::ui::compute_view(&mut fleet_app, Rect::new(0, 0, 106, 24));
+        let strip = fleet_app.view.remote_chip_strip_rect;
+        assert!(strip.height > 0, "a fleet of one still shows its strip");
+
+        let fleet_buffer = render(&mut fleet_app);
+        let local_buffer = render(&mut local_app);
+        assert_ne!(
+            fleet_buffer, local_buffer,
+            "the strip is a real, visible difference"
         );
+        // Outside the sidebar the two renders agree cell for cell: adding
+        // the strip must not disturb the panes beside it.
+        let sidebar_w = fleet_app.view.sidebar_rect.width;
+        for y in 0..24u16 {
+            for x in sidebar_w..106u16 {
+                assert_eq!(
+                    fleet_buffer[(x, y)],
+                    local_buffer[(x, y)],
+                    "pane area differs at ({x}, {y})"
+                );
+            }
+        }
     }
 
     #[tokio::test]

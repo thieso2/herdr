@@ -94,6 +94,76 @@ impl RemoteListState {
     }
 }
 
+/// Builds the modal's rows from the config plus live connection state.
+///
+/// The config is the source of rows, not the descriptor list: descriptors
+/// exclude disabled entries, and a list that hides a disabled remote gives
+/// the user no way to find it again and re-enable it. Live status is
+/// correlated by *name*, the same key every mutation uses.
+pub(crate) fn remote_list_rows(
+    entries: &[RemoteEntry],
+    descriptors: &[super::fleet_view::RemoteDescriptor],
+    mirrors: &super::RemoteMirrors,
+) -> Vec<RemoteListRow> {
+    entries
+        .iter()
+        .map(|entry| {
+            let status = if !entry.enabled {
+                RemoteListStatus::Disabled
+            } else {
+                descriptors
+                    .iter()
+                    .find(|descriptor| descriptor.name == entry.name)
+                    .and_then(|descriptor| mirrors.get(descriptor.index))
+                    .map(|mirror| match &mirror.connection {
+                        super::ClientConnectionState::Connected { .. } => {
+                            RemoteListStatus::Connected
+                        }
+                        super::ClientConnectionState::Connecting { .. } => {
+                            RemoteListStatus::Connecting
+                        }
+                        super::ClientConnectionState::Stopped { .. } => RemoteListStatus::Stopped,
+                        super::ClientConnectionState::Offline { .. }
+                        | super::ClientConnectionState::Incompatible { .. } => {
+                            RemoteListStatus::Offline
+                        }
+                        super::ClientConnectionState::Disconnected => RemoteListStatus::Unknown,
+                    })
+                    .unwrap_or(RemoteListStatus::Unknown)
+            };
+            RemoteListRow {
+                entry: entry.clone(),
+                status,
+            }
+        })
+        .collect()
+}
+
+impl RemoteListStatus {
+    /// The dot glyph, in the chip strip's vocabulary so the two surfaces
+    /// agree on what a remote's state looks like.
+    pub(crate) fn dot(self) -> &'static str {
+        match self {
+            Self::Connected => "●",
+            Self::Connecting => "◐",
+            Self::Stopped => "◍",
+            Self::Offline | Self::Unknown => "○",
+            Self::Disabled => "·",
+        }
+    }
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Connected => "connected",
+            Self::Connecting => "connecting",
+            Self::Stopped => "stopped",
+            Self::Offline => "offline",
+            Self::Disabled => "disabled",
+            Self::Unknown => "",
+        }
+    }
+}
+
 /// What a key asked the run loop to do.
 ///
 /// Every variant that writes carries the entry's *name*: each closure runs

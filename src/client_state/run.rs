@@ -122,6 +122,8 @@ enum LoopEvent {
     /// prompt can show it; `Ok` means the daemon is up and the remote can
     /// reconnect.
     RemoteStarted(usize, Result<(), String>),
+    /// Outcome of an explicit stop asked for from the remotes list.
+    RemoteStopped(usize, Result<(), String>),
 }
 
 /// Outcome of a remote's connect-plus-handshake thread. On success the
@@ -822,6 +824,9 @@ impl LoopCtx<'_> {
             LoopEvent::RemoteStarted(remote, result) => {
                 handle_remote_started(remote, result, self);
             }
+            LoopEvent::RemoteStopped(remote, result) => {
+                handle_remote_stopped(remote, result, self);
+            }
             LoopEvent::Frame(remote, generation, frame) => {
                 if link_generation(self.links.get(&remote)) != Some(generation) {
                     debug!(remote, generation, "dropping frame from a stale reader");
@@ -971,6 +976,7 @@ fn run_loop(
             let mut painted_area = ratatui::layout::Rect::default();
             let dialog = ctx.chrome.remote_edit.clone();
             let start_prompt = ctx.chrome.remote_start.clone();
+            let remote_list = ctx.chrome.remote_list.clone();
             terminal.draw(|frame| {
                 let source = MirrorPaneSource::for_view(ctx.mirrors, &in_view);
                 resize_requests =
@@ -982,7 +988,11 @@ fn run_loop(
                 if let Some(prompt) = &start_prompt {
                     crate::ui::render_remote_start_overlay(ctx.app, prompt, frame);
                 } else if let Some(dialog) = &dialog {
+                    // The field dialog is reached *from* the list, so it
+                    // draws over it.
                     crate::ui::render_remote_edit_overlay(ctx.app, dialog, frame);
+                } else if let Some(list) = &remote_list {
+                    crate::ui::render_remote_list_overlay(ctx.app, list, frame);
                 }
                 painted_area = frame.area();
             })?;
@@ -2246,6 +2256,138 @@ fn drain_app_requests(ctx: &mut LoopCtx<'_>) {
             ctx.chrome.remote_edit = Some(super::remote_edit::RemoteEditState::add());
         }
     }
+    if ctx.app.request_manage_remotes {
+        ctx.app.request_manage_remotes = false;
+        // Same gate as adding, for the same reason: the modal's every
+        // action is a write to `remotes.toml`.
+        if ctx.chrome.remote_list.is_none() && ctx.app.fleet_config_backed {
+            debug!("opening the remotes list");
+            let rows = super::remote_list::remote_list_rows(
+                &crate::fleet::config::load(),
+                ctx.descriptors,
+                ctx.mirrors,
+            );
+            ctx.chrome.remote_list = Some(super::remote_list::RemoteListState::new(rows));
+        }
+    }
+}
+
+/// Runs one remotes-list action as its own transaction, then re-renders the
+/// modal from the list the write returned.
+///
+/// There is no draft: each action commits immediately and individually
+/// through the transactional fleet-config update, so a stale baseline is
+/// structurally impossible and closing never discards work. A refused write
+/// leaves the file untouched, surfaces in the modal, and leaves it open.
+fn commit_remote_list_change(
+    ctx: &mut LoopCtx<'_>,
+    mutation: impl FnOnce(&mut Vec<crate::fleet::config::RemoteEntry>),
+) {
+    let result = crate::fleet::config::update(mutation);
+    let Some(list) = ctx.chrome.remote_list.as_mut() else {
+        return;
+    };
+    match result {
+        Ok(((), entries)) => {
+            list.error = None;
+            reconcile_fleet(&entries, ctx);
+            // Re-read live status through the reconciled descriptors.
+            let rows =
+                super::remote_list::remote_list_rows(&entries, ctx.descriptors, ctx.mirrors);
+            if let Some(list) = ctx.chrome.remote_list.as_mut() {
+                list.reload(rows);
+            }
+        }
+        Err(err) => list.error = Some(err.to_string()),
+    }
+}
+
+/// Performs one action from the remotes list modal.
+fn apply_remote_list_action(
+    action: super::remote_list::RemoteListKeyResult,
+    ctx: &mut LoopCtx<'_>,
+) {
+    use super::remote_list::RemoteListKeyResult as Action;
+    match action {
+        Action::Consumed | Action::Ignored => {}
+        Action::Close => ctx.chrome.remote_list = None,
+        Action::Reorder(name, direction) => {
+            commit_remote_list_change(ctx, |remotes| {
+                crate::fleet::config::move_in(remotes, &name, direction);
+            });
+        }
+        Action::ToggleEnabled(name) => {
+            let enable = ctx
+                .chrome
+                .remote_list
+                .as_ref()
+                .and_then(|list| {
+                    list.rows
+                        .iter()
+                        .find(|row| row.entry.name == name)
+                        .map(|row| !row.entry.enabled)
+                })
+                .unwrap_or(true);
+            commit_remote_list_change(ctx, |remotes| {
+                crate::fleet::config::set_enabled_in(remotes, &name, enable);
+            });
+        }
+        Action::Remove(name) => {
+            commit_remote_list_change(ctx, |remotes| {
+                crate::fleet::config::remove_in(remotes, &name);
+            });
+        }
+        Action::Edit(name) => {
+            // Field editing delegates to the existing single-remote dialog
+            // rather than being rebuilt here. The list stays open behind it.
+            let entry = ctx.chrome.remote_list.as_ref().and_then(|list| {
+                list.rows
+                    .iter()
+                    .find(|row| row.entry.name == name)
+                    .map(|row| row.entry.clone())
+            });
+            if let Some(entry) = entry {
+                ctx.chrome.remote_edit = Some(super::remote_edit::RemoteEditState::edit(&entry));
+            }
+        }
+        Action::StartStop(name) => start_or_stop_listed_remote(&name, ctx),
+    }
+}
+
+/// Drives lifecycle on one remote from the list.
+///
+/// Per-remote start and stop live here because dropping chip right-click
+/// left them homeless. This issues them through the same paths the existing
+/// start prompt uses; it does not implement start or stop itself.
+fn start_or_stop_listed_remote(name: &str, ctx: &mut LoopCtx<'_>) {
+    let Some(descriptor) = ctx
+        .descriptors
+        .iter()
+        .find(|descriptor| descriptor.name == name)
+        .cloned()
+    else {
+        if let Some(list) = ctx.chrome.remote_list.as_mut() {
+            list.error = Some(format!("remote '{name}' is disabled"));
+        }
+        return;
+    };
+    let running = ctx
+        .mirrors
+        .get(descriptor.index)
+        .is_some_and(|mirror| !mirror.connection.is_stopped());
+    if running {
+        stop_remote(descriptor.index, ctx);
+    } else {
+        // Reuses the confirmation the stopped chip already opens, so the
+        // one action that can bring a remote back has a single path.
+        ctx.chrome.remote_start = Some(super::remote_start::RemoteStartPrompt {
+            remote: descriptor.index,
+            name: descriptor.name.clone(),
+            status: crate::fleet::connection::stopped_status_line(&descriptor.name),
+            error: None,
+            starting: false,
+        });
+    }
 }
 
 fn interpret_raw_input(raw: crate::raw_input::RawInputEvent, ctx: &mut LoopCtx<'_>) {
@@ -2323,6 +2465,50 @@ fn start_stopped_remote(ctx: &mut LoopCtx<'_>) {
         let result = crate::fleet::bridge_child::start_remote_server(&target, &session, &program);
         let _ = tx.send(LoopEvent::RemoteStarted(remote, result));
     });
+}
+
+/// Asks a remote's server to stop, off-thread so the loop keeps rendering.
+///
+/// A local runtime is deliberately excluded: it has no ssh path, and the way
+/// to stop it is to close its last space, which the server-side exit-on-empty
+/// rule already handles.
+fn stop_remote(remote: usize, ctx: &mut LoopCtx<'_>) {
+    let Some(descriptor) = ctx
+        .descriptors
+        .iter()
+        .find(|descriptor| descriptor.index == remote)
+    else {
+        return;
+    };
+    let Some(target) = descriptor.target.clone() else {
+        if let Some(list) = ctx.chrome.remote_list.as_mut() {
+            list.error =
+                Some("a local runtime stops when its last space closes".to_owned());
+        }
+        return;
+    };
+    let session = descriptor.session.clone();
+    let program = descriptor
+        .program
+        .clone()
+        .unwrap_or_else(|| crate::identity::BRAND.to_owned());
+    let tx = ctx.event_tx.clone();
+    std::thread::spawn(move || {
+        let result = crate::fleet::bridge_child::stop_remote_server(&target, &session, &program);
+        let _ = tx.send(LoopEvent::RemoteStopped(remote, result));
+    });
+}
+
+/// Applies the outcome of an explicit stop. Success needs no state change
+/// here: the server announces its own shutdown on the control plane, which
+/// is what parks the remote as stopped.
+fn handle_remote_stopped(remote: usize, result: Result<(), String>, ctx: &mut LoopCtx<'_>) {
+    if let Err(err) = result {
+        warn!(remote, err = %err, "remote stop failed");
+        if let Some(list) = ctx.chrome.remote_list.as_mut() {
+            list.error = Some(err);
+        }
+    }
 }
 
 /// Applies the outcome of an explicit start.
@@ -2419,6 +2605,23 @@ fn handle_key(key: crate::input::TerminalKey, ctx: &mut LoopCtx<'_>) {
                 ctx.chrome.remote_edit = None;
             }
             _ => {}
+        }
+        return;
+    }
+
+    // The remotes list captures the keyboard while open, behind the field
+    // dialog it opens.
+    if ctx.chrome.remote_list.is_some() {
+        if key.kind == crossterm::event::KeyEventKind::Release {
+            return;
+        }
+        let action = ctx
+            .chrome
+            .remote_list
+            .as_mut()
+            .map(|list| super::remote_list::remote_list_apply_key(list, key));
+        if let Some(action) = action {
+            apply_remote_list_action(action, ctx);
         }
         return;
     }
@@ -2635,12 +2838,26 @@ fn submit_remote_edit(ctx: &mut LoopCtx<'_>) {
         Ok(((), remotes)) => {
             ctx.chrome.remote_edit = None;
             reconcile_fleet(&remotes, ctx);
+            refresh_remote_list(&remotes, ctx);
         }
         Err(err) => {
             if let Some(dialog) = ctx.chrome.remote_edit.as_mut() {
                 dialog.error = Some(err.to_string());
             }
         }
+    }
+}
+
+/// Re-renders the remotes list, if it is open behind the field dialog, from
+/// the entries a write returned. Keeps the two surfaces from disagreeing
+/// about the fleet after an edit made through the dialog.
+fn refresh_remote_list(entries: &[crate::fleet::config::RemoteEntry], ctx: &mut LoopCtx<'_>) {
+    if ctx.chrome.remote_list.is_none() {
+        return;
+    }
+    let rows = super::remote_list::remote_list_rows(entries, ctx.descriptors, ctx.mirrors);
+    if let Some(list) = ctx.chrome.remote_list.as_mut() {
+        list.reload(rows);
     }
 }
 
@@ -2658,6 +2875,7 @@ fn remove_edited_remote(ctx: &mut LoopCtx<'_>) {
         Ok((_, remotes)) => {
             ctx.chrome.remote_edit = None;
             reconcile_fleet(&remotes, ctx);
+            refresh_remote_list(&remotes, ctx);
         }
         Err(err) => {
             if let Some(dialog) = ctx.chrome.remote_edit.as_mut() {
@@ -2869,6 +3087,12 @@ fn handle_mouse(mouse: MouseEvent, ctx: &mut LoopCtx<'_>) {
     // buttons act.
     if ctx.chrome.remote_edit.is_some() {
         handle_dialog_click(mouse, ctx);
+        return;
+    }
+    // The remotes list likewise swallows the mouse: its rows select, and
+    // `[done]` closes.
+    if ctx.chrome.remote_list.is_some() {
+        handle_remote_list_click(mouse, ctx);
         return;
     }
     // Chip strip first: chips are pure client chrome, hit-tested against the
@@ -3094,6 +3318,43 @@ fn handle_chip_click(
         // a menu - and editing now lives in the remotes list modal, reached
         // from the remotes section menu.
         crossterm::event::MouseButton::Right | crossterm::event::MouseButton::Middle => {}
+    }
+}
+
+/// Routes a click inside the open remotes list: a row selects, `[done]`
+/// closes, and a click outside the modal is swallowed rather than reaching
+/// the view behind it.
+fn handle_remote_list_click(mouse: MouseEvent, ctx: &mut LoopCtx<'_>) {
+    if !matches!(
+        mouse.kind,
+        MouseEventKind::Down(crossterm::event::MouseButton::Left)
+    ) {
+        return;
+    }
+    let Ok((cols, rows)) = crossterm::terminal::size() else {
+        return;
+    };
+    let area = ratatui::layout::Rect::new(0, 0, cols, rows);
+    let count = ctx
+        .chrome
+        .remote_list
+        .as_ref()
+        .map(|list| list.rows.len())
+        .unwrap_or(0);
+    let Some(inner) = crate::ui::remote_list_inner_rect(area, count) else {
+        return;
+    };
+    let position = ratatui::layout::Position::new(mouse.column, mouse.row);
+    if crate::ui::remote_list_done_rect(inner).contains(position) {
+        ctx.chrome.remote_list = None;
+        return;
+    }
+    let row = crate::ui::remote_list_row_rects(inner, count)
+        .into_iter()
+        .position(|rect| rect.contains(position));
+    if let (Some(row), Some(list)) = (row, ctx.chrome.remote_list.as_mut()) {
+        list.error = None;
+        list.selected = row;
     }
 }
 
@@ -3623,6 +3884,103 @@ mod tests {
                     .is_some_and(|(message, _)| message.contains("stays in view")),
                 "refusal surfaces as a status flash"
             );
+        });
+    }
+
+    #[tokio::test]
+    async fn the_remotes_menu_opens_the_list_and_the_list_shows_disabled_remotes() {
+        with_test_ctx(three_descriptors(), |ctx| {
+            ctx.app.pure_client = true;
+            ctx.app.fleet_config_backed = true;
+
+            // The menu's `edit remotes...` sets the request flag; the run
+            // loop drains it into the modal.
+            ctx.app.request_manage_remotes = true;
+            drain_app_requests(ctx);
+            assert!(
+                ctx.chrome.remote_list.is_some(),
+                "the remotes menu opens the list"
+            );
+            assert!(!ctx.app.request_manage_remotes, "drained once");
+
+            // A disabled remote has no descriptor and no mirror, so it must
+            // come from the config rather than the descriptor list - or the
+            // user could never find it again to re-enable it.
+            let rows = super::super::remote_list::remote_list_rows(
+                &[
+                    crate::fleet::config::RemoteEntry {
+                        name: "buildbox".into(),
+                        target: Some("can@buildbox".into()),
+                        session: "default".into(),
+                        enabled: true,
+                        hue: Some(0),
+                    },
+                    crate::fleet::config::RemoteEntry {
+                        name: "dark".into(),
+                        target: Some("can@dark".into()),
+                        session: "default".into(),
+                        enabled: false,
+                        hue: Some(1),
+                    },
+                ],
+                ctx.descriptors,
+                ctx.mirrors,
+            );
+            assert_eq!(rows.len(), 2, "disabled entries stay listed");
+            assert_eq!(
+                rows[1].status,
+                super::super::remote_list::RemoteListStatus::Disabled
+            );
+        });
+    }
+
+    #[tokio::test]
+    async fn an_ephemeral_fleet_never_opens_the_remotes_list() {
+        // Every action in the modal is a write to `remotes.toml`, which a
+        // `--remote` fleet-of-one does not have.
+        with_test_ctx(three_descriptors(), |ctx| {
+            ctx.app.pure_client = true;
+            ctx.app.fleet_config_backed = false;
+
+            ctx.app.request_manage_remotes = true;
+            drain_app_requests(ctx);
+
+            assert!(ctx.chrome.remote_list.is_none());
+        });
+    }
+
+    #[tokio::test]
+    async fn the_list_captures_the_keyboard_and_escape_closes_it() {
+        with_test_ctx(three_descriptors(), |ctx| {
+            ctx.chrome.remote_list = Some(super::super::remote_list::RemoteListState::new(
+                super::super::remote_list::remote_list_rows(
+                    &[crate::fleet::config::RemoteEntry {
+                        name: "buildbox".into(),
+                        target: Some("can@buildbox".into()),
+                        session: "default".into(),
+                        enabled: true,
+                        hue: Some(0),
+                    }],
+                    ctx.descriptors,
+                    ctx.mirrors,
+                ),
+            ));
+
+            // Keys go to the modal, not the session behind it.
+            handle_key(key(KeyCode::Down), ctx);
+            assert!(ctx.chrome.remote_list.is_some());
+            assert!(!ctx.app.should_quit);
+
+            // Enter hands the selected entry to the existing field dialog
+            // rather than rebuilding field editing in the list.
+            handle_key(key(KeyCode::Enter), ctx);
+            let dialog = ctx.chrome.remote_edit.as_ref().expect("field dialog");
+            assert_eq!(dialog.original_name.as_deref(), Some("buildbox"));
+            ctx.chrome.remote_edit = None;
+
+            handle_key(key(KeyCode::Esc), ctx);
+            assert!(ctx.chrome.remote_list.is_none(), "escape closes it");
+            assert!(!ctx.app.should_quit, "and does not quit the client");
         });
     }
 

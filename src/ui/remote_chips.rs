@@ -14,7 +14,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
-use super::text::display_width_u16;
+use super::text::{display_width_u16, truncate_end};
 use crate::app::state::{RemoteChipConnection, RemoteChipState, SidebarSection};
 use crate::app::AppState;
 
@@ -346,6 +346,194 @@ pub(crate) fn render_remote_start_overlay(
 /// Inner rect of the add/edit-remote dialog, for render and hit-testing.
 // Consumed only by the unix-only pure-client run path (#20/#23).
 #[cfg_attr(windows, allow(dead_code))]
+/// The remotes list popup. Wider than the single-remote dialog because a row
+/// carries name, target, session and a status label side by side.
+const REMOTE_LIST_POPUP_WIDTH: u16 = 66;
+/// Chrome rows around the list: border, header, gaps, key hints, `[done]`.
+const REMOTE_LIST_CHROME_ROWS: u16 = 10;
+const REMOTE_LIST_MIN_HEIGHT: u16 = 12;
+const REMOTE_LIST_MAX_HEIGHT: u16 = 26;
+
+/// Popup height for `count` rows, clamped so a large fleet scrolls rather
+/// than filling the screen and a small one does not float in empty space.
+fn remote_list_popup_height(count: usize) -> u16 {
+    let wanted = REMOTE_LIST_CHROME_ROWS.saturating_add(count.min(u16::MAX as usize) as u16);
+    wanted.clamp(REMOTE_LIST_MIN_HEIGHT, REMOTE_LIST_MAX_HEIGHT)
+}
+
+// Consumed only by the unix-only pure-client run path.
+#[cfg_attr(windows, allow(dead_code))]
+pub(crate) fn remote_list_inner_rect(area: Rect, count: usize) -> Option<Rect> {
+    super::widgets::centered_popup_rect(area, REMOTE_LIST_POPUP_WIDTH, remote_list_popup_height(count))
+        .map(|popup| {
+            Rect::new(
+                popup.x + 1,
+                popup.y + 1,
+                popup.width.saturating_sub(2),
+                popup.height.saturating_sub(2),
+            )
+        })
+}
+
+/// The stacked areas of the list modal, so render and hit-test agree.
+#[cfg_attr(windows, allow(dead_code))]
+pub(crate) fn remote_list_areas(inner: Rect) -> super::widgets::ModalStackAreas {
+    super::widgets::modal_stack_areas(inner, 1, 2, 1, 1)
+}
+
+/// Per-row hit rects, parallel to the modal's rows.
+#[cfg_attr(windows, allow(dead_code))]
+pub(crate) fn remote_list_row_rects(inner: Rect, count: usize) -> Vec<Rect> {
+    super::widgets::modal_choice_rows(remote_list_areas(inner).content, count, 1)
+}
+
+/// The `[done]` control, so closing is a mouse action as well as an Escape.
+#[cfg_attr(windows, allow(dead_code))]
+pub(crate) fn remote_list_done_rect(inner: Rect) -> Rect {
+    let Some(actions) = remote_list_areas(inner).actions else {
+        return Rect::default();
+    };
+    super::widgets::action_button_row_rects(
+        actions,
+        &[super::widgets::ActionButtonSpec {
+            hint: Some("esc"),
+            label: "done",
+        }],
+        2,
+        0,
+    )
+    .first()
+    .copied()
+    .unwrap_or_default()
+}
+
+/// Draws the fleet as a list: every configured remote, disabled ones
+/// included, with a live status dot.
+#[cfg_attr(windows, allow(dead_code))]
+pub(crate) fn render_remote_list_overlay(
+    app: &AppState,
+    list: &crate::client_state::remote_list::RemoteListState,
+    frame: &mut Frame,
+) {
+    let area = frame.area();
+    super::dim_background(frame, area);
+    let Some(inner) = super::widgets::render_modal_shell(
+        frame,
+        area,
+        REMOTE_LIST_POPUP_WIDTH,
+        remote_list_popup_height(list.rows.len()),
+        &app.palette,
+    ) else {
+        return;
+    };
+    let p = &app.palette;
+    let areas = remote_list_areas(inner);
+    super::widgets::render_modal_header(frame, areas.header, "remotes", p);
+
+    if list.rows.is_empty() {
+        frame.render_widget(
+            Paragraph::new(" no remotes configured").style(Style::default().fg(p.overlay0)),
+            areas.content,
+        );
+    }
+
+    for (row, rect) in list
+        .rows
+        .iter()
+        .zip(remote_list_row_rects(inner, list.rows.len()))
+    {
+        let selected = list
+            .rows
+            .get(list.selected)
+            .is_some_and(|current| current.entry.name == row.entry.name);
+        let base = if selected {
+            Style::default()
+                .fg(p.text)
+                .bg(p.surface0)
+                .add_modifier(Modifier::BOLD)
+        } else if row.entry.enabled {
+            Style::default().fg(p.text)
+        } else {
+            // A disabled remote stays visible so it can be found again and
+            // re-enabled, but reads as out of the fleet.
+            Style::default().fg(p.overlay0).add_modifier(Modifier::DIM)
+        };
+        let target = row.entry.target.as_deref().unwrap_or("local");
+        // Name and target are what tell two similarly named remotes apart.
+        let name = truncate_end(&row.entry.name, 16);
+        let target = truncate_end(target, 22);
+        let session = truncate_end(&row.entry.session, 10);
+        let line = Line::from(vec![
+            Span::styled(
+                format!(" {} ", row.status.dot()),
+                Style::default().fg(if row.status
+                    == crate::client_state::remote_list::RemoteListStatus::Connected
+                {
+                    p.remote_hue(row.entry.hue.unwrap_or(0))
+                } else {
+                    p.overlay0
+                }),
+            ),
+            Span::styled(format!("{name:<16} "), base),
+            Span::styled(format!("{target:<22} "), Style::default().fg(p.subtext0)),
+            Span::styled(format!("{session:<10} "), Style::default().fg(p.overlay0)),
+            Span::styled(row.status.label(), Style::default().fg(p.overlay0)),
+        ]);
+        frame.render_widget(Paragraph::new(line).style(base), rect);
+    }
+
+    // A keyboard-driven list should not need documentation to use.
+    if let Some(footer) = areas.footer {
+        let hint = |key: &'static str, label: &'static str| {
+            vec![
+                Span::styled(key, Style::default().fg(p.accent).add_modifier(Modifier::BOLD)),
+                Span::styled(format!(" {label}  "), Style::default().fg(p.overlay0)),
+            ]
+        };
+        let mut keys = Vec::new();
+        keys.extend(hint("↑↓", "select"));
+        keys.extend(hint("⇧↑↓", "reorder"));
+        keys.extend(hint("space", "enable"));
+        keys.extend(hint("↵", "edit"));
+        frame.render_widget(Paragraph::new(Line::from(keys)), footer);
+
+        let mut more = Vec::new();
+        more.extend(hint("s", "start/stop"));
+        more.extend(hint("del", "remove"));
+        let second = Rect::new(
+            footer.x,
+            footer.y.saturating_add(1),
+            footer.width,
+            footer.height.saturating_sub(1),
+        );
+        if second.height > 0 {
+            frame.render_widget(Paragraph::new(Line::from(more)), second);
+        }
+    }
+
+    // A refused write surfaces here and leaves the file untouched.
+    if let Some(error) = &list.error {
+        if let Some(actions) = areas.actions {
+            let row = Rect::new(actions.x, actions.y, actions.width.saturating_sub(10), 1);
+            frame.render_widget(
+                Paragraph::new(truncate_end(error, row.width as usize))
+                    .style(Style::default().fg(p.red)),
+                row,
+            );
+        }
+    }
+
+    if areas.actions.is_some() {
+        super::widgets::render_action_button(
+            frame,
+            remote_list_done_rect(inner),
+            Some("esc"),
+            "done",
+            Style::default().fg(p.text).bg(p.surface0),
+        );
+    }
+}
+
 pub(crate) fn remote_edit_inner_rect(area: Rect) -> Option<Rect> {
     super::widgets::centered_popup_rect(area, REMOTE_EDIT_POPUP_WIDTH, REMOTE_EDIT_POPUP_HEIGHT)
         .map(|popup| {

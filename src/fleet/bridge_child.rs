@@ -185,6 +185,61 @@ pub fn start_remote_server(target: &str, session: &str, program: &str) -> Result
     })
 }
 
+/// Stops the herdr server behind a remote, over the same ssh path an
+/// explicit start uses.
+///
+/// The mirror of [`start_remote_server`]: it runs `server stop` rather than
+/// the bridge, so nothing speaks the framed protocol here and the child's
+/// exit status is again the whole answer. Per-remote lifecycle lives in the
+/// remotes list, which needs both directions; the client had only start
+/// because a chip could only ever be started.
+pub fn stop_remote_server(target: &str, session: &str, program: &str) -> Result<(), String> {
+    let mut command = Command::new("ssh");
+    command
+        .arg("-T")
+        .arg("-o")
+        .arg("BatchMode=yes")
+        .arg(target)
+        .arg(remote_stop_command(program, session))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    crate::platform::configure_background_command(&mut command);
+
+    let output = command
+        .output()
+        .map_err(|err| format!("ssh stop failed: {err}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let tail = String::from_utf8_lossy(&output.stderr)
+        .trim()
+        .replace('\n', "; ");
+    Err(if tail.is_empty() {
+        format!("the remote stop exited with {}", output.status)
+    } else {
+        tail
+    })
+}
+
+/// The far-side `server stop` command, resolved the same way the bridge
+/// command is so a managed install off `PATH` is still found.
+fn remote_stop_command(program: &str, session: &str) -> String {
+    let mut args = String::new();
+    if session != crate::session::DEFAULT_SESSION_NAME {
+        args.push_str(" --session ");
+        args.push_str(&crate::remote::shell_quote(session));
+    }
+    args.push_str(" server stop");
+    if !is_bare_binary_name(program) {
+        return format!("exec {program}{args}");
+    }
+    format!(
+        "exec /bin/sh -c {}",
+        crate::remote::shell_quote(&resolve_script(program, &args))
+    )
+}
+
 /// A live SSH bridge child. Dropping it kills and reaps the child, which
 /// closes both pipe halves.
 pub struct BridgeChild {

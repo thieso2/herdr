@@ -51,8 +51,10 @@ use self::release_notes::{render_product_announcement_overlay, render_release_no
 // Consumed only by the unix-only pure-client run path (#20/#23).
 #[cfg_attr(windows, allow(unused_imports))]
 pub(crate) use self::remote_chips::{
-    remote_chip_at, remote_edit_button_rects, remote_edit_inner_rect, remote_start_button_rects,
-    remote_start_inner_rect, render_remote_edit_overlay, render_remote_start_overlay,
+    remote_chip_at, remote_edit_button_rects, remote_edit_inner_rect, remote_list_done_rect,
+    remote_list_inner_rect, remote_list_row_rects, remote_start_button_rects,
+    remote_start_inner_rect, render_remote_edit_overlay, render_remote_list_overlay,
+    render_remote_start_overlay,
 };
 use self::remote_chips::{render_remote_chip_strip, split_sidebar_for_chip_strip};
 pub(crate) use self::scrollbar::{

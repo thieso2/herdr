@@ -89,6 +89,9 @@ fn pump_stderr_tail(mut reader: impl Read, tail: &Arc<Mutex<String>>) {
 /// A bare binary name (the saved-fleet case) is resolved on the far side;
 /// anything path-shaped is a binary a `--remote` launch already located, so it
 /// is execed verbatim.
+// The non-start form is exercised by this module's tests; production always
+// goes through `remote_bridge_command_with`, which takes the flag.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn remote_bridge_command_for(program: &str, session: &str) -> String {
     remote_bridge_command_with(program, session, false)
 }

@@ -1476,10 +1476,15 @@ mod tests {
                 "no overherdr on the remote and installing it failed: no network".into(),
             )
         });
+        // Backoff wide enough that `Offline` is observable. `wait_for` polls
+        // every 5ms, so a 10ms backoff leaves a window a starved thread on a
+        // loaded runner can miss over and over - the state is real, the
+        // sampling just never lands on it. The repair cooldown is 300s, so a
+        // wider backoff cannot let a second install slip through.
         let mut manager = FleetManager::start(
             vec![entry("gpu-1")],
             Arc::clone(&transport) as Arc<dyn FleetTransport>,
-            tuning(Duration::from_millis(10)),
+            tuning(Duration::from_millis(100)),
             noop_hook(),
         );
 

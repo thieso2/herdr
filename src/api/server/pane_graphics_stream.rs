@@ -573,6 +573,12 @@ fn read_should_retry(err: &io::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// How long to wait for a close dispatch these tests provoke directly.
+    /// The dispatch arrives in microseconds when it arrives at all, so this
+    /// bound only has to beat a loaded CI runner - it is not a measurement,
+    /// and a tight one made these tests flake on macOS rather than fail.
+    const CLOSE_DISPATCH_TIMEOUT: Duration = Duration::from_secs(15);
     use crate::api::schema::{ErrorResponse, Method, ResponseResult, SuccessResponse};
     use crate::api::{ApiRequestMessage, EventHub};
     use crate::ipc::LocalStream;
@@ -912,10 +918,10 @@ mod tests {
 
         let (close_tx, close_rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            close_tx.send(api_rx.blocking_recv()).unwrap();
+            let _ = close_tx.send(api_rx.blocking_recv());
         });
         let close = close_rx
-            .recv_timeout(Duration::from_secs(2))
+            .recv_timeout(CLOSE_DISPATCH_TIMEOUT)
             .unwrap()
             .unwrap();
         match &close.request.method {
@@ -1006,9 +1012,11 @@ mod tests {
         cancel_inactive_streams(|registered| registered != owner);
 
         let (close_tx, close_rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || close_tx.send(api_rx.blocking_recv()).unwrap());
+        std::thread::spawn(move || {
+            let _ = close_tx.send(api_rx.blocking_recv());
+        });
         let close = close_rx
-            .recv_timeout(Duration::from_secs(1))
+            .recv_timeout(CLOSE_DISPATCH_TIMEOUT)
             .expect("canceled idle stream should dispatch a close")
             .expect("API request channel should remain open");
         match &close.request.method {
@@ -1157,9 +1165,11 @@ mod tests {
         client.flush().unwrap();
 
         let (close_tx, close_rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || close_tx.send(api_rx.blocking_recv()).unwrap());
+        std::thread::spawn(move || {
+            let _ = close_tx.send(api_rx.blocking_recv());
+        });
         let close = close_rx
-            .recv_timeout(Duration::from_secs(1))
+            .recv_timeout(CLOSE_DISPATCH_TIMEOUT)
             .unwrap()
             .unwrap();
         match &close.request.method {

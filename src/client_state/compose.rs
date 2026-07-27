@@ -567,8 +567,6 @@ fn leftmost_leaf(node: &Node) -> Option<PaneId> {
     }
 }
 
-/// Applies config-derived presentation to a fresh client `AppState`,
-/// mirroring the assignments `App::new` makes for the server-owned state.
 /// Writes the chosen agent panel ordering back to the client's own config.
 ///
 /// The single-server app has always done this; the fleet client seeded the
@@ -615,6 +613,8 @@ pub(crate) fn persist_agent_panel_sort(sort: crate::app::state::AgentPanelSort) 
     }
 }
 
+/// Applies config-derived presentation to a fresh client `AppState`,
+/// mirroring the assignments `App::new` makes for the server-owned state.
 pub(crate) fn apply_client_config(app: &mut AppState, config: &crate::config::Config) {
     let (prefix_code, prefix_mods) = config.prefix_key();
     app.prefix_code = prefix_code;

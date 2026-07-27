@@ -343,9 +343,6 @@ pub(crate) fn render_remote_start_overlay(
     );
 }
 
-/// Inner rect of the add/edit-remote dialog, for render and hit-testing.
-// Consumed only by the unix-only pure-client run path (#20/#23).
-#[cfg_attr(windows, allow(dead_code))]
 /// The remotes list popup. Wider than the single-remote dialog because a row
 /// carries name, target, session and a status label side by side.
 const REMOTE_LIST_POPUP_WIDTH: u16 = 66;
@@ -362,6 +359,7 @@ fn remote_list_popup_height(count: usize) -> u16 {
 }
 
 // Consumed only by the unix-only pure-client run path.
+// Consumed only by the unix-only pure-client run path (#20/#23).
 #[cfg_attr(windows, allow(dead_code))]
 pub(crate) fn remote_list_inner_rect(area: Rect, count: usize) -> Option<Rect> {
     super::widgets::centered_popup_rect(
@@ -380,18 +378,21 @@ pub(crate) fn remote_list_inner_rect(area: Rect, count: usize) -> Option<Rect> {
 }
 
 /// The stacked areas of the list modal, so render and hit-test agree.
+// Consumed only by the unix-only pure-client run path (#20/#23).
 #[cfg_attr(windows, allow(dead_code))]
-pub(crate) fn remote_list_areas(inner: Rect) -> super::widgets::ModalStackAreas {
+fn remote_list_areas(inner: Rect) -> super::widgets::ModalStackAreas {
     super::widgets::modal_stack_areas(inner, 1, 2, 1, 1)
 }
 
 /// Per-row hit rects, parallel to the modal's rows.
+// Consumed only by the unix-only pure-client run path (#20/#23).
 #[cfg_attr(windows, allow(dead_code))]
 pub(crate) fn remote_list_row_rects(inner: Rect, count: usize) -> Vec<Rect> {
     super::widgets::modal_choice_rows(remote_list_areas(inner).content, count, 1)
 }
 
 /// The `[done]` control, so closing is a mouse action as well as an Escape.
+// Consumed only by the unix-only pure-client run path (#20/#23).
 #[cfg_attr(windows, allow(dead_code))]
 pub(crate) fn remote_list_done_rect(inner: Rect) -> Rect {
     let Some(actions) = remote_list_areas(inner).actions else {
@@ -413,6 +414,7 @@ pub(crate) fn remote_list_done_rect(inner: Rect) -> Rect {
 
 /// Draws the fleet as a list: every configured remote, disabled ones
 /// included, with a live status dot.
+// Consumed only by the unix-only pure-client run path (#20/#23).
 #[cfg_attr(windows, allow(dead_code))]
 pub(crate) fn render_remote_list_overlay(
     app: &AppState,
@@ -541,6 +543,9 @@ pub(crate) fn render_remote_list_overlay(
     }
 }
 
+/// Inner rect of the add/edit-remote dialog, for render and hit-testing.
+// Consumed only by the unix-only pure-client run path (#20/#23).
+#[cfg_attr(windows, allow(dead_code))]
 pub(crate) fn remote_edit_inner_rect(area: Rect) -> Option<Rect> {
     super::widgets::centered_popup_rect(area, REMOTE_EDIT_POPUP_WIDTH, REMOTE_EDIT_POPUP_HEIGHT)
         .map(|popup| {

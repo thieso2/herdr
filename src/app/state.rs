@@ -1426,10 +1426,16 @@ impl ContextMenuState {
                     });
                 }
                 if let Some(view) = view {
-                    // Names the source so the user knows which plugin to go
-                    // turn off, and gives them the first user-facing way to
-                    // clear a view - today it is clearable only over the API.
-                    rows.push(SectionMenuRow::readout(format!("view: {}", view.label)));
+                    // Names the source, not just the label: the point of the
+                    // readout is knowing which plugin to go turn off. When
+                    // the view supplied no label of its own the two collapse,
+                    // so do not say the same word twice.
+                    let readout = if view.label == view.source {
+                        format!("view: {}", view.label)
+                    } else {
+                        format!("view: {} ({})", view.label, view.source)
+                    };
+                    rows.push(SectionMenuRow::readout(readout));
                     rows.push(SectionMenuRow::action(
                         "clear filter",
                         SectionMenuAction::ClearAgentView,

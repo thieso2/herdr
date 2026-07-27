@@ -201,7 +201,6 @@ pub(crate) fn remote_list_apply_key(
     key: TerminalKey,
 ) -> RemoteListKeyResult {
     let shifted = key.modifiers.contains(KeyModifiers::SHIFT);
-    // Any key clears a stale error: the next action reports its own.
     let name = state.selected_name().map(|name| name.to_owned());
 
     match key.code {

@@ -463,6 +463,74 @@ mod tests {
         }
     }
 
+    /// A view that carries its own sort wins outright; a view that only
+    /// filters leaves the user's chosen ordering in force over the filtered
+    /// set, and clearing it restores that ordering with no further action.
+    ///
+    /// This precedence is what the agents section menu reflects when it
+    /// decides whether to dim the sort radio, so it is pinned here at the
+    /// ordering seam rather than only at the menu.
+    #[test]
+    fn a_filter_only_view_leaves_the_chosen_ordering_in_force() {
+        let mut state = state_with_agents();
+        // Space one holds an idle agent, space two a working one. Under
+        // `priority`, working outranks idle-and-seen, so the order flips.
+        state.agent_panel_sort = crate::app::state::AgentPanelSort::Priority;
+
+        let ordered = |state: &AppState| -> Vec<usize> {
+            let mut entries = crate::ui::all_agent_panel_entries(state);
+            apply_agent_view(state, &mut entries);
+            entries.iter().map(|entry| entry.ws_idx).collect()
+        };
+
+        assert_eq!(
+            ordered(&state),
+            vec![1, 0],
+            "priority ranks the working agent above the seen-idle one"
+        );
+
+        // A filter-only view filters, and the ordering still applies.
+        state.agent_view_override = Some(AgentViewSetParams {
+            source: "example.views".to_string(),
+            label: Some("all".to_string()),
+            filter: None,
+            sort: Vec::new(),
+        });
+        assert_eq!(
+            ordered(&state),
+            vec![1, 0],
+            "a filter-only view does not silently reorder the list"
+        );
+
+        // A view with its own sort replaces the panel ordering entirely.
+        state.agent_view_override = Some(AgentViewSetParams {
+            source: "example.views".to_string(),
+            label: Some("by space".to_string()),
+            filter: None,
+            sort: vec![crate::api::schema::AgentViewSort {
+                field: AgentViewSortField::Builtin(AgentViewBuiltinSortField::WorkspaceOrder),
+                order: Default::default(),
+            }],
+        });
+        assert_eq!(
+            ordered(&state),
+            vec![0, 1],
+            "a view carrying a sort wins over the panel ordering"
+        );
+
+        // Clearing it restores the chosen ordering, which was never mutated.
+        state.agent_view_override = None;
+        assert_eq!(ordered(&state), vec![1, 0]);
+
+        // And `grouped` applies no sort at all: it is the collection order.
+        state.agent_panel_sort = crate::app::state::AgentPanelSort::Spaces;
+        assert_eq!(
+            ordered(&state),
+            vec![0, 1],
+            "grouped is the natural collection order, not a sort"
+        );
+    }
+
     #[test]
     fn current_workspace_filter_tracks_presented_workspace() {
         let mut state = state_with_agents();

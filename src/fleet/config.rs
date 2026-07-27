@@ -233,8 +233,11 @@ fn load_from_path_strict(path: &Path) -> io::Result<Vec<RemoteEntry>> {
 /// would reintroduce duplicates anyway. Past the palette's size hues repeat,
 /// which persisting does not change - it buys stability, not uniqueness.
 pub fn lowest_unused_hue(remotes: &[RemoteEntry]) -> usize {
-    let used: std::collections::BTreeSet<usize> =
-        remotes.iter().filter_map(|remote| remote.hue).collect();
+    lowest_unused_in(&remotes.iter().filter_map(|remote| remote.hue).collect())
+}
+
+/// The lowest index not in `used`.
+fn lowest_unused_in(used: &std::collections::BTreeSet<usize>) -> usize {
     let mut candidate = 0usize;
     while used.contains(&candidate) {
         candidate += 1;
@@ -277,10 +280,7 @@ fn assign_missing_hues(remotes: &mut [RemoteEntry]) {
         if entry.hue.is_some() {
             continue;
         }
-        let mut candidate = 0usize;
-        while used.contains(&candidate) {
-            candidate += 1;
-        }
+        let candidate = lowest_unused_in(&used);
         used.insert(candidate);
         entry.hue = Some(candidate);
     }

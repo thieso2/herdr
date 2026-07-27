@@ -2290,10 +2290,7 @@ fn commit_remote_list_change(
             list.error = None;
             reconcile_fleet(&entries, ctx);
             // Re-read live status through the reconciled descriptors.
-            let rows = super::remote_list::remote_list_rows(&entries, ctx.descriptors, ctx.mirrors);
-            if let Some(list) = ctx.chrome.remote_list.as_mut() {
-                list.reload(rows);
-            }
+            refresh_remote_list(&entries, ctx);
         }
         Err(err) => list.error = Some(err.to_string()),
     }
@@ -2314,19 +2311,18 @@ fn apply_remote_list_action(
             });
         }
         Action::ToggleEnabled(name) => {
-            let enable = ctx
-                .chrome
-                .remote_list
-                .as_ref()
-                .and_then(|list| {
-                    list.rows
-                        .iter()
-                        .find(|row| row.entry.name == name)
-                        .map(|row| !row.entry.enabled)
-                })
-                .unwrap_or(true);
+            // Flipped against the list loaded *inside* the lock, not against
+            // the rows on screen: an external edit between the keystroke and
+            // the write would otherwise turn the toggle into a silent no-op
+            // that leaves the remote where it already was.
             commit_remote_list_change(ctx, |remotes| {
-                crate::fleet::config::set_enabled_in(remotes, &name, enable);
+                let current = remotes
+                    .iter()
+                    .find(|remote| remote.name == name)
+                    .map(|remote| remote.enabled);
+                if let Some(current) = current {
+                    crate::fleet::config::set_enabled_in(remotes, &name, !current);
+                }
             });
         }
         Action::Remove(name) => {

@@ -429,6 +429,9 @@ pub(super) fn dispatch_modal_key(
     app: &mut AppState,
     fallback_remote: usize,
 ) {
+    // A menu opened by key chooses by key, and the ordering it chooses has
+    // to persist just as the mouse path's does.
+    let sort_before = app.agent_panel_sort;
     let methods = {
         let pane_public = |pane_id: crate::layout::PaneId| {
             ids.public_pane_id(pane_id)
@@ -446,6 +449,9 @@ pub(super) fn dispatch_modal_key(
         unscope_workspace_methods(&mut methods, app, ids);
         methods
     };
+    if app.agent_panel_sort != sort_before {
+        super::compose::persist_agent_panel_sort(app.agent_panel_sort);
+    }
     let remote = ids
         .workspace_owner(app.selected)
         .map(|(remote, _)| remote)

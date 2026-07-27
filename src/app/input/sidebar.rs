@@ -976,8 +976,10 @@ mod tests {
         assert!(app.state.open_sidebar_section_menu(SidebarSection::Agents));
         let menu = app.state.context_menu.clone().expect("menu");
         let items = menu.items();
+        // Names the source, not just the label: the point of the readout is
+        // knowing which plugin to go turn off.
         assert!(
-            items.iter().any(|item| item == "view: blocked"),
+            items.iter().any(|item| item == "view: blocked (my-plugin)"),
             "{items:?}"
         );
         let grouped = items
@@ -1098,6 +1100,63 @@ mod tests {
             &app.state,
             SidebarSection::Agents
         ));
+    }
+
+    #[test]
+    fn choosing_an_ordering_by_keyboard_persists_it_like_the_mouse_does() {
+        // Regression: persistence hung off the *mouse* dispatch only, so the
+        // keyboard-first user the section-menu bindings exist for was
+        // exactly the one whose choice was lost on restart.
+        use crate::app::state::SidebarSection;
+        let _guard = crate::config::test_config_env_lock().lock().unwrap();
+        let path = std::env::temp_dir()
+            .join(format!(
+                "herdr-key-sort-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0)
+            ))
+            .join("config.toml");
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        std::fs::write(&path, "onboarding = false\n").expect("seed config");
+        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
+
+        let mut app = app_for_mouse_test();
+        app.state.workspaces = vec![Workspace::test_new("test")];
+        app.state.active = Some(0);
+        assert_eq!(app.state.agent_panel_sort, AgentPanelSort::Spaces);
+
+        assert!(app.state.open_sidebar_section_menu(SidebarSection::Agents));
+        let priority = app
+            .state
+            .context_menu
+            .as_ref()
+            .expect("menu")
+            .items()
+            .iter()
+            .position(|item| item.contains("priority"))
+            .expect("priority row");
+        if let Some(menu) = app.state.context_menu.as_mut() {
+            menu.list.highlighted = priority;
+        }
+
+        // Enter, from the keyboard, through the menu's own key handler.
+        app.handle_context_menu_key_via_api(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Enter,
+            crossterm::event::KeyModifiers::empty(),
+        ));
+
+        assert_eq!(app.state.agent_panel_sort, AgentPanelSort::Priority);
+        let content = std::fs::read_to_string(&path).expect("read back");
+        assert!(
+            content.contains("agent_panel_sort = \"priority\""),
+            "a keyboard choice must reach the same config key: {content}"
+        );
+
+        std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
+        let _ = std::fs::remove_dir_all(path.parent().expect("parent"));
     }
 
     #[test]

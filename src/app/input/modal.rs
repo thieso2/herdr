@@ -1237,6 +1237,10 @@ impl App {
     }
 
     pub(crate) fn handle_context_menu_key_via_api(&mut self, key: KeyEvent) {
+        // Choosing an ordering from the *keyboard* must persist exactly as
+        // choosing it with the mouse does; the mouse path snapshots around
+        // `handle_mouse` in `input/mod.rs` for the same reason.
+        let previous_agent_panel_sort = self.state.agent_panel_sort;
         match key.code {
             KeyCode::Esc => {
                 self.state.context_menu = None;
@@ -1259,6 +1263,9 @@ impl App {
                 }
             }
             _ => {}
+        }
+        if self.state.agent_panel_sort != previous_agent_panel_sort {
+            self.save_agent_panel_sort(self.state.agent_panel_sort);
         }
     }
 

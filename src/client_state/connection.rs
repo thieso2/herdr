@@ -47,6 +47,7 @@ impl ClientConnectionState {
     }
 
     /// Whether this remote is waiting on an explicit start.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn is_stopped(&self) -> bool {
         matches!(self, Self::Stopped { .. })
     }

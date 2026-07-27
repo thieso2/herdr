@@ -775,6 +775,19 @@ fn app_for_mouse_test() -> App {
     app.state.latest_release_notes_available = false;
     app.state.view.sidebar_rect = ratatui::layout::Rect::new(0, 0, 26, 20);
     app.state.view.terminal_area = ratatui::layout::Rect::new(26, 0, 80, 20);
+    // These tests set the sidebar rect directly rather than running
+    // `compute_view`, so derive the section header rects the same way it
+    // would - they are click targets several tests drive.
+    let (remotes, spaces, agents) = crate::ui::sidebar_section_header_rects(
+        app.state.view.sidebar_rect,
+        ratatui::layout::Rect::default(),
+        app.state.sidebar_collapsed,
+        false,
+        app.state.sidebar_section_split,
+    );
+    app.state.view.sidebar_remotes_header_rect = remotes;
+    app.state.view.sidebar_spaces_header_rect = spaces;
+    app.state.view.sidebar_agents_header_rect = agents;
     app
 }
 

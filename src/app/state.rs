@@ -855,8 +855,13 @@ pub struct ViewState {
     pub remote_chip_strip_rect: Rect,
     /// Per-chip hit rects, parallel to `AppState::remote_chips`.
     pub remote_chip_hit_areas: Vec<Rect>,
-    /// The `add` affordance in the strip header.
-    pub remote_add_hit_area: Rect,
+    /// The three sidebar section header rows, each a full-row click target
+    /// opening that section's menu. `Rect::default()` where the section is
+    /// not rendered: a collapsed sidebar, a degenerate section, or - for
+    /// remotes - a view with no chip strip at all.
+    pub sidebar_remotes_header_rect: Rect,
+    pub sidebar_spaces_header_rect: Rect,
+    pub sidebar_agents_header_rect: Rect,
     pub workspace_card_areas: Vec<WorkspaceCardArea>,
     pub tab_bar_rect: Rect,
     pub tab_hit_areas: Vec<Rect>,
@@ -1276,8 +1281,41 @@ pub(crate) struct TabPressState {
     pub start_row: u16,
 }
 
+/// One of the three sidebar sections whose header opens a menu.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SidebarSection {
+    Remotes,
+    Spaces,
+    Agents,
+}
+
+/// The agent view override in force, as far as the agents section menu needs
+/// to know: what to call it, who applied it, and whether it takes the
+/// ordering away from the user's chosen sort.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActiveAgentView {
+    /// The view's own label, or a fallback when it supplied none.
+    pub label: String,
+    /// The plugin that applied it, so the user knows what to go turn off.
+    pub source: String,
+    /// True when the view carries its own sort spec, which wins outright
+    /// over the panel ordering. A filter-only view leaves the user's sort
+    /// in force, and the radio stays live.
+    pub owns_sort: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ContextMenuKind {
+    /// A sidebar section header. Carries the facts its contents depend on,
+    /// the way every other kind does, so the menu stays derivable from the
+    /// kind alone.
+    SidebarSection {
+        section: SidebarSection,
+        /// Agents only: the active ordering, marked as a radio pair.
+        sort: AgentPanelSort,
+        /// Agents only: the active view override, when there is one.
+        view: Option<ActiveAgentView>,
+    },
     Workspace {
         ws_idx: usize,
     },
@@ -1301,6 +1339,7 @@ pub enum ContextMenuKind {
 }
 
 /// Right-click context menu state.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContextMenuState {
     pub kind: ContextMenuKind,
     pub x: u16,
@@ -1308,9 +1347,185 @@ pub struct ContextMenuState {
     pub list: MenuListState,
 }
 
+/// What a row of a sidebar section menu does when chosen.
+///
+/// Typed rather than matched on the row's text: three dispatch tails read
+/// these, and a label typo in any one of them would be a silent no-op.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SectionMenuAction {
+    AddRemote,
+    EditRemotes,
+    NewSpace,
+    SetAgentSort(AgentPanelSort),
+    ClearAgentView,
+}
+
+/// One row of a section menu: what it reads as, and what it does. A row with
+/// no action is a readout, dimmed and unselectable.
+struct SectionMenuRow {
+    label: String,
+    action: Option<SectionMenuAction>,
+}
+
+impl SectionMenuRow {
+    fn action(label: impl Into<String>, action: SectionMenuAction) -> Self {
+        Self {
+            label: label.into(),
+            action: Some(action),
+        }
+    }
+
+    fn readout(label: impl Into<String>) -> Self {
+        Self {
+            label: label.into(),
+            action: None,
+        }
+    }
+}
+
 impl ContextMenuState {
-    pub fn items(&self) -> &'static [&'static str] {
+    /// The rows of a sidebar section menu, or empty for any other kind.
+    fn section_rows(&self) -> Vec<SectionMenuRow> {
+        let ContextMenuKind::SidebarSection {
+            section,
+            sort,
+            view,
+        } = &self.kind
+        else {
+            return Vec::new();
+        };
+        match section {
+            // `new ...` is a named action rather than the two-character
+            // `add` label it replaces. The whole menu is suppressed for an
+            // ephemeral fleet, so no row here can silently do nothing.
+            SidebarSection::Remotes => vec![
+                SectionMenuRow::action("new ...", SectionMenuAction::AddRemote),
+                SectionMenuRow::action("edit remotes...", SectionMenuAction::EditRemotes),
+            ],
+            SidebarSection::Spaces => vec![SectionMenuRow::action(
+                "new ...",
+                SectionMenuAction::NewSpace,
+            )],
+            SidebarSection::Agents => {
+                // A radio pair rather than a toggle: both the current value
+                // and the alternative are visible, so choosing is a decision
+                // instead of a cycle.
+                let radio = |active: bool| if active { "●" } else { "○" };
+                let mut rows = vec![SectionMenuRow::readout("sort by")];
+                for (label, value) in [
+                    ("grouped", AgentPanelSort::Spaces),
+                    ("priority", AgentPanelSort::Priority),
+                ] {
+                    let text = format!("{} {label}", radio(*sort == value));
+                    // A view that supplies its own ordering wins outright,
+                    // so the radio dims. A filter-only view leaves the
+                    // user's sort in force and the radio stays live.
+                    rows.push(match view {
+                        Some(view) if view.owns_sort => SectionMenuRow::readout(text),
+                        _ => SectionMenuRow::action(text, SectionMenuAction::SetAgentSort(value)),
+                    });
+                }
+                if let Some(view) = view {
+                    // Names the source, not just the label: the point of the
+                    // readout is knowing which plugin to go turn off. When
+                    // the view supplied no label of its own the two collapse,
+                    // so do not say the same word twice.
+                    let readout = if view.label == view.source {
+                        format!("view: {}", view.label)
+                    } else {
+                        format!("view: {} ({})", view.label, view.source)
+                    };
+                    rows.push(SectionMenuRow::readout(readout));
+                    rows.push(SectionMenuRow::action(
+                        "clear filter",
+                        SectionMenuAction::ClearAgentView,
+                    ));
+                }
+                rows
+            }
+        }
+    }
+
+    /// Whether row `idx` can be chosen. Readout rows - the `sort by` header,
+    /// the `view:` line, and a dimmed sort radio - are labels, not actions.
+    pub fn item_selectable(&self, idx: usize) -> bool {
+        match &self.kind {
+            ContextMenuKind::SidebarSection { .. } => self
+                .section_rows()
+                .get(idx)
+                .is_some_and(|row| row.action.is_some()),
+            _ => true,
+        }
+    }
+
+    /// The typed action behind row `idx` of a section menu.
+    pub fn section_action(&self, idx: usize) -> Option<SectionMenuAction> {
+        self.section_rows().get(idx).and_then(|row| row.action)
+    }
+
+    /// Moves the highlight one row down, skipping readout rows so the
+    /// selection can never rest on a label that does nothing.
+    pub fn highlight_next(&mut self) {
+        self.step_highlight(true);
+    }
+
+    /// Moves the highlight one row up, skipping readout rows.
+    pub fn highlight_prev(&mut self) {
+        self.step_highlight(false);
+    }
+
+    fn step_highlight(&mut self, forward: bool) {
+        let count = self.items().len();
+        if count == 0 {
+            return;
+        }
+        let mut idx = self.list.highlighted;
+        // At most one full lap: a menu of nothing but readouts leaves the
+        // highlight where it was rather than spinning.
+        for _ in 0..count {
+            idx = if forward {
+                (idx + 1) % count
+            } else {
+                (idx + count - 1) % count
+            };
+            if self.item_selectable(idx) {
+                self.list.highlighted = idx;
+                return;
+            }
+        }
+    }
+
+    /// The active agent view override this menu was opened over, when any.
+    pub fn active_view(&self) -> Option<&ActiveAgentView> {
+        match &self.kind {
+            ContextMenuKind::SidebarSection { view, .. } => view.as_ref(),
+            _ => None,
+        }
+    }
+
+    /// Menu rows, derived from the kind.
+    ///
+    /// Owned rather than static slices: the agents section menu names the
+    /// active view and marks the active sort, so its rows are not knowable
+    /// at compile time.
+    pub fn items(&self) -> Vec<String> {
+        if matches!(self.kind, ContextMenuKind::SidebarSection { .. }) {
+            return self
+                .section_rows()
+                .into_iter()
+                .map(|row| row.label)
+                .collect();
+        }
+        self.static_items()
+            .iter()
+            .map(|item| item.to_string())
+            .collect()
+    }
+
+    fn static_items(&self) -> &'static [&'static str] {
         match self.kind {
+            // Handled by `section_rows`; never reached through `items`.
+            ContextMenuKind::SidebarSection { .. } => &[],
             ContextMenuKind::Workspace { .. } => &["Rename", "Close"],
             ContextMenuKind::GitWorkspace {
                 is_linked_worktree: false,
@@ -1499,6 +1714,23 @@ pub struct AppState {
     pub selected: usize,
     pub mode: Mode,
     pub should_quit: bool,
+    /// Whether the catalog has held at least one space since this server
+    /// started. Arms the exit-on-empty rule: without it a fresh server with
+    /// no startup cwd and no restored session starts empty and would exit
+    /// before the startup seed or a client got a chance.
+    ///
+    /// Server runtime state, never persisted and never set client-side —
+    /// the pure client exits on the same `should_quit` field, so a latch it
+    /// could set would kill the client.
+    pub(crate) catalog_ever_held_space: bool,
+    /// Mirrors the server's shutdown-in-progress and live-handoff windows,
+    /// during which emptying the catalog must not request another exit.
+    pub(crate) exit_on_empty_suppressed: bool,
+    /// True when `should_quit` was set because the catalog went empty rather
+    /// than because someone asked. Distinguishes the two reasons told to
+    /// framed clients, so a stop reads as "no panes left" rather than
+    /// "stopped by request".
+    pub(crate) exit_requested_because_empty: bool,
     /// True when this AppState is composed by the pure fleet client: menu
     /// entries whose effects only exist server-side (settings, reload
     /// config) are omitted, and detach means "exit the fleet client".
@@ -1529,6 +1761,11 @@ pub struct AppState {
     /// so the owning pure-client loop drains this into the dialog. Only the
     /// pure client offers the entry that sets it.
     pub request_add_remote: bool,
+    /// Set when the user asked to edit the fleet from the remotes section
+    /// menu. Drained by the pure-client loop into the remotes list modal,
+    /// for the same reason as `request_add_remote`: the modal is client
+    /// chrome that `AppState` cannot reach.
+    pub request_manage_remotes: bool,
     /// Set when the headless server should ask attached clients to reload
     /// their client-local sound config from disk.
     pub request_client_config_reload: bool,
@@ -1705,6 +1942,79 @@ pub struct AppState {
 }
 
 impl AppState {
+    /// Arms the exit-on-empty rule once the catalog has actually held a
+    /// space. Never un-latches: a server that has hosted work and then lost
+    /// all of it is exactly the case the rule exists for.
+    ///
+    /// Called only from the server loop — the pure client shares this state
+    /// and exits on the same `should_quit`.
+    pub(crate) fn note_catalog_populated(&mut self) {
+        if !self.workspaces.is_empty() {
+            self.catalog_ever_held_space = true;
+        }
+    }
+
+    /// Whether this server should exit because nothing is left in it.
+    ///
+    /// A pure predicate over server-side state, so the run loop only has to
+    /// call it. Note what is deliberately absent: any notion of attached
+    /// clients. The fleet client holds a live session to every enabled
+    /// remote, so a "do not stop while a client is attached" veto would mean
+    /// the stop never fires for exactly the users it exists for.
+    pub(crate) fn should_exit_because_catalog_empty(&self) -> bool {
+        self.workspaces.is_empty()
+            && self.catalog_ever_held_space
+            && !self.exit_on_empty_suppressed
+            && !self.should_quit
+    }
+
+    /// Requests shutdown when the catalog just went empty; returns whether
+    /// it did. Setting `should_quit` rather than shutting down directly is
+    /// what keeps clients notified: the server loop turns the flag into the
+    /// shutdown-initiation path, which announces before it goes.
+    pub(crate) fn request_exit_if_catalog_empty(&mut self) -> bool {
+        if self.should_exit_because_catalog_empty() {
+            self.should_quit = true;
+            self.exit_requested_because_empty = true;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// The agent view override in force, as the agents section menu needs
+    /// it: what to call it, who applied it, and whether it takes the
+    /// ordering away from the user's chosen sort.
+    ///
+    /// A view with a sort spec wins outright; a filter-only view leaves the
+    /// panel ordering in force over the filtered set. That is the precedence
+    /// the ordering code already implements — the menu reflects it rather
+    /// than the cruder "any view suppresses the sort" rule it replaces.
+    pub(crate) fn active_agent_view(&self) -> Option<ActiveAgentView> {
+        self.agent_view_override
+            .as_ref()
+            .map(|view| ActiveAgentView {
+                label: view.label.clone().unwrap_or_else(|| "filtered".to_string()),
+                source: view.source.clone(),
+                owns_sort: !view.sort.is_empty(),
+            })
+    }
+
+    /// Whether a key is bound to open this section's menu.
+    ///
+    /// The other half of the `▾` reachability rule: a header advertises a
+    /// menu when the mouse can open it *or* a key can. With mouse capture
+    /// off and nothing bound the headers carry no marker, because there is
+    /// genuinely no way to open them.
+    pub(crate) fn sidebar_section_menu_key_bound(&self, section: SidebarSection) -> bool {
+        let bindings = match section {
+            SidebarSection::Remotes => &self.keybinds.open_remotes_menu,
+            SidebarSection::Spaces => &self.keybinds.open_spaces_menu,
+            SidebarSection::Agents => &self.keybinds.open_agents_menu,
+        };
+        !bindings.bindings.is_empty()
+    }
+
     pub(crate) fn mark_session_dirty(&mut self) {
         self.session_dirty = true;
     }
@@ -2058,6 +2368,9 @@ impl AppState {
             selected: 0,
             mode: Mode::Navigate,
             should_quit: false,
+            catalog_ever_held_space: false,
+            exit_on_empty_suppressed: false,
+            exit_requested_because_empty: false,
             pure_client: false,
             fleet_config_backed: false,
             detach_exits: false,
@@ -2073,6 +2386,7 @@ impl AppState {
             request_submit_worktree_remove: false,
             request_reload_config: false,
             request_add_remote: false,
+            request_manage_remotes: false,
             request_client_config_reload: false,
             request_clipboard_write: None,
             request_history_top_backfill: false,
@@ -2106,7 +2420,9 @@ impl AppState {
                 sidebar_rect: Rect::default(),
                 remote_chip_strip_rect: Rect::default(),
                 remote_chip_hit_areas: Vec::new(),
-                remote_add_hit_area: Rect::default(),
+                sidebar_remotes_header_rect: Rect::default(),
+                sidebar_spaces_header_rect: Rect::default(),
+                sidebar_agents_header_rect: Rect::default(),
                 workspace_card_areas: Vec::new(),
                 tab_bar_rect: Rect::default(),
                 tab_hit_areas: Vec::new(),
@@ -2530,6 +2846,9 @@ impl AppState {
         }
         if let Some(menu) = &self.context_menu {
             match menu.kind {
+                // A section menu carries no workspace, tab or pane index,
+                // so there is nothing here to validate.
+                ContextMenuKind::SidebarSection { .. } => {}
                 ContextMenuKind::Workspace { ws_idx }
                 | ContextMenuKind::GitWorkspace { ws_idx, .. } => {
                     assert_workspace_index(ws_idx, "context menu workspace")
@@ -2590,6 +2909,68 @@ mod tests {
             scan_cols: 80,
             scan_screen: crate::ghostty::ActiveScreen::Primary,
         }
+    }
+
+    #[test]
+    fn exit_on_empty_needs_a_catalog_that_once_held_a_space() {
+        // A fresh server with no startup cwd and no restored session starts
+        // empty; without the latch it would exit before the startup seed or
+        // a client got a chance.
+        let mut state = AppState::test_new();
+        assert!(state.workspaces.is_empty());
+        assert!(
+            !state.should_exit_because_catalog_empty(),
+            "never held a space"
+        );
+
+        state.note_catalog_populated();
+        assert!(
+            !state.catalog_ever_held_space,
+            "an empty catalog does not arm the rule"
+        );
+
+        state
+            .workspaces
+            .push(crate::workspace::Workspace::test_new("one"));
+        state.note_catalog_populated();
+        assert!(state.catalog_ever_held_space);
+        assert!(
+            !state.should_exit_because_catalog_empty(),
+            "a catalog that still holds a space stays"
+        );
+
+        state.workspaces.clear();
+        assert!(
+            state.should_exit_because_catalog_empty(),
+            "held one, holds none: exit"
+        );
+        state.note_catalog_populated();
+        assert!(state.catalog_ever_held_space, "the latch never un-latches");
+    }
+
+    #[test]
+    fn exit_on_empty_is_suppressed_during_shutdown_and_handoff() {
+        let mut state = AppState::test_new();
+        state
+            .workspaces
+            .push(crate::workspace::Workspace::test_new("one"));
+        state.note_catalog_populated();
+        state.workspaces.clear();
+
+        state.exit_on_empty_suppressed = true;
+        assert!(
+            !state.should_exit_because_catalog_empty(),
+            "a shutdown already in progress, or a live handoff, does not re-trigger"
+        );
+        assert!(!state.request_exit_if_catalog_empty());
+        assert!(!state.should_quit);
+
+        state.exit_on_empty_suppressed = false;
+        assert!(state.request_exit_if_catalog_empty());
+        assert!(state.should_quit, "the run loop turns this into a shutdown");
+
+        // Already going: asking again changes nothing.
+        assert!(!state.request_exit_if_catalog_empty());
     }
 
     #[test]

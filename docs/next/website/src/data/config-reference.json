@@ -494,6 +494,24 @@
           "description": "Focus the last focused pane across workspaces and tabs. Unset by default."
         },
         {
+          "key": "keys.open_remotes_menu",
+          "type": "keybinding",
+          "default": "unset",
+          "description": "Open the sidebar's remotes section menu. Unset by default."
+        },
+        {
+          "key": "keys.open_spaces_menu",
+          "type": "keybinding",
+          "default": "unset",
+          "description": "Open the sidebar's spaces section menu. Unset by default."
+        },
+        {
+          "key": "keys.open_agents_menu",
+          "type": "keybinding",
+          "default": "unset",
+          "description": "Open the sidebar's agents section menu. Unset by default."
+        },
+        {
           "key": "keys.split_vertical",
           "type": "keybinding",
           "default": "\"prefix+v\"",

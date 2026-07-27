@@ -183,6 +183,12 @@ impl App {
     ) {
         let previous_mode = self.state.mode;
         match action {
+            NavigateAction::OpenSidebarSectionMenu(section) => {
+                // Opens anchored under its own header, so a menu opened by
+                // key looks identical to one opened by click. A section with
+                // no menu - remotes, for an ephemeral fleet - does nothing.
+                self.state.open_sidebar_section_menu(section);
+            }
             NavigateAction::NewWorkspace => {
                 self.begin_tui_workspace_create("tui.key.workspace.create");
             }
@@ -1323,6 +1329,10 @@ pub(crate) enum NavigateAction {
     CyclePaneNext,
     CyclePanePrevious,
     LastPane,
+    /// Open one of the three sidebar section menus. The menus are otherwise
+    /// mouse-only, which leaves the sidebar unreachable with mouse capture
+    /// off; these are the opt-in way in.
+    OpenSidebarSectionMenu(crate::app::state::SidebarSection),
     Help,
     Settings,
     ReloadConfig,
@@ -1448,6 +1458,18 @@ fn non_indexed_action_for_key(
         (&kb.swap_pane_up, NavigateAction::SwapPaneUp),
         (&kb.swap_pane_right, NavigateAction::SwapPaneRight),
         (&kb.last_pane, NavigateAction::LastPane),
+        (
+            &kb.open_remotes_menu,
+            NavigateAction::OpenSidebarSectionMenu(crate::app::state::SidebarSection::Remotes),
+        ),
+        (
+            &kb.open_spaces_menu,
+            NavigateAction::OpenSidebarSectionMenu(crate::app::state::SidebarSection::Spaces),
+        ),
+        (
+            &kb.open_agents_menu,
+            NavigateAction::OpenSidebarSectionMenu(crate::app::state::SidebarSection::Agents),
+        ),
         (&kb.cycle_pane_next, NavigateAction::CyclePaneNext),
         (&kb.cycle_pane_previous, NavigateAction::CyclePanePrevious),
         (&kb.split_vertical, NavigateAction::SplitVertical),
@@ -1530,6 +1552,9 @@ pub(super) fn execute_navigate_action_in_context(
 ) {
     let previous_mode = state.mode;
     match action {
+        NavigateAction::OpenSidebarSectionMenu(section) => {
+            state.open_sidebar_section_menu(section);
+        }
         NavigateAction::NewWorkspace => {
             state.request_new_workspace = true;
             leave_navigate_mode(state);

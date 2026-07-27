@@ -15,7 +15,7 @@
 
 use std::collections::HashMap;
 use std::io;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -47,10 +47,10 @@ use crate::protocol::framed::{
     CONTROL_STREAM_ID, FRAMED_PROTOCOL_MIN_SUPPORTED, FRAMED_PROTOCOL_VERSION, FRAME_HEADER_BYTES,
     HISTORY_FETCH_MAX_BYTES, HISTORY_PAGE_DEFAULT_BYTES, HISTORY_PAGE_MIN_BYTES,
     HISTORY_PAGE_SERVED_MAX_BYTES, MAX_FRAME_PAYLOAD, NOTIFICATION_POSTED_EVENT,
-    PANE_PASTE_IMAGE_METHOD, PANE_SEND_BYTES_METHOD, PING_METHOD, SESSION_HELLO_METHOD,
-    SESSION_SNAPSHOT_METHOD, STREAM_CLOSED_EVENT, STREAM_CLOSE_METHOD, STREAM_HISTORY_METHOD,
-    STREAM_OPEN_METHOD, STREAM_RESIZE_METHOD, STREAM_REVOKED_EVENT, STREAM_SCROLL_METHOD,
-    WINDOW_TITLE_CHANGED_EVENT,
+    PANE_PASTE_IMAGE_METHOD, PANE_SEND_BYTES_METHOD, PING_METHOD, SERVER_STOPPING_EVENT,
+    SESSION_HELLO_METHOD, SESSION_SNAPSHOT_METHOD, STREAM_CLOSED_EVENT, STREAM_CLOSE_METHOD,
+    STREAM_HISTORY_METHOD, STREAM_OPEN_METHOD, STREAM_RESIZE_METHOD, STREAM_REVOKED_EVENT,
+    STREAM_SCROLL_METHOD, WINDOW_TITLE_CHANGED_EVENT,
 };
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -121,6 +121,7 @@ pub(super) fn serve(
     api_tx: &ApiRequestSender,
     event_hub: &EventHub,
     running: &Arc<AtomicBool>,
+    stop_reason: &Arc<AtomicU8>,
 ) -> io::Result<()> {
     let mut reader = FrameReader::new();
 
@@ -174,6 +175,7 @@ pub(super) fn serve(
         api_tx,
         event_hub,
         running,
+        stop_reason,
     );
 
     // Every stream the session still owns goes away with the connection —
@@ -204,6 +206,7 @@ fn run_negotiated_session(
     api_tx: &ApiRequestSender,
     event_hub: &EventHub,
     running: &Arc<AtomicBool>,
+    stop_reason: &Arc<AtomicU8>,
 ) -> io::Result<SessionEnd> {
     // Events published before the handshake are history, not session traffic.
     let mut event_cursor = event_hub.current_sequence();
@@ -213,6 +216,7 @@ fn run_negotiated_session(
             PollFrame::Closed => return Ok(SessionEnd::PeerClosed),
             PollFrame::Pending => {
                 if !running.load(Ordering::Relaxed) {
+                    announce_server_stopping(stream, stop_reason);
                     return Ok(SessionEnd::ServerStopped);
                 }
                 if let Some(end) = pump_session_output_or_end(
@@ -1360,6 +1364,29 @@ fn write_control_allow_disconnect(
     write_frame_allow_disconnect(stream, FrameType::Control, CONTROL_STREAM_ID, &payload)
 }
 
+/// Tells this session's client that the server is going away on purpose,
+/// just before the session ends on server stop.
+///
+/// Ungated: a client that negotiated no capabilities at all still needs to
+/// know, because otherwise a deliberate stop reaches it as a bare EOF and is
+/// indistinguishable from a crash. Best-effort by design — a peer that has
+/// already gone must not turn a clean stop into an io error.
+fn announce_server_stopping(stream: &mut LocalStream, stop_reason: &Arc<AtomicU8>) {
+    // No declared reason means nobody asked for a stop: the handle was just
+    // dropped, which is how a live handoff ends the old server. Staying
+    // silent is what lets the client reconnect to the replacement.
+    let Some(reason) = super::StopReason::from_code(stop_reason.load(Ordering::Acquire)) else {
+        return;
+    };
+    let event = serde_json::json!({
+        "event": SERVER_STOPPING_EVENT,
+        "data": { "reason": reason.as_str() },
+    });
+    if let Err(err) = write_control_allow_disconnect(stream, &event) {
+        debug!(err = %err, "failed to announce server stop to framed client");
+    }
+}
+
 /// Writes an already-encoded JSON API response string as a control frame.
 fn write_control_raw_allow_disconnect(
     stream: &mut LocalStream,
@@ -1469,13 +1496,32 @@ mod tests {
         api_tx: crate::api::ApiRequestSender,
         event_hub: EventHub,
     ) -> (Receiver<io::Result<()>>, std::thread::JoinHandle<()>) {
+        spawn_connection_with_stop(
+            server,
+            api_tx,
+            event_hub,
+            Arc::new(AtomicBool::new(true)),
+            Arc::new(AtomicU8::new(0)),
+        )
+    }
+
+    /// Like [`spawn_connection_with`], but the caller keeps the stop flag and
+    /// reason so a test can stop the server mid-session.
+    fn spawn_connection_with_stop(
+        server: LocalStream,
+        api_tx: crate::api::ApiRequestSender,
+        event_hub: EventHub,
+        running: Arc<AtomicBool>,
+        stop_reason: Arc<AtomicU8>,
+    ) -> (Receiver<io::Result<()>>, std::thread::JoinHandle<()>) {
         let (done_tx, done_rx) = mpsc::channel();
         let thread = std::thread::spawn(move || {
             let result = super::super::handle_connection(
                 server,
                 &api_tx,
                 &event_hub,
-                &Arc::new(AtomicBool::new(true)),
+                &running,
+                &stop_reason,
                 None,
             );
             done_tx.send(result).unwrap();
@@ -2316,6 +2362,67 @@ mod tests {
         assert_eq!(event["event"], "catalog.event");
         assert_eq!(event["data"]["event"], "workspace_focused");
         assert_eq!(event["data"]["data"]["workspace_id"], "ws_2");
+
+        finish(client, done_rx, thread, path);
+    }
+
+    #[test]
+    fn a_server_stop_is_announced_even_to_a_session_that_negotiated_nothing() {
+        // Deliberately ungated, unlike every other event: the others are data
+        // feeds a client opts into, but this one is about the session itself.
+        // Without it a stop reaches the client as a bare EOF, indistinguishable
+        // from a crash.
+        for (code, expected) in [(1u8, "empty"), (0u8, "requested")] {
+            let (mut client, server, path) = local_stream_pair("stop-announce");
+            let (api_tx, _api_rx) = tokio::sync::mpsc::unbounded_channel();
+            let running = Arc::new(AtomicBool::new(true));
+            let stop_reason = Arc::new(AtomicU8::new(0));
+            let (done_rx, thread) = spawn_connection_with_stop(
+                server,
+                api_tx,
+                EventHub::default(),
+                Arc::clone(&running),
+                Arc::clone(&stop_reason),
+            );
+
+            hello(&mut client, "h-stop", &[]);
+
+            stop_reason.store(code, Ordering::Release);
+            running.store(false, Ordering::Release);
+
+            let event = read_control(&mut client);
+            assert_eq!(event["event"], SERVER_STOPPING_EVENT, "{event}");
+            assert_eq!(event["data"]["reason"], expected, "{event}");
+
+            finish(client, done_rx, thread, path);
+        }
+    }
+
+    #[test]
+    fn a_session_ending_without_a_declared_reason_announces_nothing() {
+        // How a live handoff ends the old server: the handle is dropped,
+        // which flips `running`, but nobody declared a stop. The client must
+        // see a plain EOF so it retries and reconnects to the replacement
+        // server, rather than parking the remote as stopped.
+        let (mut client, server, path) = local_stream_pair("stop-silent");
+        let (api_tx, _api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let running = Arc::new(AtomicBool::new(true));
+        let (done_rx, thread) = spawn_connection_with_stop(
+            server,
+            api_tx,
+            EventHub::default(),
+            Arc::clone(&running),
+            Arc::new(AtomicU8::new(super::super::STOP_REASON_UNSET)),
+        );
+
+        hello(&mut client, "h-silent", &[]);
+        running.store(false, Ordering::Release);
+
+        // Nothing more arrives: the next read hits end-of-stream.
+        match read_frame(&mut client) {
+            Err(FramedCodecError::UnexpectedEof) => {}
+            other => panic!("an undeclared stop must announce nothing, got {other:?}"),
+        }
 
         finish(client, done_rx, thread, path);
     }

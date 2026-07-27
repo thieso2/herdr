@@ -318,9 +318,14 @@ mod tests {
         assert!(!app.view.split_borders.is_empty());
         assert!(frame.cursor.is_some());
         assert_eq!(frame.hyperlinks, vec![uri.to_owned()]);
+        // Rebaselined for the sidebar section menus, for the same reason
+        // as the render digest in `crate::ui`: both section headers gained
+        // a right-aligned `▾` and the agents header lost the
+        // `grouped`/`priority` label to the menu. Verified by reading the
+        // frame's cells, not by accepting the new digest.
         assert_eq!(
             frame_digest(&frame),
-            "ce383feeaac30922502b7c4f8af53b5ca30e816ec4503ca6d015738b584da487"
+            "8504721aa50ef88c62f90b1fc3745310ba33f8da52044a65efe8c5628be2d8e7"
         );
     }
 

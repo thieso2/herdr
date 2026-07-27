@@ -98,6 +98,7 @@ mod tests {
             name: name.to_string(),
             target: Some(format!("can@{name}.example")),
             session: "work".to_string(),
+            hue: None,
             enabled,
         }
     }
@@ -107,6 +108,7 @@ mod tests {
             name: name.to_string(),
             target: None,
             session: session.to_string(),
+            hue: None,
             enabled,
         }
     }

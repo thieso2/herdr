@@ -403,6 +403,12 @@ pub struct KeysConfig {
     pub cycle_pane_previous: BindingConfig,
     /// Focus the last focused pane across workspaces and tabs. Unset by default.
     pub last_pane: BindingConfig,
+    /// Open the sidebar's remotes section menu. Unset by default.
+    pub open_remotes_menu: BindingConfig,
+    /// Open the sidebar's spaces section menu. Unset by default.
+    pub open_spaces_menu: BindingConfig,
+    /// Open the sidebar's agents section menu. Unset by default.
+    pub open_agents_menu: BindingConfig,
     /// Split pane vertically (side by side). Default: "prefix+v"
     pub split_vertical: BindingConfig,
     /// Split pane horizontally (stacked). Default: "prefix+minus"
@@ -523,6 +529,12 @@ pub(crate) struct KeysConfigOverlay {
     #[serde(skip_serializing_if = "Option::is_none")]
     last_pane: Option<BindingConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    open_remotes_menu: Option<BindingConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    open_spaces_menu: Option<BindingConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    open_agents_menu: Option<BindingConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     split_vertical: Option<BindingConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     split_horizontal: Option<BindingConfig>,
@@ -604,6 +616,9 @@ impl<'de> Deserialize<'de> for KeysConfig {
         apply_field!(cycle_pane_next);
         apply_field!(cycle_pane_previous);
         apply_field!(last_pane);
+        apply_field!(open_remotes_menu);
+        apply_field!(open_spaces_menu);
+        apply_field!(open_agents_menu);
         apply_field!(split_vertical);
         apply_field!(split_horizontal);
         apply_field!(close_pane);
@@ -702,6 +717,9 @@ impl KeysConfig {
         copy_effective_action_field!(cycle_pane_next, keybinds.cycle_pane_next);
         copy_effective_action_field!(cycle_pane_previous, keybinds.cycle_pane_previous);
         copy_effective_action_field!(last_pane, keybinds.last_pane);
+        copy_effective_action_field!(open_remotes_menu, keybinds.open_remotes_menu);
+        copy_effective_action_field!(open_spaces_menu, keybinds.open_spaces_menu);
+        copy_effective_action_field!(open_agents_menu, keybinds.open_agents_menu);
         copy_effective_action_field!(split_vertical, keybinds.split_vertical);
         copy_effective_action_field!(split_horizontal, keybinds.split_horizontal);
         copy_effective_action_field!(close_pane, keybinds.close_pane);
@@ -978,6 +996,12 @@ impl Default for KeysConfig {
             cycle_pane_next: BindingConfig::one("prefix+tab"),
             cycle_pane_previous: BindingConfig::one("prefix+shift+tab"),
             last_pane: BindingConfig::empty(),
+            // Unbound by default: the prefix namespace is contested and
+            // herdr is mouse-first. These join the established family of
+            // secondary actions shipped unbound for users who want them.
+            open_remotes_menu: BindingConfig::empty(),
+            open_spaces_menu: BindingConfig::empty(),
+            open_agents_menu: BindingConfig::empty(),
             split_vertical: BindingConfig::one("prefix+v"),
             split_horizontal: BindingConfig::one("prefix+minus"),
             close_pane: BindingConfig::one("prefix+x"),

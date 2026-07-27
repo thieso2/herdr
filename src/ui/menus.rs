@@ -296,10 +296,21 @@ pub(super) fn render_context_menu(app: &AppState, frame: &mut Frame) {
         return;
     };
 
+    // Readout rows - the agents menu's `sort by` header, its `view:` line,
+    // and a sort radio a plugin view has taken over - render dimmed so the
+    // menu shows what applies without offering it as an action.
     let items: Vec<ListItem> = menu
         .items()
         .iter()
-        .map(|item| ListItem::new(Line::from(*item)))
+        .enumerate()
+        .map(|(idx, item)| {
+            let line = if menu.item_selectable(idx) {
+                Line::from(item.clone())
+            } else {
+                Line::from(Span::styled(item.clone(), Style::default().fg(p.overlay0)))
+            };
+            ListItem::new(line)
+        })
         .collect();
     let list = List::new(items)
         .style(Style::default().fg(p.text))

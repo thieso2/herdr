@@ -1,6 +1,6 @@
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -34,11 +34,63 @@ const INITIAL_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const STREAM_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_INITIAL_REQUEST_BYTES: usize = 1024 * 1024;
 
+/// Why this server is stopping, told to framed clients so that a deliberate
+/// stop is distinguishable from a crash.
+///
+/// Both variants are terminal for the client. An unrecognised value on the
+/// wire is treated as [`StopReason::Requested`], so a newer server can add
+/// reasons without stranding an older client.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum StopReason {
+    /// Someone asked: `server.stop`, a signal, or a client command.
+    #[default]
+    Requested,
+    /// The catalog went empty, so there was nothing left to keep alive.
+    Empty,
+}
+
+/// Stop-reason code meaning "no deliberate stop was declared".
+///
+/// The sessions' `running` flag also goes false when [`ServerHandle`] is
+/// merely dropped, which is how a live handoff ends the old server. That
+/// must stay silent: the client has to retry and reconnect to the
+/// replacement, not park the remote as stopped. So the announcement is
+/// keyed on this sentinel being replaced by [`ServerHandle::begin_stopping`],
+/// not on `running` alone.
+pub(super) const STOP_REASON_UNSET: u8 = u8::MAX;
+
+impl StopReason {
+    /// The wire value carried in the `server.stopping` event.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Requested => crate::protocol::framed::SERVER_STOPPING_REASON_REQUESTED,
+            Self::Empty => crate::protocol::framed::SERVER_STOPPING_REASON_EMPTY,
+        }
+    }
+
+    fn code(self) -> u8 {
+        match self {
+            Self::Requested => 0,
+            Self::Empty => 1,
+        }
+    }
+
+    /// The declared reason for a code, or `None` when no stop was declared.
+    pub(super) fn from_code(code: u8) -> Option<Self> {
+        match code {
+            STOP_REASON_UNSET => None,
+            1 => Some(Self::Empty),
+            _ => Some(Self::Requested),
+        }
+    }
+}
+
 pub struct ServerHandle {
     _thread: std::thread::JoinHandle<()>,
     path: PathBuf,
     identity: SocketFileIdentity,
     running: Arc<AtomicBool>,
+    stop_reason: Arc<AtomicU8>,
 }
 
 impl Drop for ServerHandle {
@@ -56,6 +108,18 @@ impl Drop for ServerHandle {
 impl ServerHandle {
     pub(crate) fn remove_socket_file_if_owned(&self) -> std::io::Result<()> {
         remove_socket_file_if_owned(&self.path, &self.identity)
+    }
+
+    /// Records why this server is stopping and tells framed sessions to wind
+    /// up, so each can announce the stop before its socket closes.
+    ///
+    /// Called at the start of shutdown rather than left to `Drop`, so the
+    /// announcement lands inside the flush window the shutdown path already
+    /// waits out. `Drop` repeating the `running` store afterwards is a
+    /// harmless no-op.
+    pub(crate) fn begin_stopping(&self, reason: StopReason) {
+        self.stop_reason.store(reason.code(), Ordering::Release);
+        self.running.store(false, Ordering::Release);
     }
 }
 
@@ -87,7 +151,9 @@ pub fn start_server_with_capabilities(
     info!(path = %path.display(), "api server listening");
 
     let running = Arc::new(AtomicBool::new(true));
+    let stop_reason = Arc::new(AtomicU8::new(STOP_REASON_UNSET));
     let listener_running = Arc::clone(&running);
+    let listener_stop_reason = Arc::clone(&stop_reason);
     let thread = std::thread::spawn(move || {
         for stream in listener.incoming() {
             match stream {
@@ -96,12 +162,14 @@ pub fn start_server_with_capabilities(
                     let event_hub = event_hub.clone();
                     let capabilities = capabilities.clone();
                     let connection_running = Arc::clone(&listener_running);
+                    let connection_stop_reason = Arc::clone(&listener_stop_reason);
                     std::thread::spawn(move || {
                         if let Err(err) = handle_connection(
                             stream,
                             &api_tx,
                             &event_hub,
                             &connection_running,
+                            &connection_stop_reason,
                             capabilities,
                         ) {
                             warn!(err = %err, "api connection failed");
@@ -118,6 +186,7 @@ pub fn start_server_with_capabilities(
     });
 
     Ok(ServerHandle {
+        stop_reason,
         _thread: thread,
         path,
         identity,
@@ -143,6 +212,7 @@ fn handle_connection(
     api_tx: &ApiRequestSender,
     event_hub: &EventHub,
     running: &Arc<AtomicBool>,
+    stop_reason: &Arc<AtomicU8>,
     capabilities: Option<ServerCapabilities>,
 ) -> std::io::Result<()> {
     if let Err(err) = stream.set_send_timeout(Some(STREAM_WRITE_TIMEOUT)) {
@@ -156,7 +226,7 @@ fn handle_connection(
     let line = match preamble {
         ConnectionPreamble::FramedSession => {
             debug!("framed session opened on api socket");
-            return framed_session::serve(stream, api_tx, event_hub, running);
+            return framed_session::serve(stream, api_tx, event_hub, running, stop_reason);
         }
         ConnectionPreamble::RequestLine(line) => line,
     };
@@ -579,6 +649,7 @@ mod windows_tests {
                 &api_tx,
                 &EventHub::default(),
                 &Arc::new(AtomicBool::new(true)),
+                &Arc::new(std::sync::atomic::AtomicU8::new(0)),
                 None,
             );
             done_tx.send(result).unwrap();
@@ -1095,7 +1166,14 @@ mod tests {
         let server_running = Arc::clone(&running);
         let event_hub = EventHub::default();
         let server_thread = std::thread::spawn(move || {
-            handle_connection(server, &api_tx, &event_hub, &server_running, None)
+            handle_connection(
+                server,
+                &api_tx,
+                &event_hub,
+                &server_running,
+                &Arc::new(std::sync::atomic::AtomicU8::new(0)),
+                None,
+            )
         });
 
         let msg = api_rx.blocking_recv().unwrap();
@@ -1134,7 +1212,15 @@ mod tests {
 
         let running = Arc::new(AtomicBool::new(true));
         let event_hub = EventHub::default();
-        handle_connection(server, &api_tx, &event_hub, &running, None).unwrap();
+        handle_connection(
+            server,
+            &api_tx,
+            &event_hub,
+            &running,
+            &Arc::new(std::sync::atomic::AtomicU8::new(0)),
+            None,
+        )
+        .unwrap();
 
         let response: serde_json::Value = serde_json::from_str(&read_line(&mut client)).unwrap();
         assert_eq!(response["id"], "wait_1");
@@ -1161,7 +1247,15 @@ mod tests {
 
         let running = Arc::new(AtomicBool::new(true));
         let event_hub = EventHub::default();
-        handle_connection(server, &api_tx, &event_hub, &running, None).unwrap();
+        handle_connection(
+            server,
+            &api_tx,
+            &event_hub,
+            &running,
+            &Arc::new(std::sync::atomic::AtomicU8::new(0)),
+            None,
+        )
+        .unwrap();
 
         let response: serde_json::Value = serde_json::from_str(&read_line(&mut client)).unwrap();
         assert_eq!(response["id"], "wait_2");
@@ -1222,7 +1316,15 @@ mod tests {
         client.flush().unwrap();
 
         let running = Arc::new(AtomicBool::new(true));
-        handle_connection(server, &api_tx, &event_hub, &running, None).unwrap();
+        handle_connection(
+            server,
+            &api_tx,
+            &event_hub,
+            &running,
+            &Arc::new(std::sync::atomic::AtomicU8::new(0)),
+            None,
+        )
+        .unwrap();
 
         let response: serde_json::Value = serde_json::from_str(&read_line(&mut client)).unwrap();
         assert_eq!(response["id"], "wait_close");
@@ -1279,7 +1381,14 @@ mod tests {
         let event_hub = EventHub::default();
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let server_thread = std::thread::spawn(move || {
-            let result = handle_connection(server, &api_tx, &event_hub, &server_running, None);
+            let result = handle_connection(
+                server,
+                &api_tx,
+                &event_hub,
+                &server_running,
+                &Arc::new(std::sync::atomic::AtomicU8::new(0)),
+                None,
+            );
             done_tx.send(result).unwrap();
         });
 
@@ -1311,7 +1420,14 @@ mod tests {
         let event_hub = EventHub::default();
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let server_thread = std::thread::spawn(move || {
-            let result = handle_connection(server, &api_tx, &event_hub, &server_running, None);
+            let result = handle_connection(
+                server,
+                &api_tx,
+                &event_hub,
+                &server_running,
+                &Arc::new(std::sync::atomic::AtomicU8::new(0)),
+                None,
+            );
             done_tx.send(result).unwrap();
         });
 
@@ -1343,7 +1459,14 @@ mod tests {
         let event_hub = EventHub::default();
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let server_thread = std::thread::spawn(move || {
-            let result = handle_connection(server, &api_tx, &event_hub, &server_running, None);
+            let result = handle_connection(
+                server,
+                &api_tx,
+                &event_hub,
+                &server_running,
+                &Arc::new(std::sync::atomic::AtomicU8::new(0)),
+                None,
+            );
             done_tx.send(result).unwrap();
         });
 

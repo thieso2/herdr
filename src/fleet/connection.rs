@@ -101,6 +101,25 @@ pub fn stopped_status_line(name: &str) -> String {
     )
 }
 
+/// The status line for a remote whose server announced that it was stopping
+/// on purpose, worded from the reason it gave.
+///
+/// Distinct from [`stopped_status_line`], which describes finding no server
+/// at connect time. Here the client watched it go, so the line says why —
+/// and an unrecognised reason from a newer server reads as "by request", the
+/// same as any deliberate stop.
+pub fn announced_stop_status_line(name: &str, reason: &str) -> String {
+    let why = if reason == crate::protocol::framed::SERVER_STOPPING_REASON_EMPTY {
+        "no panes left"
+    } else {
+        "stopped by request"
+    };
+    format!(
+        "{brand} server on {name} stopped ({why}); run `{brand} remote start {name}`",
+        brand = crate::identity::BRAND
+    )
+}
+
 /// Connection lifecycle of one remote. Plain data; renders directly into the
 /// `remote list` state column.
 #[derive(Debug, Clone, PartialEq, Eq)]

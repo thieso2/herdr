@@ -12,13 +12,13 @@ use self::tokens::{ResolvedToken, ResolvedTokenKind, SpaceTokenContext};
 use super::scrollbar::{render_scrollbar, should_show_scrollbar};
 use super::status::{agent_icon, state_dot, state_label, state_label_color};
 use super::text::{display_width, display_width_u16, truncate_end};
-use crate::app::state::{AgentPanelSort, Palette};
+use crate::app::state::{Palette, SidebarSection};
 use crate::app::{AppState, Mode};
 use crate::detect::AgentState;
 use crate::terminal::{EmptyPaneContentSource, PaneContentSource};
 
-const WORKSPACE_SECTION_HEADER_ROWS: u16 = 2;
-const AGENT_PANEL_HEADER_ROWS: u16 = 3;
+pub(crate) const WORKSPACE_SECTION_HEADER_ROWS: u16 = 2;
+pub(crate) const AGENT_PANEL_HEADER_ROWS: u16 = 3;
 
 pub(crate) struct AgentPanelEntry {
     pub ws_idx: usize,
@@ -78,35 +78,104 @@ pub(crate) fn sidebar_section_divider_rect(area: Rect, split_ratio: f32) -> Rect
     Rect::new(content.x, content.y + ws_h, content.width, 1)
 }
 
-fn agent_panel_sort_label(sort: AgentPanelSort) -> &'static str {
-    match sort {
-        AgentPanelSort::Spaces => "grouped",
-        AgentPanelSort::Priority => "priority",
+/// The marker every section header carries in its right-hand slot, so that
+/// slot means exactly one thing on all three sections.
+const SECTION_MENU_MARKER: &str = "▾";
+
+/// The three section header rows: remotes, spaces, agents.
+///
+/// One source of truth for hit-testing and drawing, so a header that is
+/// clickable is always a header that was drawn. `Rect::default()` marks a
+/// section that is not on screen.
+///
+/// `sidebar_area` is the sidebar *after* the chip strip is carved off the
+/// top, and `strip_rect` is the strip itself. Their widths differ: the two
+/// sidebar sections already exclude the `│` separator column while the strip
+/// carries full sidebar width, so the strip is normalised here and a
+/// right-aligned marker never lands on the separator.
+pub(crate) fn sidebar_section_header_rects(
+    sidebar_area: Rect,
+    strip_rect: Rect,
+    sidebar_collapsed: bool,
+    has_chips: bool,
+    split_ratio: f32,
+) -> (Rect, Rect, Rect) {
+    if sidebar_collapsed {
+        return (Rect::default(), Rect::default(), Rect::default());
     }
+    let remotes = if strip_rect.width > 1 && strip_rect.height > 0 && has_chips {
+        Rect::new(
+            strip_rect.x,
+            strip_rect.y,
+            strip_rect.width.saturating_sub(1),
+            1,
+        )
+    } else {
+        Rect::default()
+    };
+    let (ws_area, detail_area) = expanded_sidebar_sections(sidebar_area, split_ratio);
+    // Header rows are collision-free: the spaces body starts two rows in and
+    // the agents body three, so these rows belong to nothing else. The
+    // agents header sits one row below its `─` divider.
+    let spaces = if ws_area.width > 0 && ws_area.height >= WORKSPACE_SECTION_HEADER_ROWS {
+        Rect::new(ws_area.x, ws_area.y, ws_area.width, 1)
+    } else {
+        Rect::default()
+    };
+    let agents = if detail_area.width > 0 && detail_area.height >= AGENT_PANEL_HEADER_ROWS {
+        Rect::new(detail_area.x, detail_area.y + 1, detail_area.width, 1)
+    } else {
+        Rect::default()
+    };
+    (remotes, spaces, agents)
 }
 
-pub(crate) fn agent_panel_toggle_rect(area: Rect, sort: AgentPanelSort) -> Rect {
-    agent_panel_header_label_rect(area, agent_panel_sort_label(sort))
-}
-
-fn agent_panel_header_label_rect(area: Rect, label: &str) -> Rect {
-    if area.width == 0 || area.height < 2 {
-        return Rect::default();
+/// Whether a section's menu can actually be opened, and so whether its `▾`
+/// should be drawn at all.
+///
+/// Menus are opened by clicking a header or, once bound, by a per-section
+/// key. With mouse capture off and nothing bound there is genuinely no way
+/// in, and the header must not advertise one. That is not a regression:
+/// with mouse capture off today the remotes `add` affordance is already
+/// suppressed and the sort label is already unclickable.
+pub(crate) fn sidebar_section_marker_visible(app: &AppState, section: SidebarSection) -> bool {
+    // The remotes menu offers writes to `remotes.toml`, which an ephemeral
+    // `--remote` fleet-of-one does not have, so it has no menu to mark.
+    if section == SidebarSection::Remotes && !app.fleet_config_backed {
+        return false;
     }
-
-    let width = display_width_u16(label).min(area.width);
-    Rect::new(
-        area.x + area.width.saturating_sub(width),
-        area.y + 1,
-        width,
-        1,
-    )
+    app.mouse_capture || app.sidebar_section_menu_key_bound(section)
 }
 
-fn active_agent_view_label(app: &AppState) -> Option<&str> {
-    app.agent_view_override
-        .as_ref()
-        .map(|view| view.label.as_deref().unwrap_or("filtered"))
+/// Draws one section header: its label, and a right-aligned `▾` when the
+/// menu behind it is reachable.
+///
+/// Shared by all three sections so a header looks and behaves the same
+/// everywhere, rather than three different affordances in one sidebar.
+pub(crate) fn render_sidebar_section_header(
+    frame: &mut Frame,
+    rect: Rect,
+    label: &str,
+    marker: Option<Style>,
+    p: &crate::app::state::Palette,
+) {
+    if rect.width == 0 || rect.height == 0 {
+        return;
+    }
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            label,
+            Style::default().fg(p.overlay0).add_modifier(Modifier::BOLD),
+        ))),
+        rect,
+    );
+    if let Some(style) = marker {
+        let width = display_width_u16(SECTION_MENU_MARKER).min(rect.width);
+        frame.render_widget(
+            Paragraph::new(Span::styled(SECTION_MENU_MARKER, style)),
+            Rect::new(rect.x + rect.width.saturating_sub(width), rect.y, width, 1),
+        );
+    }
 }
 
 pub(crate) fn agent_panel_entries(app: &AppState) -> Vec<AgentPanelEntry> {
@@ -1123,15 +1192,14 @@ fn render_workspace_list(
     };
 
     let list_bottom = area.y + area.height.saturating_sub(1);
-    if area.height > 0 {
-        frame.render_widget(
-            Paragraph::new(Line::from(vec![Span::styled(
-                " spaces",
-                Style::default().fg(p.overlay0).add_modifier(Modifier::BOLD),
-            )])),
-            Rect::new(area.x, area.y, area.width, 1),
-        );
-    }
+    render_sidebar_section_header(
+        frame,
+        app.view.sidebar_spaces_header_rect,
+        " spaces",
+        sidebar_section_marker_visible(app, SidebarSection::Spaces)
+            .then(|| Style::default().fg(p.overlay0)),
+        p,
+    );
 
     let metrics = workspace_list_scroll_metrics(app, area);
     let scrollbar_rect = workspace_list_scrollbar_rect(app, area);
@@ -1352,31 +1420,25 @@ fn render_agent_detail(
         Rect::new(area.x, area.y, area.width, 1),
     );
 
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![Span::styled(
-            " agents",
-            Style::default().fg(p.overlay0).add_modifier(Modifier::BOLD),
-        )])),
-        Rect::new(area.x, area.y + 1, area.width, 1),
+    // The right-hand slot holds the marker and nothing else, the same as
+    // every other section. The active sort is no longer visible without
+    // opening the menu - accepted deliberately in exchange for three
+    // identical headers. An accent-coloured marker is the at-a-glance
+    // signal that a plugin view is filtering the panel.
+    render_sidebar_section_header(
+        frame,
+        app.view.sidebar_agents_header_rect,
+        " agents",
+        sidebar_section_marker_visible(app, SidebarSection::Agents).then(|| {
+            let color = if app.agent_view_override.is_some() {
+                p.accent
+            } else {
+                p.overlay0
+            };
+            Style::default().fg(color).add_modifier(Modifier::BOLD)
+        }),
+        p,
     );
-    let control_label = active_agent_view_label(app)
-        .unwrap_or_else(|| agent_panel_sort_label(app.agent_panel_sort));
-    let toggle_rect = agent_panel_header_label_rect(area, control_label);
-    if toggle_rect != Rect::default() {
-        let color = if app.agent_view_override.is_some() {
-            p.accent
-        } else {
-            p.overlay0
-        };
-        frame.render_widget(
-            Paragraph::new(Span::styled(
-                control_label,
-                Style::default().fg(color).add_modifier(Modifier::BOLD),
-            ))
-            .alignment(Alignment::Right),
-            toggle_rect,
-        );
-    }
 
     let details = agent_panel_entries_from(app, terminal_runtimes);
     let metrics = agent_panel_scroll_metrics(app, area);

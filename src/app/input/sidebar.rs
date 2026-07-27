@@ -424,21 +424,86 @@ impl AppState {
         best.map(|(insert_idx, _)| insert_idx)
     }
 
-    pub(super) fn on_agent_panel_sort_toggle(&self, col: u16, row: u16) -> bool {
-        if self.sidebar_collapsed || self.agent_view_override.is_some() {
+    /// The sidebar section whose header row is under `(col, row)`.
+    ///
+    /// The whole header row is the target, for all three sections, so the
+    /// affordance is the same everywhere rather than three differently-sized
+    /// labels. The remotes header is deliberately tested first: it lives in
+    /// the chip strip, which sits *outside* `view.sidebar_rect`.
+    pub(crate) fn sidebar_section_header_at(
+        &self,
+        col: u16,
+        row: u16,
+    ) -> Option<crate::app::state::SidebarSection> {
+        use crate::app::state::SidebarSection;
+        if self.sidebar_collapsed {
+            return None;
+        }
+        let hit = |rect: ratatui::layout::Rect| {
+            rect.width > 0
+                && rect.height > 0
+                && col >= rect.x
+                && col < rect.x + rect.width
+                && row >= rect.y
+                && row < rect.y + rect.height
+        };
+        for (rect, section) in [
+            (
+                self.view.sidebar_remotes_header_rect,
+                SidebarSection::Remotes,
+            ),
+            (self.view.sidebar_spaces_header_rect, SidebarSection::Spaces),
+            (self.view.sidebar_agents_header_rect, SidebarSection::Agents),
+        ] {
+            if hit(rect) {
+                return Some(section);
+            }
+        }
+        None
+    }
+
+    /// Opens a section's menu anchored under its own header, so a menu
+    /// opened by key looks identical to one opened by click.
+    ///
+    /// Returns whether a menu opened. The remotes section opens nothing
+    /// without a config-backed fleet: its menu offers writes to
+    /// `remotes.toml`, which an ephemeral `--remote` launch does not have.
+    /// The gate lives here so the mouse and keyboard paths cannot diverge.
+    pub(crate) fn open_sidebar_section_menu(
+        &mut self,
+        section: crate::app::state::SidebarSection,
+    ) -> bool {
+        use crate::app::state::{ContextMenuKind, ContextMenuState, MenuListState, SidebarSection};
+        if section == SidebarSection::Remotes && !self.fleet_config_backed {
             return false;
         }
-
-        let (_, detail_area) = crate::ui::expanded_sidebar_sections(
-            self.view.sidebar_rect,
-            self.sidebar_section_split,
-        );
-        let rect = crate::ui::agent_panel_toggle_rect(detail_area, self.agent_panel_sort);
-        rect.width > 0
-            && col >= rect.x
-            && col < rect.x + rect.width
-            && row >= rect.y
-            && row < rect.y + rect.height
+        let anchor = match section {
+            SidebarSection::Remotes => self.view.sidebar_remotes_header_rect,
+            SidebarSection::Spaces => self.view.sidebar_spaces_header_rect,
+            SidebarSection::Agents => self.view.sidebar_agents_header_rect,
+        };
+        if anchor.width == 0 {
+            return false;
+        }
+        let kind = ContextMenuKind::SidebarSection {
+            section,
+            sort: self.agent_panel_sort,
+            view: self.active_agent_view(),
+        };
+        let menu = ContextMenuState {
+            kind,
+            x: anchor.x,
+            y: anchor.y + 1,
+            list: MenuListState::new(0),
+        };
+        // Land the highlight on something choosable: the agents menu opens
+        // with a `sort by` readout on top.
+        let first = (0..menu.items().len()).find(|idx| menu.item_selectable(*idx));
+        let mut menu = menu;
+        menu.list = MenuListState::new(first.unwrap_or(0));
+        self.context_menu = Some(menu);
+        self.mode = crate::app::Mode::ContextMenu;
+        true
     }
 
     pub(super) fn agent_detail_target_at(
@@ -803,7 +868,326 @@ mod tests {
     }
 
     #[test]
-    fn clicking_agent_panel_toggle_switches_sort() {
+    fn every_section_header_opens_its_menu_on_left_and_on_right_click() {
+        // One sidebar, one affordance: the same gesture on every header.
+        use crate::app::state::SidebarSection;
+        let mut app = app_for_mouse_test();
+        app.state.workspaces = vec![Workspace::test_new("test")];
+        app.state.active = Some(0);
+        app.state.fleet_config_backed = true;
+
+        for (rect, expected) in [
+            (
+                app.state.view.sidebar_spaces_header_rect,
+                SidebarSection::Spaces,
+            ),
+            (
+                app.state.view.sidebar_agents_header_rect,
+                SidebarSection::Agents,
+            ),
+        ] {
+            assert!(rect.width > 0, "{expected:?} header is on screen");
+            for button in [MouseButton::Left, MouseButton::Right] {
+                app.state.context_menu = None;
+                app.state.mode = Mode::Terminal;
+                // The whole row is the target, not a small label.
+                app.handle_mouse(mouse(
+                    MouseEventKind::Down(button),
+                    rect.x + rect.width - 1,
+                    rect.y,
+                ));
+                let menu = app
+                    .state
+                    .context_menu
+                    .as_ref()
+                    .unwrap_or_else(|| panic!("{expected:?} menu on {button:?}"));
+                assert!(
+                    matches!(
+                        menu.kind,
+                        crate::app::state::ContextMenuKind::SidebarSection { section, .. }
+                            if section == expected
+                    ),
+                    "{expected:?} on {button:?}"
+                );
+                // Anchored under its own header, so it is obvious which
+                // section it belongs to.
+                assert_eq!(menu.x, rect.x);
+                assert_eq!(menu.y, rect.y + 1);
+            }
+        }
+    }
+
+    #[test]
+    fn the_remotes_header_offers_no_menu_for_an_ephemeral_fleet() {
+        // Its menu offers writes to `remotes.toml`, which a `--remote`
+        // fleet-of-one does not have. The gate lives on the open path so
+        // mouse and keyboard cannot diverge.
+        use crate::app::state::SidebarSection;
+        let mut app = app_for_mouse_test();
+        app.state.view.sidebar_remotes_header_rect = ratatui::layout::Rect::new(0, 0, 25, 1);
+
+        app.state.fleet_config_backed = false;
+        assert!(!app.state.open_sidebar_section_menu(SidebarSection::Remotes));
+        assert_eq!(app.state.context_menu, None);
+        assert!(!crate::ui::sidebar_section_marker_visible(
+            &app.state,
+            SidebarSection::Remotes
+        ));
+
+        app.state.fleet_config_backed = true;
+        assert!(app.state.open_sidebar_section_menu(SidebarSection::Remotes));
+        let menu = app.state.context_menu.as_ref().expect("remotes menu");
+        let items = menu.items();
+        assert!(items.iter().any(|item| item == "new ..."), "{items:?}");
+        assert!(
+            items.iter().any(|item| item == "edit remotes..."),
+            "{items:?}"
+        );
+    }
+
+    #[test]
+    fn the_agents_menu_shows_the_active_view_and_offers_to_clear_it() {
+        use crate::api::schema::{AgentViewSetParams, AgentViewSort};
+        use crate::app::state::{SectionMenuAction, SidebarSection};
+        let mut app = app_for_mouse_test();
+
+        // No override: the view lines are absent, so the menu only shows
+        // what applies right now.
+        assert!(app.state.open_sidebar_section_menu(SidebarSection::Agents));
+        let items = app.state.context_menu.as_ref().expect("menu").items();
+        assert!(
+            !items.iter().any(|item| item.starts_with("view:")),
+            "{items:?}"
+        );
+        assert!(
+            !items.iter().any(|item| item == "clear filter"),
+            "{items:?}"
+        );
+
+        // A filter-only view leaves the user's ordering in force, so the
+        // radio stays selectable.
+        app.state.agent_view_override = Some(AgentViewSetParams {
+            source: "my-plugin".into(),
+            label: Some("blocked".into()),
+            filter: None,
+            sort: Vec::new(),
+        });
+        app.state.context_menu = None;
+        assert!(app.state.open_sidebar_section_menu(SidebarSection::Agents));
+        let menu = app.state.context_menu.clone().expect("menu");
+        let items = menu.items();
+        // Names the source, not just the label: the point of the readout is
+        // knowing which plugin to go turn off.
+        assert!(
+            items.iter().any(|item| item == "view: blocked (my-plugin)"),
+            "{items:?}"
+        );
+        let grouped = items
+            .iter()
+            .position(|item| item.contains("grouped"))
+            .expect("grouped row");
+        assert!(
+            menu.item_selectable(grouped),
+            "a filter-only view does not take the ordering"
+        );
+
+        // A view carrying its own sort wins outright, so the radio dims.
+        app.state.agent_view_override = Some(AgentViewSetParams {
+            source: "my-plugin".into(),
+            label: Some("blocked".into()),
+            filter: None,
+            sort: vec![AgentViewSort {
+                field: crate::api::schema::AgentViewSortField::Builtin(
+                    crate::api::schema::AgentViewBuiltinSortField::Attention,
+                ),
+                order: Default::default(),
+            }],
+        });
+        app.state.context_menu = None;
+        assert!(app.state.open_sidebar_section_menu(SidebarSection::Agents));
+        let menu = app.state.context_menu.clone().expect("menu");
+        let items = menu.items();
+        let grouped = items
+            .iter()
+            .position(|item| item.contains("grouped"))
+            .expect("grouped row");
+        assert!(
+            !menu.item_selectable(grouped),
+            "a view with its own sort dims the radio rather than silently ignoring it"
+        );
+
+        // `clear filter` carries the active source, so a plugin that
+        // re-applied a view in the meantime is not cleared by accident.
+        let clear = items
+            .iter()
+            .position(|item| item == "clear filter")
+            .expect("clear filter row");
+        assert_eq!(
+            menu.section_action(clear),
+            Some(SectionMenuAction::ClearAgentView)
+        );
+        assert_eq!(
+            menu.active_view().map(|view| view.source.as_str()),
+            Some("my-plugin")
+        );
+    }
+
+    #[test]
+    fn a_bound_key_opens_the_same_menu_the_mouse_would() {
+        use crate::app::state::SidebarSection;
+        let mut app = app_for_mouse_test();
+        app.state.workspaces = vec![Workspace::test_new("test")];
+        app.state.active = Some(0);
+
+        // Unbound by default: the prefix namespace is contested and herdr
+        // is mouse-first, so these ship for the users who want them.
+        assert!(app.state.keybinds.open_agents_menu.bindings.is_empty());
+        assert!(!app
+            .state
+            .sidebar_section_menu_key_bound(SidebarSection::Agents));
+
+        app.state.keybinds.open_agents_menu = crate::config::ActionKeybinds::direct("alt+a");
+        assert!(app
+            .state
+            .sidebar_section_menu_key_bound(SidebarSection::Agents));
+
+        // Opened by key, anchored under its own header - identical to the
+        // menu a click would have produced.
+        let header = app.state.view.sidebar_agents_header_rect;
+        assert!(app.state.open_sidebar_section_menu(SidebarSection::Agents));
+        let menu = app.state.context_menu.as_ref().expect("agents menu");
+        assert_eq!((menu.x, menu.y), (header.x, header.y + 1));
+        assert_eq!(app.state.mode, Mode::ContextMenu);
+    }
+
+    #[test]
+    fn the_marker_only_shows_where_the_menu_can_actually_be_opened() {
+        use crate::app::state::SidebarSection;
+        let mut app = app_for_mouse_test();
+        app.state.fleet_config_backed = true;
+
+        app.state.mouse_capture = true;
+        for section in [
+            SidebarSection::Remotes,
+            SidebarSection::Spaces,
+            SidebarSection::Agents,
+        ] {
+            assert!(crate::ui::sidebar_section_marker_visible(
+                &app.state, section
+            ));
+        }
+
+        // With mouse capture off and nothing bound there is genuinely no
+        // way in, so the headers must not advertise one.
+        app.state.mouse_capture = false;
+        for section in [
+            SidebarSection::Remotes,
+            SidebarSection::Spaces,
+            SidebarSection::Agents,
+        ] {
+            assert!(!crate::ui::sidebar_section_marker_visible(
+                &app.state, section
+            ));
+        }
+
+        // Binding one section brings back exactly that marker.
+        app.state.keybinds.open_spaces_menu = crate::config::ActionKeybinds::direct("alt+s");
+        assert!(crate::ui::sidebar_section_marker_visible(
+            &app.state,
+            SidebarSection::Spaces
+        ));
+        assert!(!crate::ui::sidebar_section_marker_visible(
+            &app.state,
+            SidebarSection::Agents
+        ));
+    }
+
+    #[test]
+    fn choosing_an_ordering_by_keyboard_persists_it_like_the_mouse_does() {
+        // Regression: persistence hung off the *mouse* dispatch only, so the
+        // keyboard-first user the section-menu bindings exist for was
+        // exactly the one whose choice was lost on restart.
+        use crate::app::state::SidebarSection;
+        let _guard = crate::config::test_config_env_lock().lock().unwrap();
+        let path = std::env::temp_dir()
+            .join(format!(
+                "herdr-key-sort-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0)
+            ))
+            .join("config.toml");
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        std::fs::write(&path, "onboarding = false\n").expect("seed config");
+        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
+
+        let mut app = app_for_mouse_test();
+        app.state.workspaces = vec![Workspace::test_new("test")];
+        app.state.active = Some(0);
+        assert_eq!(app.state.agent_panel_sort, AgentPanelSort::Spaces);
+
+        assert!(app.state.open_sidebar_section_menu(SidebarSection::Agents));
+        let priority = app
+            .state
+            .context_menu
+            .as_ref()
+            .expect("menu")
+            .items()
+            .iter()
+            .position(|item| item.contains("priority"))
+            .expect("priority row");
+        if let Some(menu) = app.state.context_menu.as_mut() {
+            menu.list.highlighted = priority;
+        }
+
+        // Enter, from the keyboard, through the menu's own key handler.
+        app.handle_context_menu_key_via_api(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Enter,
+            crossterm::event::KeyModifiers::empty(),
+        ));
+
+        assert_eq!(app.state.agent_panel_sort, AgentPanelSort::Priority);
+        let content = std::fs::read_to_string(&path).expect("read back");
+        assert!(
+            content.contains("agent_panel_sort = \"priority\""),
+            "a keyboard choice must reach the same config key: {content}"
+        );
+
+        std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
+        let _ = std::fs::remove_dir_all(path.parent().expect("parent"));
+    }
+
+    #[test]
+    fn menu_navigation_skips_the_readout_rows() {
+        use crate::app::state::SidebarSection;
+        let mut app = app_for_mouse_test();
+        assert!(app.state.open_sidebar_section_menu(SidebarSection::Agents));
+        let menu = app.state.context_menu.as_mut().expect("menu");
+
+        // The agents menu opens on a `sort by` readout, so the highlight
+        // must start below it and never come back to it.
+        assert!(menu.item_selectable(menu.list.highlighted));
+        for _ in 0..6 {
+            menu.highlight_next();
+            assert!(
+                menu.item_selectable(menu.list.highlighted),
+                "row {} is a readout",
+                menu.list.highlighted
+            );
+        }
+        for _ in 0..6 {
+            menu.highlight_prev();
+            assert!(menu.item_selectable(menu.list.highlighted));
+        }
+    }
+
+    #[test]
+    fn the_agents_header_opens_a_menu_whose_radio_switches_the_sort() {
+        // The sort used to be a label in the header showing its own current
+        // value - simultaneously the only hint it was clickable and the only
+        // documentation of what the modes were. It is a menu radio now.
         let mut app = app_for_mouse_test();
         app.state.workspaces = vec![Workspace::test_new("test")];
         app.state.active = Some(0);
@@ -811,19 +1195,44 @@ mod tests {
         app.state.mode = Mode::Terminal;
         app.state.agent_panel_scroll = 3;
 
-        let (_, detail_area) = crate::ui::expanded_sidebar_sections(
-            app.state.view.sidebar_rect,
-            app.state.sidebar_section_split,
-        );
-        let toggle = crate::ui::agent_panel_toggle_rect(detail_area, app.state.agent_panel_sort);
+        let header = app.state.view.sidebar_agents_header_rect;
+        assert!(header.width > 0, "the agents header is a click target");
+
+        // Anywhere on the row opens it, not just a small label.
         app.handle_mouse(mouse(
             MouseEventKind::Down(MouseButton::Left),
-            toggle.x,
-            toggle.y,
+            header.x + header.width / 2,
+            header.y,
         ));
+        assert_eq!(app.state.mode, Mode::ContextMenu);
+        let menu = app.state.context_menu.as_ref().expect("agents menu");
+        let items = menu.items();
+        assert!(
+            items.iter().any(|item| item.contains("grouped")),
+            "{items:?}"
+        );
+        assert!(
+            items.iter().any(|item| item.contains("priority")),
+            "{items:?}"
+        );
+        // The current value is marked, so both it and the alternative show.
+        assert!(
+            items
+                .iter()
+                .any(|item| item.starts_with('\u{25cf}') && item.contains("grouped")),
+            "{items:?}"
+        );
+
+        let priority = items
+            .iter()
+            .position(|item| item.contains("priority"))
+            .expect("priority row");
+        let menu = app.state.context_menu.clone().expect("agents menu");
+        app.apply_context_menu_action_via_api(menu, priority);
 
         assert_eq!(app.state.agent_panel_sort, AgentPanelSort::Priority);
         assert_eq!(app.state.agent_panel_scroll, 0);
+        assert_eq!(app.state.context_menu, None, "choosing closes the menu");
     }
 
     #[test]

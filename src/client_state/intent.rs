@@ -51,6 +51,30 @@ pub(super) fn dispatch_prefix_intent(
         return;
     }
 
+    // Section menus are client chrome as well: the menu opens over the
+    // composed view and its items dispatch through the existing modal path.
+    // Unbound by default, so this is a no-op for anyone who has not asked.
+    let section_menu = [
+        (
+            app.keybinds.open_remotes_menu.matches_prefix_key(key),
+            crate::app::state::SidebarSection::Remotes,
+        ),
+        (
+            app.keybinds.open_spaces_menu.matches_prefix_key(key),
+            crate::app::state::SidebarSection::Spaces,
+        ),
+        (
+            app.keybinds.open_agents_menu.matches_prefix_key(key),
+            crate::app::state::SidebarSection::Agents,
+        ),
+    ]
+    .into_iter()
+    .find_map(|(matched, section)| matched.then_some(section));
+    if let Some(section) = section_menu {
+        app.open_sidebar_section_menu(section);
+        return;
+    }
+
     // With nothing focused (for example a solo'd remote with no spaces
     // yet), creation still goes to the *effective* focused remote, never
     // silently to local — and never to a remote filtered out of view.
@@ -262,6 +286,7 @@ pub(super) fn dispatch_mouse_intent(
     // mouse-reporting panes already happened in the caller, so the empty
     // registry only mutes the residual forwarding paths.
     let mode_before = app.mode;
+    let sort_before = app.agent_panel_sort;
     let empty_runtimes = crate::terminal::TerminalRuntimeRegistry::new();
     let action = {
         let in_view: Vec<usize> = chrome
@@ -273,6 +298,12 @@ pub(super) fn dispatch_mouse_intent(
         let source = super::compose::MirrorPaneSource::for_view(mirrors, &in_view);
         app.handle_mouse_with_content(&empty_runtimes, &source, mouse)
     };
+    // Mirrors the single-server client, which snapshots the sort around the
+    // same handler and writes it back when it changed. Placed before every
+    // early return below so no dispatch path can skip the write.
+    if app.agent_panel_sort != sort_before {
+        super::compose::persist_agent_panel_sort(app.agent_panel_sort);
+    }
     // A mouse-driven copy (copy_on_select drag release, double-click word
     // copies) lands in request_clipboard_write; the pure client is the
     // host terminal, so it goes straight out as OSC52.
@@ -398,6 +429,9 @@ pub(super) fn dispatch_modal_key(
     app: &mut AppState,
     fallback_remote: usize,
 ) {
+    // A menu opened by key chooses by key, and the ordering it chooses has
+    // to persist just as the mouse path's does.
+    let sort_before = app.agent_panel_sort;
     let methods = {
         let pane_public = |pane_id: crate::layout::PaneId| {
             ids.public_pane_id(pane_id)
@@ -415,6 +449,9 @@ pub(super) fn dispatch_modal_key(
         unscope_workspace_methods(&mut methods, app, ids);
         methods
     };
+    if app.agent_panel_sort != sort_before {
+        super::compose::persist_agent_panel_sort(app.agent_panel_sort);
+    }
     let remote = ids
         .workspace_owner(app.selected)
         .map(|(remote, _)| remote)
@@ -617,6 +654,7 @@ mod tests {
                 target: None,
                 session: "default".into(),
                 enabled: true,
+                hue: None,
             }]);
         assert_ne!(app.mode, crate::app::Mode::KeybindHelp);
 
@@ -1079,12 +1117,14 @@ mod tests {
                 target: None,
                 session: "default".into(),
                 enabled: true,
+                hue: None,
             },
             crate::fleet::config::RemoteEntry {
                 name: "buildbox".into(),
                 target: Some("can@buildbox.example".into()),
                 session: "default".into(),
                 enabled: true,
+                hue: None,
             },
         ]);
         let mut links = Links::new();

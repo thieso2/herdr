@@ -5,9 +5,8 @@ use tracing::warn;
 
 use crate::{
     app::state::{
-        AgentPanelSort, AppState, ContextMenuKind, ContextMenuState, DragState, DragTarget,
-        MenuListState, Mode, RightClickPassthroughGesture, TabPressState, ViewLayout,
-        WorkspacePressState,
+        AppState, ContextMenuKind, ContextMenuState, DragState, DragTarget, MenuListState, Mode,
+        RightClickPassthroughGesture, TabPressState, ViewLayout, WorkspacePressState,
     },
     layout::{PaneInfo, SplitBorder},
     selection::Selection,
@@ -528,6 +527,14 @@ impl AppState {
                     return None;
                 }
 
+                // Before the `in_sidebar` block on purpose: the chip strip
+                // is carved off the top of the sidebar, so the remotes
+                // header is *not* inside `view.sidebar_rect`.
+                if let Some(section) = self.sidebar_section_header_at(mouse.column, mouse.row) {
+                    self.open_sidebar_section_menu(section);
+                    return None;
+                }
+
                 if in_sidebar {
                     if self.on_sidebar_toggle(mouse.column, mouse.row) {
                         self.sidebar_collapsed = !self.sidebar_collapsed;
@@ -603,16 +610,6 @@ impl AppState {
                             start_col: mouse.column,
                             start_row: mouse.row,
                         });
-                        return None;
-                    }
-
-                    if self.on_agent_panel_sort_toggle(mouse.column, mouse.row) {
-                        self.agent_panel_sort = match self.agent_panel_sort {
-                            AgentPanelSort::Spaces => AgentPanelSort::Priority,
-                            AgentPanelSort::Priority => AgentPanelSort::Spaces,
-                        };
-                        self.agent_panel_scroll = 0;
-                        self.mark_session_dirty();
                         return None;
                     }
 
@@ -1006,6 +1003,21 @@ impl AppState {
                 if let Some(info) = self.pane_at(mouse.column, mouse.row).cloned() {
                     let _ = self.forward_pane_mouse_motion(terminal_runtimes, &info, mouse);
                 }
+            }
+
+            // Right-click opens the same menu as left-click, so the gesture
+            // matches every other row in herdr. Its own arm because the
+            // remotes header sits outside `view.sidebar_rect`, which the
+            // arm below is guarded on.
+            MouseEventKind::Down(MouseButton::Right)
+                if self
+                    .sidebar_section_header_at(mouse.column, mouse.row)
+                    .is_some() =>
+            {
+                if let Some(section) = self.sidebar_section_header_at(mouse.column, mouse.row) {
+                    self.open_sidebar_section_menu(section);
+                }
+                return None;
             }
 
             MouseEventKind::Down(MouseButton::Right) if in_sidebar && !self.sidebar_collapsed => {
@@ -2471,7 +2483,10 @@ mod tests {
                 ..
             } if pane_id == target && source_pane_id == source
         ));
-        assert!(menu.items().contains(&"Swap with focused pane"));
+        assert!(menu
+            .items()
+            .iter()
+            .any(|item| item == "Swap with focused pane"));
     }
 
     #[tokio::test]

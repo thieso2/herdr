@@ -328,6 +328,7 @@ fn offer_to_save_remote(target: &str, session: &str) {
         target: Some(target.to_string()),
         session: session.to_string(),
         enabled: true,
+        hue: None,
     };
     match crate::fleet::config::upsert_remote(entry) {
         Ok(_) => eprintln!(
@@ -2937,6 +2938,7 @@ mod tests {
             target: Some("someone@buildbox.example".into()),
             session: "default".into(),
             enabled: true,
+            hue: None,
         }];
 
         // Free name: the plain derivation.

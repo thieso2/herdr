@@ -780,6 +780,48 @@ pub(crate) fn handle_confirm_close_key(state: &mut AppState, key: KeyEvent) {
     }
 }
 
+/// The `AppState` half of choosing a sidebar section menu row.
+///
+/// Shared by all three context-menu dispatch tails so the section menus
+/// cannot behave differently depending on which client is running. What
+/// cannot live here is the part that needs a wire call: clearing an agent
+/// view is an API command, so each tail issues that itself.
+///
+/// Returns the chosen action, so a caller that must also send a method knows
+/// which one. A readout row yields `None` and changes nothing.
+pub(super) fn section_menu_state_effect(
+    state: &mut AppState,
+    menu: &ContextMenuState,
+    idx: usize,
+) -> Option<crate::app::state::SectionMenuAction> {
+    use crate::app::state::SectionMenuAction;
+
+    // Readout rows are labels, not actions. Clicking one puts the menu back
+    // rather than closing it on a row that does nothing - the click landed
+    // on text, so nothing was chosen.
+    let Some(action) = menu.section_action(idx) else {
+        state.context_menu = Some(menu.clone());
+        state.mode = crate::app::Mode::ContextMenu;
+        return None;
+    };
+    match action {
+        SectionMenuAction::AddRemote => state.request_add_remote = true,
+        SectionMenuAction::EditRemotes => state.request_manage_remotes = true,
+        SectionMenuAction::NewSpace => state.request_new_workspace = true,
+        SectionMenuAction::SetAgentSort(sort) => {
+            state.agent_panel_sort = sort;
+            // The panel can otherwise be left scrolled past its new content.
+            state.agent_panel_scroll = 0;
+            state.mark_session_dirty();
+        }
+        // Issued as an API command by the caller; nothing to change here.
+        SectionMenuAction::ClearAgentView => {}
+    }
+    leave_modal(state);
+    state.context_menu = None;
+    Some(action)
+}
+
 #[cfg(test)]
 pub(super) fn apply_context_menu_action(
     state: &mut AppState,
@@ -787,8 +829,13 @@ pub(super) fn apply_context_menu_action(
     menu: ContextMenuState,
     idx: usize,
 ) {
-    let item = menu.items().get(idx).copied();
-    match (menu.kind, item) {
+    if let ContextMenuKind::SidebarSection { .. } = menu.kind {
+        section_menu_state_effect(state, &menu, idx);
+        return;
+    }
+    let items = menu.items();
+    let item = items.get(idx).map(String::as_str);
+    match (menu.kind.clone(), item) {
         (ContextMenuKind::GitWorkspace { ws_idx, .. }, Some("New worktree")) => {
             state.request_new_linked_worktree = Some(ws_idx);
             leave_modal(state);
@@ -997,12 +1044,12 @@ pub(crate) fn handle_context_menu_key(
         }
         KeyCode::Up => {
             if let Some(menu) = &mut state.context_menu {
-                menu.list.move_prev();
+                menu.highlight_prev();
             }
         }
         KeyCode::Down => {
             if let Some(menu) = &mut state.context_menu {
-                menu.list.move_next(menu.items().len());
+                menu.highlight_next();
             }
         }
         KeyCode::Enter => {
@@ -1190,6 +1237,10 @@ impl App {
     }
 
     pub(crate) fn handle_context_menu_key_via_api(&mut self, key: KeyEvent) {
+        // Choosing an ordering from the *keyboard* must persist exactly as
+        // choosing it with the mouse does; the mouse path snapshots around
+        // `handle_mouse` in `input/mod.rs` for the same reason.
+        let previous_agent_panel_sort = self.state.agent_panel_sort;
         match key.code {
             KeyCode::Esc => {
                 self.state.context_menu = None;
@@ -1197,12 +1248,12 @@ impl App {
             }
             KeyCode::Up => {
                 if let Some(menu) = &mut self.state.context_menu {
-                    menu.list.move_prev();
+                    menu.highlight_prev();
                 }
             }
             KeyCode::Down => {
                 if let Some(menu) = &mut self.state.context_menu {
-                    menu.list.move_next(menu.items().len());
+                    menu.highlight_next();
                 }
             }
             KeyCode::Enter => {
@@ -1213,11 +1264,32 @@ impl App {
             }
             _ => {}
         }
+        if self.state.agent_panel_sort != previous_agent_panel_sort {
+            self.save_agent_panel_sort(self.state.agent_panel_sort);
+        }
     }
 
     pub(crate) fn apply_context_menu_action_via_api(&mut self, menu: ContextMenuState, idx: usize) {
-        let item = menu.items().get(idx).copied();
-        match (menu.kind, item) {
+        if let ContextMenuKind::SidebarSection { .. } = menu.kind {
+            let source = menu.active_view().map(|view| view.source.clone());
+            if let Some(action) = section_menu_state_effect(&mut self.state, &menu, idx) {
+                if action == crate::app::state::SectionMenuAction::ClearAgentView {
+                    // Passes the active view's source rather than reaching
+                    // into the override state, so a plugin that re-applied a
+                    // view in the meantime is not cleared by accident.
+                    self.dispatch_runtime_mutation(
+                        "tui.menu.agent_view.clear",
+                        crate::api::schema::Method::AgentViewClear(
+                            crate::api::schema::AgentViewClearParams { source },
+                        ),
+                    );
+                }
+            }
+            return;
+        }
+        let items = menu.items();
+        let item = items.get(idx).map(String::as_str);
+        match (menu.kind.clone(), item) {
             (ContextMenuKind::GitWorkspace { ws_idx, .. }, Some("New worktree")) => {
                 self.state.request_new_linked_worktree = Some(ws_idx);
                 leave_modal(&mut self.state);
@@ -1465,13 +1537,13 @@ pub(crate) fn pure_client_modal_key(
             }
             KeyCode::Up => {
                 if let Some(menu) = &mut state.context_menu {
-                    menu.list.move_prev();
+                    menu.highlight_prev();
                 }
                 Vec::new()
             }
             KeyCode::Down => {
                 if let Some(menu) = &mut state.context_menu {
-                    menu.list.move_next(menu.items().len());
+                    menu.highlight_next();
                 }
                 Vec::new()
             }
@@ -1650,9 +1722,38 @@ fn pure_context_menu_action(
 ) -> Vec<crate::api::schema::Method> {
     use crate::app::state::ContextMenuKind;
 
-    let item = menu.items().get(idx).copied();
     let mut methods = Vec::new();
-    match (menu.kind, item) {
+    if let ContextMenuKind::SidebarSection { .. } = menu.kind {
+        let source = menu.active_view().map(|view| view.source.clone());
+        if let Some(action) = section_menu_state_effect(state, &menu, idx) {
+            match action {
+                crate::app::state::SectionMenuAction::ClearAgentView => {
+                    methods.push(crate::api::schema::Method::AgentViewClear(
+                        crate::api::schema::AgentViewClearParams { source },
+                    ));
+                }
+                // The pure client creates spaces over the wire; the request
+                // flag it would otherwise set is drained server-side only.
+                crate::app::state::SectionMenuAction::NewSpace => {
+                    state.request_new_workspace = false;
+                    methods.push(crate::api::schema::Method::WorkspaceCreate(
+                        crate::api::schema::WorkspaceCreateParams {
+                            cwd: None,
+                            focus: true,
+                            label: None,
+                            env: Default::default(),
+                        },
+                    ));
+                }
+                _ => {}
+            }
+        }
+        return methods;
+    }
+
+    let items = menu.items();
+    let item = items.get(idx).map(String::as_str);
+    match (menu.kind.clone(), item) {
         (
             ContextMenuKind::Workspace { ws_idx } | ContextMenuKind::GitWorkspace { ws_idx, .. },
             Some("Rename"),

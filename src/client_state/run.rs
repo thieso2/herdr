@@ -1016,7 +1016,14 @@ fn run_loop(
 
         let event = match event_rx.recv_timeout(LOOP_TICK) {
             Ok(event) => event,
-            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            // A quiet tick is what tells the framer that a held `esc` was the
+            // whole keystroke. This is the only place that decision gets made.
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if drain_idle_input(&mut framer, &mut ctx) {
+                    dirty = true;
+                }
+                continue;
+            }
             Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(ctx.ui.ever_connected),
         };
         ctx.handle_event(event, &mut framer);
@@ -2234,6 +2241,27 @@ fn visible_panes_of_workspace(catalog: &SessionCatalog, workspace_id: &str) -> V
 fn handle_raw_input(raw: crate::raw_input::RawInputEvent, ctx: &mut LoopCtx<'_>) {
     interpret_raw_input(raw, ctx);
     drain_app_requests(ctx);
+}
+
+/// Releases input the framer is still holding once the host has gone quiet.
+///
+/// `RawInputFramer::push` cannot tell a lone `esc` from the first byte of an
+/// escape sequence, so it buffers one and says nothing. Only a timeout flush
+/// decides no continuation is coming. Nothing drove that flush here, so every
+/// `esc` in the pure client sat in the buffer until the *next* keystroke
+/// pushed it out - which is to say `esc` did nothing at all.
+///
+/// Returns whether anything was dispatched, so the caller can redraw.
+fn drain_idle_input(framer: &mut crate::raw_input::RawInputFramer, ctx: &mut LoopCtx<'_>) -> bool {
+    if !framer.has_pending_input() {
+        return false;
+    }
+    let mut dispatched = false;
+    for raw in framer.flush_timeout() {
+        handle_raw_input(raw, ctx);
+        dispatched = true;
+    }
+    dispatched
 }
 
 /// Turns pending `AppState` requests into client chrome. The global menu's
@@ -3742,6 +3770,46 @@ mod tests {
             );
             assert!(!ctx.app.request_add_remote, "the request is drained once");
             assert!(!ctx.app.should_quit);
+        });
+    }
+
+    /// `esc` dismissed nothing in the pure client. The framer holds a lone
+    /// escape back because it cannot yet tell it from the start of a
+    /// sequence, and only an idle flush resolves that - which the run loop
+    /// never performed, so the keystroke was stuck in the buffer until the
+    /// next one arrived. Every `esc` in the client rode on this: closing a
+    /// dialog, cancelling prefix, leaving copy mode.
+    #[tokio::test]
+    async fn an_idle_tick_releases_a_held_escape_and_closes_a_dialog() {
+        with_test_ctx(vec![RemoteDescriptor::local()], |ctx| {
+            ctx.app.pure_client = true;
+            ctx.app.fleet_config_backed = true;
+            ctx.chrome.remote_edit = Some(super::super::remote_edit::RemoteEditState::add());
+
+            let mut framer = crate::raw_input::RawInputFramer::for_host_input();
+
+            // The escape byte alone yields no event: the framer is waiting to
+            // see whether a sequence follows.
+            assert!(
+                framer.push(b"\x1b").is_empty(),
+                "a lone escape is held, not dispatched"
+            );
+            assert!(framer.has_pending_input(), "and it is still buffered");
+            assert!(
+                ctx.chrome.remote_edit.is_some(),
+                "so the dialog is still open at this point"
+            );
+
+            // The quiet tick is what settles it.
+            assert!(
+                drain_idle_input(&mut framer, ctx),
+                "the idle flush dispatches"
+            );
+            assert!(
+                ctx.chrome.remote_edit.is_none(),
+                "esc closed the dialog once the tick released it"
+            );
+            assert!(!framer.has_pending_input(), "nothing is left held");
         });
     }
 

@@ -77,8 +77,13 @@ impl RemoteDescriptor {
 /// The composed remote list: every *enabled* fleet config entry in file
 /// order, and nothing else. There is no implicit local runtime — an entry
 /// with no target is a local one, and it is in this list only because the
-/// config asked for it. Hues follow list order so they stay stable while the
-/// config file does.
+/// config asked for it.
+///
+/// Hues come from the entry, not from its position: a remote keeps the
+/// colour the user has learned to associate with that machine when the list
+/// is reordered or another remote is disabled. An entry with no stored hue
+/// falls back to the old positional rule, which is what a file loaded
+/// outside [`crate::fleet::config::load`] looks like.
 pub(crate) fn remote_descriptors(
     entries: &[crate::fleet::config::RemoteEntry],
 ) -> Vec<RemoteDescriptor> {
@@ -89,7 +94,7 @@ pub(crate) fn remote_descriptors(
         .map(|(index, entry)| RemoteDescriptor {
             index,
             name: entry.name.clone(),
-            hue_index: index,
+            hue_index: entry.hue.unwrap_or(index),
             target: entry.target.clone(),
             session: entry.session.clone(),
             program: None,
@@ -290,6 +295,7 @@ mod tests {
             target: Some(format!("can@{name}.example")),
             session: "work".to_owned(),
             enabled,
+            hue: None,
         }
     }
 
@@ -302,6 +308,7 @@ mod tests {
             target: None,
             session: "default".to_owned(),
             enabled: true,
+            hue: None,
         }
     }
 
@@ -338,6 +345,45 @@ mod tests {
         assert_eq!(descriptors[0].target, None);
         assert_eq!(descriptors[2].target.as_deref(), Some("can@gpu-01.example"));
         assert_eq!(descriptors[2].hue_index, 2);
+    }
+
+    #[test]
+    fn a_stored_hue_survives_reorder_and_a_disabled_neighbour() {
+        // A remote's colour is the machine's identity, not its row number:
+        // taking one machine out, or moving it, must not recolour the rest.
+        let hued = |name: &str, enabled: bool, hue: usize| RemoteEntry {
+            hue: Some(hue),
+            ..entry(name, enabled)
+        };
+        let fleet = vec![
+            hued("buildbox", true, 0),
+            hued("gpu-01", true, 1),
+            hued("dark", true, 2),
+        ];
+
+        let hue_of = |entries: &[RemoteEntry], name: &str| {
+            remote_descriptors(entries)
+                .into_iter()
+                .find(|descriptor| descriptor.name == name)
+                .map(|descriptor| descriptor.hue_index)
+        };
+
+        let mut reordered = fleet.clone();
+        reordered.swap(0, 2);
+        assert_eq!(hue_of(&reordered, "dark"), Some(2), "reorder keeps hues");
+        assert_eq!(hue_of(&reordered, "buildbox"), Some(0));
+
+        let mut with_disabled = fleet.clone();
+        with_disabled[0].enabled = false;
+        assert_eq!(
+            hue_of(&with_disabled, "dark"),
+            Some(2),
+            "disabling the first remote does not shift the others"
+        );
+        assert_eq!(hue_of(&with_disabled, "buildbox"), None, "and drops out");
+
+        // An entry with no stored hue still falls back to its position.
+        assert_eq!(hue_of(&[entry("a", true), entry("b", true)], "b"), Some(1));
     }
 
     #[cfg(unix)]

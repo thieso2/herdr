@@ -422,12 +422,14 @@ mod tests {
                 target: Some("can@gpu-1.example".into()),
                 session: "default".into(),
                 enabled: true,
+                hue: None,
             },
             crate::fleet::config::RemoteEntry {
                 name: "buildbox".into(),
                 target: Some("can@buildbox.example".into()),
                 session: "default".into(),
                 enabled: false,
+                hue: None,
             },
         ];
 

@@ -617,6 +617,7 @@ mod tests {
                 target: None,
                 session: "default".into(),
                 enabled: true,
+                hue: None,
             }]);
         assert_ne!(app.mode, crate::app::Mode::KeybindHelp);
 
@@ -1079,12 +1080,14 @@ mod tests {
                 target: None,
                 session: "default".into(),
                 enabled: true,
+                hue: None,
             },
             crate::fleet::config::RemoteEntry {
                 name: "buildbox".into(),
                 target: Some("can@buildbox.example".into()),
                 session: "default".into(),
                 enabled: true,
+                hue: None,
             },
         ]);
         let mut links = Links::new();

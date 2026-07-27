@@ -13,7 +13,7 @@ use crate::input::TerminalKey;
 pub(crate) const REMOTE_EDIT_FIELDS: usize = 3;
 
 /// State of the add/edit-remote dialog.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RemoteEditState {
     /// `Some(name)` when editing an existing remote; `None` when adding.
     pub(crate) original_name: Option<String>,
@@ -23,6 +23,30 @@ pub(crate) struct RemoteEditState {
     /// 0 = name, 1 = target, 2 = session.
     pub(crate) focused_field: usize,
     pub(crate) error: Option<String>,
+    /// The edited entry's `enabled` flag, carried through untouched. The
+    /// dialog edits fields only: changing a hostname must not silently
+    /// reconnect a machine the user deliberately took out of the fleet.
+    pub(crate) enabled: bool,
+    /// The edited entry's stored hue, carried through so a field edit never
+    /// recolours the remote. `None` when adding: the config layer allocates.
+    pub(crate) hue: Option<usize>,
+}
+
+// Hand-written rather than derived: a dialog with no entry behind it is an
+// *add*, and a remote you just added is enabled.
+impl Default for RemoteEditState {
+    fn default() -> Self {
+        Self {
+            original_name: None,
+            name: String::new(),
+            target: String::new(),
+            session: String::new(),
+            focused_field: 0,
+            error: None,
+            enabled: true,
+            hue: None,
+        }
+    }
 }
 
 impl RemoteEditState {
@@ -41,6 +65,8 @@ impl RemoteEditState {
             session: entry.session.clone(),
             focused_field: 0,
             error: None,
+            enabled: entry.enabled,
+            hue: entry.hue,
         }
     }
 
@@ -75,7 +101,8 @@ impl RemoteEditState {
                     session.to_owned()
                 }
             },
-            enabled: true,
+            enabled: self.enabled,
+            hue: self.hue,
         };
         crate::fleet::config::validate_entry(&entry)?;
         Ok(entry)
@@ -228,6 +255,39 @@ mod tests {
     }
 
     #[test]
+    fn editing_a_disabled_remote_leaves_it_disabled_and_keeps_its_hue() {
+        // The dialog used to hardcode `enabled: true`, which was harmless
+        // only while nothing could set it false. With a toggle in the
+        // remotes list, changing a hostname would silently reconnect a
+        // machine the user deliberately took out of the fleet.
+        let disabled = crate::fleet::config::RemoteEntry {
+            name: "gpu".into(),
+            target: Some("can@gpu".into()),
+            session: "work".into(),
+            enabled: false,
+            hue: Some(2),
+        };
+
+        let mut state = RemoteEditState::edit(&disabled);
+        remote_edit_apply_key(&mut state, key(KeyCode::Tab));
+        for c in "-new".chars() {
+            remote_edit_apply_key(&mut state, key(KeyCode::Char(c)));
+        }
+
+        let edited = state.entry().expect("valid entry");
+        assert!(!edited.enabled, "a field edit does not re-enable a remote");
+        assert_eq!(edited.hue, Some(2), "a field edit does not recolour it");
+        assert_eq!(edited.target.as_deref(), Some("can@gpu-new"));
+
+        // Adding is unaffected: a remote you just added is enabled.
+        let mut added = RemoteEditState::add();
+        added.name = "new".to_owned();
+        let entry = added.entry().expect("valid entry");
+        assert!(entry.enabled);
+        assert_eq!(entry.hue, None, "the config layer allocates the hue");
+    }
+
+    #[test]
     fn remove_applies_only_to_existing_remotes() {
         let mut add = RemoteEditState::add();
         assert_eq!(
@@ -241,6 +301,7 @@ mod tests {
             target: Some("can@gpu".into()),
             session: "work".into(),
             enabled: true,
+            hue: None,
         };
         let mut edit = RemoteEditState::edit(&entry);
         assert!(edit.is_edit());

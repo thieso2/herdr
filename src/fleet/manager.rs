@@ -910,6 +910,7 @@ mod tests {
             target: Some(format!("test@{name}.invalid")),
             session: crate::session::DEFAULT_SESSION_NAME.to_string(),
             enabled: true,
+            hue: None,
         }
     }
 

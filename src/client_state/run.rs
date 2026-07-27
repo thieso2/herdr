@@ -3074,6 +3074,7 @@ fn handle_chip_click(
                     target: descriptor.target.clone(),
                     session: descriptor.session.clone(),
                     enabled: true,
+                    hue: None,
                 },
             ));
         }
@@ -3284,18 +3285,21 @@ mod tests {
                 target: None,
                 session: "default".into(),
                 enabled: true,
+                hue: None,
             },
             crate::fleet::config::RemoteEntry {
                 name: "buildbox".into(),
                 target: Some("can@buildbox.example".into()),
                 session: "default".into(),
                 enabled: true,
+                hue: None,
             },
             crate::fleet::config::RemoteEntry {
                 name: "gpu-01".into(),
                 target: Some("can@gpu-01.example".into()),
                 session: "default".into(),
                 enabled: true,
+                hue: None,
             },
         ])
     }
@@ -3648,12 +3652,14 @@ mod tests {
                     target: None,
                     session: "default".into(),
                     enabled: true,
+                    hue: None,
                 },
                 crate::fleet::config::RemoteEntry {
                     name: "buildbox".into(),
                     target: Some("can@buildbox2.example".into()),
                     session: "default".into(),
                     enabled: true,
+                    hue: None,
                 },
             ];
             reconcile_fleet(&entries, ctx);

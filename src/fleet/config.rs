@@ -363,6 +363,9 @@ pub fn upsert_in(remotes: &mut Vec<RemoteEntry>, mut entry: RemoteEntry) {
 /// list loaded inside the fleet lock, so an index-based mutation applied to
 /// a list something else reordered would corrupt it silently, while a
 /// name-based one is either correct or a no-op.
+// Driven from the remotes list, which lives in the unix-only pure client;
+// Windows has no production consumer yet (#20), like `mod client_state`.
+#[cfg_attr(windows, allow(dead_code))]
 pub fn set_enabled_in(remotes: &mut [RemoteEntry], name: &str, enabled: bool) -> bool {
     match remotes.iter_mut().find(|remote| remote.name == name) {
         Some(entry) => {
@@ -376,6 +379,7 @@ pub fn set_enabled_in(remotes: &mut [RemoteEntry], name: &str, enabled: bool) ->
 /// Moves the entry named `name` one slot in `direction`; returns whether it
 /// moved. A missing entry, or one already at that edge of the list, is a
 /// no-op. Hues are stored per entry, so reordering never recolours anything.
+#[cfg_attr(windows, allow(dead_code))] // see `set_enabled_in`
 pub fn move_in(remotes: &mut [RemoteEntry], name: &str, direction: MoveDirection) -> bool {
     let Some(index) = remotes.iter().position(|remote| remote.name == name) else {
         return false;

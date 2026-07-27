@@ -196,6 +196,9 @@ pub fn start_remote_server(target: &str, session: &str, program: &str) -> Result
 /// exit status is again the whole answer. Per-remote lifecycle lives in the
 /// remotes list, which needs both directions; the client had only start
 /// because a chip could only ever be started.
+// Both callers are unix-only: the pure client's remotes list and
+// `remote::unix`. Windows has no production consumer yet (#20).
+#[cfg_attr(windows, allow(dead_code))]
 pub fn stop_remote_server(target: &str, session: &str, program: &str) -> Result<(), String> {
     let mut command = Command::new("ssh");
     command
@@ -227,6 +230,7 @@ pub fn stop_remote_server(target: &str, session: &str, program: &str) -> Result<
 
 /// The far-side `server stop` command, resolved the same way the bridge
 /// command is so a managed install off `PATH` is still found.
+#[cfg_attr(windows, allow(dead_code))] // see `stop_remote_server`
 fn remote_stop_command(program: &str, session: &str) -> String {
     let mut args = String::new();
     if session != crate::session::DEFAULT_SESSION_NAME {
@@ -291,6 +295,8 @@ impl BridgeChild {
     }
 
     /// Spawns the bridge child running an explicit remote herdr path.
+    // Called only from the unix-only pure client (#20).
+    #[cfg_attr(windows, allow(dead_code))]
     pub fn spawn_program(
         target: &str,
         session: &str,

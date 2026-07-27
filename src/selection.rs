@@ -212,6 +212,9 @@ impl Selection {
     /// pane's scrollback. Screen-buffer rows count down from the top of
     /// loaded history, so prepending shifts every existing row by `rows` and
     /// a selection left alone would silently cover different text.
+    // Reached only through `AppState::rebase_absolute_rows_after_prepend`,
+    // whose sole consumer is the unix-only pure client (#20).
+    #[cfg_attr(windows, allow(dead_code))]
     pub(crate) fn rebase_rows_after_prepend(&mut self, rows: u32) {
         self.anchor.0 = self.anchor.0.saturating_add(rows);
         self.cursor.0 = self.cursor.0.saturating_add(rows);

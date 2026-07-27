@@ -108,6 +108,9 @@ pub fn stopped_status_line(name: &str) -> String {
 /// at connect time. Here the client watched it go, so the line says why —
 /// and an unrecognised reason from a newer server reads as "by request", the
 /// same as any deliberate stop.
+// Raised only by the unix-only pure client's connection state machine, which
+// Windows compiles with no production consumer yet (#20).
+#[cfg_attr(windows, allow(dead_code))]
 pub fn announced_stop_status_line(name: &str, reason: &str) -> String {
     let why = if reason == crate::protocol::framed::SERVER_STOPPING_REASON_EMPTY {
         "no panes left"

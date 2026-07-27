@@ -2040,6 +2040,9 @@ impl AppState {
     ///
     /// The copy-mode cursor is viewport-relative and the entry offset is
     /// measured from the bottom, so neither moves.
+    // Only the unix-only pure client backfills history, so Windows compiles
+    // this with no production consumer yet (#20), like `mod client_state`.
+    #[cfg_attr(windows, allow(dead_code))]
     pub(crate) fn rebase_absolute_rows_after_prepend(&mut self, pane_id: PaneId, rows: usize) {
         if rows == 0 {
             return;

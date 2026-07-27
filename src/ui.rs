@@ -84,7 +84,9 @@ pub(crate) use self::{
     sidebar::{
         agent_entry_gap, agent_entry_height_in_body, agent_panel_body_rect, agent_panel_entries,
         agent_panel_scroll_for_target, agent_panel_scroll_metrics, agent_panel_scrollbar_rect,
-        agent_panel_toggle_rect, all_agent_panel_entries, collapsed_sidebar_sections,
+        all_agent_panel_entries, collapsed_sidebar_sections, render_sidebar_section_header,
+        sidebar_section_header_rects,
+        sidebar_section_marker_visible,
         collapsed_sidebar_toggle_rect, compute_workspace_card_areas, expanded_sidebar_sections,
         expanded_sidebar_toggle_rect, normalized_workspace_scroll, sidebar_section_divider_rect,
         workspace_drop_indicator_row, workspace_list_entries, workspace_list_entries_expanded,
@@ -235,7 +237,6 @@ fn compute_view_internal(
         &app.remote_chips,
         sidebar_area,
         app.sidebar_collapsed,
-        app.fleet_config_backed,
     );
 
     let (tab_bar_rect, terminal_area) = app
@@ -261,6 +262,17 @@ fn compute_view_internal(
     } else {
         compute_workspace_card_areas(app, sidebar_area)
     };
+
+    // One source of truth for hit-testing and drawing, so a header that is
+    // clickable is always a header that was drawn.
+    let (sidebar_remotes_header_rect, sidebar_spaces_header_rect, sidebar_agents_header_rect) =
+        sidebar_section_header_rects(
+            sidebar_area,
+            chip_strip.strip_rect,
+            app.sidebar_collapsed,
+            !app.remote_chips.is_empty(),
+            app.sidebar_section_split,
+        );
 
     let tab_bar_view = app
         .active
@@ -305,7 +317,9 @@ fn compute_view_internal(
         sidebar_rect: sidebar_area,
         remote_chip_strip_rect: chip_strip.strip_rect,
         remote_chip_hit_areas: chip_strip.chip_hit_areas,
-        remote_add_hit_area: chip_strip.add_hit_area,
+        sidebar_remotes_header_rect,
+        sidebar_spaces_header_rect,
+        sidebar_agents_header_rect,
         workspace_card_areas,
         tab_bar_rect,
         tab_hit_areas: tab_bar_view.tab_hit_areas,
@@ -366,7 +380,9 @@ fn compute_mobile_view(
         sidebar_rect: Rect::default(),
         remote_chip_strip_rect: Rect::default(),
         remote_chip_hit_areas: Vec::new(),
-        remote_add_hit_area: Rect::default(),
+        sidebar_remotes_header_rect: Rect::default(),
+        sidebar_spaces_header_rect: Rect::default(),
+        sidebar_agents_header_rect: Rect::default(),
         workspace_card_areas: Vec::new(),
         tab_bar_rect: Rect::default(),
         tab_hit_areas: Vec::new(),
@@ -661,9 +677,17 @@ mod tests {
         // the authoring worktree). Re-verified after the fleet-tui merge:
         // with "char-branch" pinned the merged render is byte-identical to
         // the pure-client parity baseline.
+        //
+        // Rebaselined for the sidebar section menus: both section headers
+        // now carry a right-aligned `▾` and the agents header no longer
+        // carries the `grouped`/`priority` label, which moved into the
+        // menu. Verified by reading the rendered rows, not by accepting the
+        // new digest:
+        //   " spaces                 ▾│ 1        logs    +"
+        //   " agents                 ▾│"
         assert_eq!(
             digest,
-            "bb5e1667ff64404f378028b508414f278a06c0ee3c4ac26b775251ea0f858023"
+            "9e3855056f02d741454af01d35e6a2ed5976cd71418cadcc48ec7dd70e7bf7b4"
         );
     }
 

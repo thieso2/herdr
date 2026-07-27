@@ -637,7 +637,7 @@ mod tests {
         let server_running = Arc::clone(&running);
         let event_hub = EventHub::default();
         let server_thread = std::thread::spawn(move || {
-            super::super::handle_connection(server, &api_tx, &event_hub, &server_running, None)
+            super::super::handle_connection(server, &api_tx, &event_hub, &server_running, &Arc::new(std::sync::atomic::AtomicU8::new(0)), None)
         });
 
         let open = api_rx.blocking_recv().unwrap();
@@ -735,7 +735,7 @@ mod tests {
         let server_running = Arc::clone(&running);
         let event_hub = EventHub::default();
         let server_thread = std::thread::spawn(move || {
-            super::super::handle_connection(server, &api_tx, &event_hub, &server_running, None)
+            super::super::handle_connection(server, &api_tx, &event_hub, &server_running, &Arc::new(std::sync::atomic::AtomicU8::new(0)), None)
         });
 
         let open = api_rx.blocking_recv().unwrap();
@@ -864,7 +864,7 @@ mod tests {
         let server_running = Arc::clone(&running);
         let event_hub = EventHub::default();
         let server_thread = std::thread::spawn(move || {
-            super::super::handle_connection(server, &api_tx, &event_hub, &server_running, None)
+            super::super::handle_connection(server, &api_tx, &event_hub, &server_running, &Arc::new(std::sync::atomic::AtomicU8::new(0)), None)
         });
 
         let open = api_rx.blocking_recv().unwrap();

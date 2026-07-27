@@ -2871,20 +2871,11 @@ fn handle_mouse(mouse: MouseEvent, ctx: &mut LoopCtx<'_>) {
         handle_dialog_click(mouse, ctx);
         return;
     }
-    // Chip strip first: chips and the add affordance are pure client
-    // chrome, hit-tested against the computed view.
+    // Chip strip first: chips are pure client chrome, hit-tested against the
+    // computed view. The strip's header is not handled here - it is a
+    // section menu now, opened through the shared intent path like the other
+    // two headers.
     if let MouseEventKind::Down(button) = mouse.kind {
-        if button == crossterm::event::MouseButton::Left
-            && ctx.app.view.remote_add_hit_area.width > 0
-            && ctx
-                .app
-                .view
-                .remote_add_hit_area
-                .contains(ratatui::layout::Position::new(mouse.column, mouse.row))
-        {
-            ctx.chrome.remote_edit = Some(super::remote_edit::RemoteEditState::add());
-            return;
-        }
         if let Some(chip_idx) = crate::ui::remote_chip_at(ctx.app, mouse.column, mouse.row) {
             handle_chip_click(chip_idx, button, ctx);
             return;
@@ -3098,20 +3089,11 @@ fn handle_chip_click(
                 ctx.ui.status_flash = Some((refusal.to_owned(), now));
             }
         }
-        crossterm::event::MouseButton::Right => {
-            // Edit the remote behind the chip. Every chip is now a config
-            // entry - local runtimes included - so every chip is editable.
-            ctx.chrome.remote_edit = Some(super::remote_edit::RemoteEditState::edit(
-                &crate::fleet::config::RemoteEntry {
-                    name: descriptor.name.clone(),
-                    target: descriptor.target.clone(),
-                    session: descriptor.session.clone(),
-                    enabled: true,
-                    hue: None,
-                },
-            ));
-        }
-        crossterm::event::MouseButton::Middle => {}
+        // Right-click on a chip does nothing. It used to jump straight into
+        // the edit dialog - the one place in herdr where right-click skipped
+        // a menu - and editing now lives in the remotes list modal, reached
+        // from the remotes section menu.
+        crossterm::event::MouseButton::Right | crossterm::event::MouseButton::Middle => {}
     }
 }
 
@@ -3459,10 +3441,9 @@ mod tests {
     }
 
     /// The reported bootstrap hole, closed at the source: a one-remote
-    /// fleet used to compose no strip, so the strip's add affordance - the
-    /// only way to add a remote - did not exist, and a menu entry had to
-    /// stand in for it. The strip is always composed now, so the affordance
-    /// is always there and the menu is not needed for this at all.
+    /// fleet used to compose no strip, so there was nowhere to add a remote
+    /// from and a launcher-menu entry had to stand in. The strip is always
+    /// composed now, and its header carries the menu that owns adding.
     #[tokio::test]
     async fn the_first_remote_can_be_added_from_a_one_remote_strip() {
         use crossterm::event::MouseButton;
@@ -3476,8 +3457,8 @@ mod tests {
                 "a one-remote fleet still composes its strip"
             );
             assert!(
-                ctx.app.view.remote_add_hit_area.width > 0,
-                "and so the strip's add affordance is not on screen"
+                ctx.app.view.sidebar_remotes_header_rect.width > 0,
+                "and so its header, which owns adding, is on screen"
             );
 
             let click = |column: u16, row: u16| {
@@ -3646,27 +3627,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn right_click_opens_the_edit_dialog_for_every_remote() {
+    async fn right_clicking_a_chip_does_nothing() {
         with_test_ctx(three_descriptors(), |ctx| {
-            // Regression: remote #0 used to be an implicit runtime with no
-            // config entry, so right-clicking it refused. Every chip is a
-            // config entry now, local ones included, so every chip edits -
-            // and a local runtime shows an empty target field.
+            // Right-click used to jump straight into the edit dialog - the
+            // one place in herdr where it skipped a menu. Editing lives in
+            // the remotes list modal now, so right-click means "open a menu"
+            // everywhere without exception, and a chip has none.
+            let before = ctx.chrome.selection.clone();
+
             handle_chip_click(0, crossterm::event::MouseButton::Right, ctx);
-            let local = ctx.chrome.remote_edit.as_ref().expect("edit dialog");
-            assert_eq!(local.original_name.as_deref(), Some("local"));
-            assert_eq!(local.target, "", "a local runtime has no ssh target");
-            ctx.chrome.remote_edit = None;
-
             handle_chip_click(2, crossterm::event::MouseButton::Right, ctx);
-            let dialog = ctx.chrome.remote_edit.as_ref().expect("edit dialog");
-            assert_eq!(dialog.original_name.as_deref(), Some("gpu-01"));
-            assert_eq!(dialog.target, "can@gpu-01.example");
 
-            // While the dialog is open, keys go to it, not the session.
-            handle_key(key(KeyCode::Esc), ctx);
-            assert!(ctx.chrome.remote_edit.is_none());
+            assert!(ctx.chrome.remote_edit.is_none(), "no dialog is opened");
+            assert!(ctx.chrome.remote_start.is_none());
+            assert_eq!(ctx.chrome.selection, before, "and nothing is filtered");
             assert!(!ctx.app.should_quit);
+        });
+    }
+
+    #[tokio::test]
+    async fn left_clicking_a_chip_still_filters_and_solos() {
+        with_test_ctx(three_descriptors(), |ctx| {
+            // The menus change nothing about how the fleet is filtered.
+            handle_chip_click(2, crossterm::event::MouseButton::Left, ctx);
+            assert!(
+                !ctx.chrome.selection.is_in_view(2),
+                "left-click still toggles a remote out of view"
+            );
+
+            handle_chip_click(2, crossterm::event::MouseButton::Left, ctx);
+            assert!(ctx.chrome.selection.is_in_view(2), "and back in");
         });
     }
 

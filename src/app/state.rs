@@ -855,8 +855,13 @@ pub struct ViewState {
     pub remote_chip_strip_rect: Rect,
     /// Per-chip hit rects, parallel to `AppState::remote_chips`.
     pub remote_chip_hit_areas: Vec<Rect>,
-    /// The `add` affordance in the strip header.
-    pub remote_add_hit_area: Rect,
+    /// The three sidebar section header rows, each a full-row click target
+    /// opening that section's menu. `Rect::default()` where the section is
+    /// not rendered: a collapsed sidebar, a degenerate section, or - for
+    /// remotes - a view with no chip strip at all.
+    pub sidebar_remotes_header_rect: Rect,
+    pub sidebar_spaces_header_rect: Rect,
+    pub sidebar_agents_header_rect: Rect,
     pub workspace_card_areas: Vec<WorkspaceCardArea>,
     pub tab_bar_rect: Rect,
     pub tab_hit_areas: Vec<Rect>,
@@ -1334,6 +1339,7 @@ pub enum ContextMenuKind {
 }
 
 /// Right-click context menu state.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContextMenuState {
     pub kind: ContextMenuKind,
     pub x: u16,
@@ -1452,6 +1458,38 @@ impl ContextMenuState {
     /// The typed action behind row `idx` of a section menu.
     pub fn section_action(&self, idx: usize) -> Option<SectionMenuAction> {
         self.section_rows().get(idx).and_then(|row| row.action)
+    }
+
+    /// Moves the highlight one row down, skipping readout rows so the
+    /// selection can never rest on a label that does nothing.
+    pub fn highlight_next(&mut self) {
+        self.step_highlight(true);
+    }
+
+    /// Moves the highlight one row up, skipping readout rows.
+    pub fn highlight_prev(&mut self) {
+        self.step_highlight(false);
+    }
+
+    fn step_highlight(&mut self, forward: bool) {
+        let count = self.items().len();
+        if count == 0 {
+            return;
+        }
+        let mut idx = self.list.highlighted;
+        // At most one full lap: a menu of nothing but readouts leaves the
+        // highlight where it was rather than spinning.
+        for _ in 0..count {
+            idx = if forward {
+                (idx + 1) % count
+            } else {
+                (idx + count - 1) % count
+            };
+            if self.item_selectable(idx) {
+                self.list.highlighted = idx;
+                return;
+            }
+        }
     }
 
     /// The active agent view override this menu was opened over, when any.
@@ -1717,6 +1755,11 @@ pub struct AppState {
     /// so the owning pure-client loop drains this into the dialog. Only the
     /// pure client offers the entry that sets it.
     pub request_add_remote: bool,
+    /// Set when the user asked to edit the fleet from the remotes section
+    /// menu. Drained by the pure-client loop into the remotes list modal,
+    /// for the same reason as `request_add_remote`: the modal is client
+    /// chrome that `AppState` cannot reach.
+    pub request_manage_remotes: bool,
     /// Set when the headless server should ask attached clients to reload
     /// their client-local sound config from disk.
     pub request_client_config_reload: bool,
@@ -1931,6 +1974,37 @@ impl AppState {
         } else {
             false
         }
+    }
+
+    /// The agent view override in force, as the agents section menu needs
+    /// it: what to call it, who applied it, and whether it takes the
+    /// ordering away from the user's chosen sort.
+    ///
+    /// A view with a sort spec wins outright; a filter-only view leaves the
+    /// panel ordering in force over the filtered set. That is the precedence
+    /// the ordering code already implements — the menu reflects it rather
+    /// than the cruder "any view suppresses the sort" rule it replaces.
+    pub(crate) fn active_agent_view(&self) -> Option<ActiveAgentView> {
+        self.agent_view_override
+            .as_ref()
+            .map(|view| ActiveAgentView {
+                label: view
+                    .label
+                    .clone()
+                    .unwrap_or_else(|| "filtered".to_string()),
+                source: view.source.clone(),
+                owns_sort: !view.sort.is_empty(),
+            })
+    }
+
+    /// Whether a key is bound to open this section's menu.
+    ///
+    /// The other half of the `▾` reachability rule: a header advertises a
+    /// menu when the mouse can open it *or* a key can. Menus ship
+    /// keyboard-openable only once the bindings exist, so this is false
+    /// throughout until they are added.
+    pub(crate) fn sidebar_section_menu_key_bound(&self, _section: SidebarSection) -> bool {
+        false
     }
 
     pub(crate) fn mark_session_dirty(&mut self) {
@@ -2304,6 +2378,7 @@ impl AppState {
             request_submit_worktree_remove: false,
             request_reload_config: false,
             request_add_remote: false,
+            request_manage_remotes: false,
             request_client_config_reload: false,
             request_clipboard_write: None,
             request_history_top_backfill: false,
@@ -2337,7 +2412,9 @@ impl AppState {
                 sidebar_rect: Rect::default(),
                 remote_chip_strip_rect: Rect::default(),
                 remote_chip_hit_areas: Vec::new(),
-                remote_add_hit_area: Rect::default(),
+                sidebar_remotes_header_rect: Rect::default(),
+                sidebar_spaces_header_rect: Rect::default(),
+                sidebar_agents_header_rect: Rect::default(),
                 workspace_card_areas: Vec::new(),
                 tab_bar_rect: Rect::default(),
                 tab_hit_areas: Vec::new(),

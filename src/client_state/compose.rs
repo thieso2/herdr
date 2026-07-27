@@ -13,6 +13,8 @@
 
 use std::collections::HashMap;
 
+use tracing::warn;
+
 use crate::api::schema::common::{AgentStatus, SplitDirection};
 use crate::api::schema::panes::{PaneInfo, PaneLayoutSnapshot};
 use crate::app::state::RemoteTag;
@@ -567,6 +569,48 @@ fn leftmost_leaf(node: &Node) -> Option<PaneId> {
 
 /// Applies config-derived presentation to a fresh client `AppState`,
 /// mirroring the assignments `App::new` makes for the server-owned state.
+/// Writes the chosen agent panel ordering back to the client's own config.
+///
+/// The single-server app has always done this; the fleet client seeded the
+/// value at startup and never wrote it back, so a fleet user re-picked their
+/// ordering every session. Invisible while the control was a small label
+/// most people never clicked - the section menu is what makes it visible.
+///
+/// Deliberately does not re-apply config afterwards, unlike the single-server
+/// path: [`apply_client_config`] runs exactly once at startup, so re-running
+/// it here would clobber live state. The in-memory value is already correct;
+/// the write is purely for the next launch.
+pub(crate) fn persist_agent_panel_sort(sort: crate::app::state::AgentPanelSort) {
+    // Matches the single-server guard: without a config path pinned by the
+    // environment, a unit test would write to the developer's real config.
+    #[cfg(test)]
+    if std::env::var_os(crate::config::CONFIG_PATH_ENV_VAR).is_none() {
+        return;
+    }
+
+    let value = match sort {
+        crate::app::state::AgentPanelSort::Spaces => {
+            crate::config::AgentPanelSortConfig::Spaces.as_str()
+        }
+        crate::app::state::AgentPanelSort::Priority => {
+            crate::config::AgentPanelSortConfig::Priority.as_str()
+        }
+    };
+    let path = crate::config::config_path();
+    if let Some(parent) = path.parent() {
+        if let Err(err) = std::fs::create_dir_all(parent) {
+            warn!(err = %err, "failed to save agent panel sort");
+            return;
+        }
+    }
+    let content = std::fs::read_to_string(&path).unwrap_or_default();
+    let updated =
+        crate::config::upsert_section_value(&content, "ui", "agent_panel_sort", &format!("\"{value}\""));
+    if let Err(err) = std::fs::write(&path, updated) {
+        warn!(err = %err, "failed to save agent panel sort");
+    }
+}
+
 pub(crate) fn apply_client_config(app: &mut AppState, config: &crate::config::Config) {
     let (prefix_code, prefix_mods) = config.prefix_key();
     app.prefix_code = prefix_code;
@@ -670,6 +714,48 @@ mod tests {
     use ratatui::backend::TestBackend;
     use ratatui::layout::Rect;
     use ratatui::Terminal;
+
+    #[test]
+    fn the_fleet_client_writes_the_agent_panel_sort_back_to_config() {
+        // Regression: the fleet client seeded the ordering from config at
+        // startup and never wrote it back, so a fleet user re-picked their
+        // ordering every session.
+        let _guard = crate::config::test_config_env_lock().lock().unwrap();
+        let path = std::env::temp_dir()
+            .join(format!(
+                "herdr-client-sort-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0)
+            ))
+            .join("config.toml");
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        std::fs::write(&path, "onboarding = false\n").expect("seed config");
+        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
+
+        persist_agent_panel_sort(crate::app::state::AgentPanelSort::Priority);
+
+        // It writes the same key a hand edit would, so there is one source
+        // of truth for the setting...
+        let content = std::fs::read_to_string(&path).expect("read back");
+        assert!(content.contains("agent_panel_sort = \"priority\""), "{content}");
+
+        // ...and the value survives a reload into a fresh client state.
+        let loaded = crate::config::Config::load();
+        let mut app = AppState::test_new();
+        apply_client_config(&mut app, &loaded.config);
+        assert_eq!(app.agent_panel_sort, crate::app::state::AgentPanelSort::Priority);
+
+        persist_agent_panel_sort(crate::app::state::AgentPanelSort::Spaces);
+        let loaded = crate::config::Config::load();
+        apply_client_config(&mut app, &loaded.config);
+        assert_eq!(app.agent_panel_sort, crate::app::state::AgentPanelSort::Spaces);
+
+        std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
+        let _ = std::fs::remove_dir_all(path.parent().expect("parent"));
+    }
 
     fn mirror_with_layout() -> crate::client_state::RemoteMirror {
         let mut mirror = crate::client_state::RemoteMirror::test_with_adversarial_catalog();

@@ -262,6 +262,7 @@ pub(super) fn dispatch_mouse_intent(
     // mouse-reporting panes already happened in the caller, so the empty
     // registry only mutes the residual forwarding paths.
     let mode_before = app.mode;
+    let sort_before = app.agent_panel_sort;
     let empty_runtimes = crate::terminal::TerminalRuntimeRegistry::new();
     let action = {
         let in_view: Vec<usize> = chrome
@@ -273,6 +274,12 @@ pub(super) fn dispatch_mouse_intent(
         let source = super::compose::MirrorPaneSource::for_view(mirrors, &in_view);
         app.handle_mouse_with_content(&empty_runtimes, &source, mouse)
     };
+    // Mirrors the single-server client, which snapshots the sort around the
+    // same handler and writes it back when it changed. Placed before every
+    // early return below so no dispatch path can skip the write.
+    if app.agent_panel_sort != sort_before {
+        super::compose::persist_agent_panel_sort(app.agent_panel_sort);
+    }
     // A mouse-driven copy (copy_on_select drag release, double-click word
     // copies) lands in request_clipboard_write; the pure client is the
     // host terminal, so it goes straight out as OSC52.

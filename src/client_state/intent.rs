@@ -51,6 +51,30 @@ pub(super) fn dispatch_prefix_intent(
         return;
     }
 
+    // Section menus are client chrome as well: the menu opens over the
+    // composed view and its items dispatch through the existing modal path.
+    // Unbound by default, so this is a no-op for anyone who has not asked.
+    let section_menu = [
+        (
+            app.keybinds.open_remotes_menu.matches_prefix_key(key),
+            crate::app::state::SidebarSection::Remotes,
+        ),
+        (
+            app.keybinds.open_spaces_menu.matches_prefix_key(key),
+            crate::app::state::SidebarSection::Spaces,
+        ),
+        (
+            app.keybinds.open_agents_menu.matches_prefix_key(key),
+            crate::app::state::SidebarSection::Agents,
+        ),
+    ]
+    .into_iter()
+    .find_map(|(matched, section)| matched.then_some(section));
+    if let Some(section) = section_menu {
+        app.open_sidebar_section_menu(section);
+        return;
+    }
+
     // With nothing focused (for example a solo'd remote with no spaces
     // yet), creation still goes to the *effective* focused remote, never
     // silently to local — and never to a remote filtered out of view.

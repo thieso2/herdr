@@ -1024,6 +1024,74 @@ mod tests {
     }
 
     #[test]
+    fn a_bound_key_opens_the_same_menu_the_mouse_would() {
+        use crate::app::state::SidebarSection;
+        let mut app = app_for_mouse_test();
+        app.state.workspaces = vec![Workspace::test_new("test")];
+        app.state.active = Some(0);
+
+        // Unbound by default: the prefix namespace is contested and herdr
+        // is mouse-first, so these ship for the users who want them.
+        assert!(app.state.keybinds.open_agents_menu.bindings.is_empty());
+        assert!(!app
+            .state
+            .sidebar_section_menu_key_bound(SidebarSection::Agents));
+
+        app.state.keybinds.open_agents_menu = crate::config::ActionKeybinds::direct("alt+a");
+        assert!(app
+            .state
+            .sidebar_section_menu_key_bound(SidebarSection::Agents));
+
+        // Opened by key, anchored under its own header - identical to the
+        // menu a click would have produced.
+        let header = app.state.view.sidebar_agents_header_rect;
+        assert!(app
+            .state
+            .open_sidebar_section_menu(SidebarSection::Agents));
+        let menu = app.state.context_menu.as_ref().expect("agents menu");
+        assert_eq!((menu.x, menu.y), (header.x, header.y + 1));
+        assert_eq!(app.state.mode, Mode::ContextMenu);
+    }
+
+    #[test]
+    fn the_marker_only_shows_where_the_menu_can_actually_be_opened() {
+        use crate::app::state::SidebarSection;
+        let mut app = app_for_mouse_test();
+        app.state.fleet_config_backed = true;
+
+        app.state.mouse_capture = true;
+        for section in [
+            SidebarSection::Remotes,
+            SidebarSection::Spaces,
+            SidebarSection::Agents,
+        ] {
+            assert!(crate::ui::sidebar_section_marker_visible(&app.state, section));
+        }
+
+        // With mouse capture off and nothing bound there is genuinely no
+        // way in, so the headers must not advertise one.
+        app.state.mouse_capture = false;
+        for section in [
+            SidebarSection::Remotes,
+            SidebarSection::Spaces,
+            SidebarSection::Agents,
+        ] {
+            assert!(!crate::ui::sidebar_section_marker_visible(&app.state, section));
+        }
+
+        // Binding one section brings back exactly that marker.
+        app.state.keybinds.open_spaces_menu = crate::config::ActionKeybinds::direct("alt+s");
+        assert!(crate::ui::sidebar_section_marker_visible(
+            &app.state,
+            SidebarSection::Spaces
+        ));
+        assert!(!crate::ui::sidebar_section_marker_visible(
+            &app.state,
+            SidebarSection::Agents
+        ));
+    }
+
+    #[test]
     fn menu_navigation_skips_the_readout_rows() {
         use crate::app::state::SidebarSection;
         let mut app = app_for_mouse_test();

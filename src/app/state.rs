@@ -2000,11 +2000,16 @@ impl AppState {
     /// Whether a key is bound to open this section's menu.
     ///
     /// The other half of the `▾` reachability rule: a header advertises a
-    /// menu when the mouse can open it *or* a key can. Menus ship
-    /// keyboard-openable only once the bindings exist, so this is false
-    /// throughout until they are added.
-    pub(crate) fn sidebar_section_menu_key_bound(&self, _section: SidebarSection) -> bool {
-        false
+    /// menu when the mouse can open it *or* a key can. With mouse capture
+    /// off and nothing bound the headers carry no marker, because there is
+    /// genuinely no way to open them.
+    pub(crate) fn sidebar_section_menu_key_bound(&self, section: SidebarSection) -> bool {
+        let bindings = match section {
+            SidebarSection::Remotes => &self.keybinds.open_remotes_menu,
+            SidebarSection::Spaces => &self.keybinds.open_spaces_menu,
+            SidebarSection::Agents => &self.keybinds.open_agents_menu,
+        };
+        !bindings.bindings.is_empty()
     }
 
     pub(crate) fn mark_session_dirty(&mut self) {

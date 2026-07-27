@@ -94,6 +94,11 @@ fn spawn_client_process(
     let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_herdr"));
     cmd.arg("client");
     cmd.env("HERDR_DISABLE_SOUND", "1");
+    // The thin client exits non-zero on a lost connection, which is what its
+    // caller waits for. The pure client parks the remote and keeps rendering
+    // instead, so it never exits and the blocking PTY read never returns -
+    // the test hangs rather than failing. Pin the path being tested.
+    cmd.env("HERDR_PURE_CLIENT", "0");
     cmd.env("XDG_CONFIG_HOME", config_home);
     cmd.env("XDG_RUNTIME_DIR", runtime_dir);
     cmd.env("HERDR_SOCKET_PATH", api_socket_path);

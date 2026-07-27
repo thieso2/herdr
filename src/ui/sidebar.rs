@@ -173,12 +173,7 @@ pub(crate) fn render_sidebar_section_header(
         let width = display_width_u16(SECTION_MENU_MARKER).min(rect.width);
         frame.render_widget(
             Paragraph::new(Span::styled(SECTION_MENU_MARKER, style)),
-            Rect::new(
-                rect.x + rect.width.saturating_sub(width),
-                rect.y,
-                width,
-                1,
-            ),
+            Rect::new(rect.x + rect.width.saturating_sub(width), rect.y, width, 1),
         );
     }
 }

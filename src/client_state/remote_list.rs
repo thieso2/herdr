@@ -85,11 +85,7 @@ impl RemoteListState {
         let previous = self.selected;
         self.rows = rows;
         self.selected = tracked
-            .and_then(|name| {
-                self.rows
-                    .iter()
-                    .position(|row| row.entry.name == name)
-            })
+            .and_then(|name| self.rows.iter().position(|row| row.entry.name == name))
             .unwrap_or_else(|| previous.min(self.rows.len().saturating_sub(1)));
     }
 }

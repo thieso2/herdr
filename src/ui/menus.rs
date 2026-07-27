@@ -307,10 +307,7 @@ pub(super) fn render_context_menu(app: &AppState, frame: &mut Frame) {
             let line = if menu.item_selectable(idx) {
                 Line::from(item.clone())
             } else {
-                Line::from(Span::styled(
-                    item.clone(),
-                    Style::default().fg(p.overlay0),
-                ))
+                Line::from(Span::styled(item.clone(), Style::default().fg(p.overlay0)))
             };
             ListItem::new(line)
         })

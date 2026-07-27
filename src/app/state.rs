@@ -1422,10 +1422,7 @@ impl ContextMenuState {
                     // user's sort in force and the radio stays live.
                     rows.push(match view {
                         Some(view) if view.owns_sort => SectionMenuRow::readout(text),
-                        _ => SectionMenuRow::action(
-                            text,
-                            SectionMenuAction::SetAgentSort(value),
-                        ),
+                        _ => SectionMenuRow::action(text, SectionMenuAction::SetAgentSort(value)),
                     });
                 }
                 if let Some(view) = view {
@@ -1513,7 +1510,10 @@ impl ContextMenuState {
                 .map(|row| row.label)
                 .collect();
         }
-        self.static_items().iter().map(|item| item.to_string()).collect()
+        self.static_items()
+            .iter()
+            .map(|item| item.to_string())
+            .collect()
     }
 
     fn static_items(&self) -> &'static [&'static str] {
@@ -1988,10 +1988,7 @@ impl AppState {
         self.agent_view_override
             .as_ref()
             .map(|view| ActiveAgentView {
-                label: view
-                    .label
-                    .clone()
-                    .unwrap_or_else(|| "filtered".to_string()),
+                label: view.label.clone().unwrap_or_else(|| "filtered".to_string()),
                 source: view.source.clone(),
                 owns_sort: !view.sort.is_empty(),
             })

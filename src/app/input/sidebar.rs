@@ -448,7 +448,10 @@ impl AppState {
                 && row < rect.y + rect.height
         };
         for (rect, section) in [
-            (self.view.sidebar_remotes_header_rect, SidebarSection::Remotes),
+            (
+                self.view.sidebar_remotes_header_rect,
+                SidebarSection::Remotes,
+            ),
             (self.view.sidebar_spaces_header_rect, SidebarSection::Spaces),
             (self.view.sidebar_agents_header_rect, SidebarSection::Agents),
         ] {
@@ -470,9 +473,7 @@ impl AppState {
         &mut self,
         section: crate::app::state::SidebarSection,
     ) -> bool {
-        use crate::app::state::{
-            ContextMenuKind, ContextMenuState, MenuListState, SidebarSection,
-        };
+        use crate::app::state::{ContextMenuKind, ContextMenuState, MenuListState, SidebarSection};
         if section == SidebarSection::Remotes && !self.fleet_config_backed {
             return false;
         }
@@ -954,8 +955,14 @@ mod tests {
         // what applies right now.
         assert!(app.state.open_sidebar_section_menu(SidebarSection::Agents));
         let items = app.state.context_menu.as_ref().expect("menu").items();
-        assert!(!items.iter().any(|item| item.starts_with("view:")), "{items:?}");
-        assert!(!items.iter().any(|item| item == "clear filter"), "{items:?}");
+        assert!(
+            !items.iter().any(|item| item.starts_with("view:")),
+            "{items:?}"
+        );
+        assert!(
+            !items.iter().any(|item| item == "clear filter"),
+            "{items:?}"
+        );
 
         // A filter-only view leaves the user's ordering in force, so the
         // radio stays selectable.
@@ -1045,9 +1052,7 @@ mod tests {
         // Opened by key, anchored under its own header - identical to the
         // menu a click would have produced.
         let header = app.state.view.sidebar_agents_header_rect;
-        assert!(app
-            .state
-            .open_sidebar_section_menu(SidebarSection::Agents));
+        assert!(app.state.open_sidebar_section_menu(SidebarSection::Agents));
         let menu = app.state.context_menu.as_ref().expect("agents menu");
         assert_eq!((menu.x, menu.y), (header.x, header.y + 1));
         assert_eq!(app.state.mode, Mode::ContextMenu);
@@ -1065,7 +1070,9 @@ mod tests {
             SidebarSection::Spaces,
             SidebarSection::Agents,
         ] {
-            assert!(crate::ui::sidebar_section_marker_visible(&app.state, section));
+            assert!(crate::ui::sidebar_section_marker_visible(
+                &app.state, section
+            ));
         }
 
         // With mouse capture off and nothing bound there is genuinely no
@@ -1076,7 +1083,9 @@ mod tests {
             SidebarSection::Spaces,
             SidebarSection::Agents,
         ] {
-            assert!(!crate::ui::sidebar_section_marker_visible(&app.state, section));
+            assert!(!crate::ui::sidebar_section_marker_visible(
+                &app.state, section
+            ));
         }
 
         // Binding one section brings back exactly that marker.
@@ -1139,11 +1148,19 @@ mod tests {
         assert_eq!(app.state.mode, Mode::ContextMenu);
         let menu = app.state.context_menu.as_ref().expect("agents menu");
         let items = menu.items();
-        assert!(items.iter().any(|item| item.contains("grouped")), "{items:?}");
-        assert!(items.iter().any(|item| item.contains("priority")), "{items:?}");
+        assert!(
+            items.iter().any(|item| item.contains("grouped")),
+            "{items:?}"
+        );
+        assert!(
+            items.iter().any(|item| item.contains("priority")),
+            "{items:?}"
+        );
         // The current value is marked, so both it and the alternative show.
         assert!(
-            items.iter().any(|item| item.starts_with('\u{25cf}') && item.contains("grouped")),
+            items
+                .iter()
+                .any(|item| item.starts_with('\u{25cf}') && item.contains("grouped")),
             "{items:?}"
         );
 

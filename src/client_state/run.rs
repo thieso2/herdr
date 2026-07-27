@@ -1852,9 +1852,7 @@ fn handle_server_frame(remote: usize, frame: Frame, ctx: &mut LoopCtx<'_>) {
                             .get("data")
                             .and_then(|data| data.get("reason"))
                             .and_then(|value| value.as_str())
-                            .unwrap_or(
-                                crate::protocol::framed::SERVER_STOPPING_REASON_REQUESTED,
-                            );
+                            .unwrap_or(crate::protocol::framed::SERVER_STOPPING_REASON_REQUESTED);
                         let status = crate::fleet::connection::announced_stop_status_line(
                             &mirror.name,
                             reason,
@@ -2292,8 +2290,7 @@ fn commit_remote_list_change(
             list.error = None;
             reconcile_fleet(&entries, ctx);
             // Re-read live status through the reconciled descriptors.
-            let rows =
-                super::remote_list::remote_list_rows(&entries, ctx.descriptors, ctx.mirrors);
+            let rows = super::remote_list::remote_list_rows(&entries, ctx.descriptors, ctx.mirrors);
             if let Some(list) = ctx.chrome.remote_list.as_mut() {
                 list.reload(rows);
             }
@@ -2482,8 +2479,7 @@ fn stop_remote(remote: usize, ctx: &mut LoopCtx<'_>) {
     };
     let Some(target) = descriptor.target.clone() else {
         if let Some(list) = ctx.chrome.remote_list.as_mut() {
-            list.error =
-                Some("a local runtime stops when its last space closes".to_owned());
+            list.error = Some("a local runtime stops when its last space closes".to_owned());
         }
         return;
     };

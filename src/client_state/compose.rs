@@ -604,8 +604,12 @@ pub(crate) fn persist_agent_panel_sort(sort: crate::app::state::AgentPanelSort) 
         }
     }
     let content = std::fs::read_to_string(&path).unwrap_or_default();
-    let updated =
-        crate::config::upsert_section_value(&content, "ui", "agent_panel_sort", &format!("\"{value}\""));
+    let updated = crate::config::upsert_section_value(
+        &content,
+        "ui",
+        "agent_panel_sort",
+        &format!("\"{value}\""),
+    );
     if let Err(err) = std::fs::write(&path, updated) {
         warn!(err = %err, "failed to save agent panel sort");
     }
@@ -740,18 +744,27 @@ mod tests {
         // It writes the same key a hand edit would, so there is one source
         // of truth for the setting...
         let content = std::fs::read_to_string(&path).expect("read back");
-        assert!(content.contains("agent_panel_sort = \"priority\""), "{content}");
+        assert!(
+            content.contains("agent_panel_sort = \"priority\""),
+            "{content}"
+        );
 
         // ...and the value survives a reload into a fresh client state.
         let loaded = crate::config::Config::load();
         let mut app = AppState::test_new();
         apply_client_config(&mut app, &loaded.config);
-        assert_eq!(app.agent_panel_sort, crate::app::state::AgentPanelSort::Priority);
+        assert_eq!(
+            app.agent_panel_sort,
+            crate::app::state::AgentPanelSort::Priority
+        );
 
         persist_agent_panel_sort(crate::app::state::AgentPanelSort::Spaces);
         let loaded = crate::config::Config::load();
         apply_client_config(&mut app, &loaded.config);
-        assert_eq!(app.agent_panel_sort, crate::app::state::AgentPanelSort::Spaces);
+        assert_eq!(
+            app.agent_panel_sort,
+            crate::app::state::AgentPanelSort::Spaces
+        );
 
         std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
         let _ = std::fs::remove_dir_all(path.parent().expect("parent"));

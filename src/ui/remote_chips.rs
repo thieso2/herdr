@@ -364,15 +364,19 @@ fn remote_list_popup_height(count: usize) -> u16 {
 // Consumed only by the unix-only pure-client run path.
 #[cfg_attr(windows, allow(dead_code))]
 pub(crate) fn remote_list_inner_rect(area: Rect, count: usize) -> Option<Rect> {
-    super::widgets::centered_popup_rect(area, REMOTE_LIST_POPUP_WIDTH, remote_list_popup_height(count))
-        .map(|popup| {
-            Rect::new(
-                popup.x + 1,
-                popup.y + 1,
-                popup.width.saturating_sub(2),
-                popup.height.saturating_sub(2),
-            )
-        })
+    super::widgets::centered_popup_rect(
+        area,
+        REMOTE_LIST_POPUP_WIDTH,
+        remote_list_popup_height(count),
+    )
+    .map(|popup| {
+        Rect::new(
+            popup.x + 1,
+            popup.y + 1,
+            popup.width.saturating_sub(2),
+            popup.height.saturating_sub(2),
+        )
+    })
 }
 
 /// The stacked areas of the list modal, so render and hit-test agree.
@@ -466,13 +470,13 @@ pub(crate) fn render_remote_list_overlay(
         let line = Line::from(vec![
             Span::styled(
                 format!(" {} ", row.status.dot()),
-                Style::default().fg(if row.status
-                    == crate::client_state::remote_list::RemoteListStatus::Connected
-                {
-                    p.remote_hue(row.entry.hue.unwrap_or(0))
-                } else {
-                    p.overlay0
-                }),
+                Style::default().fg(
+                    if row.status == crate::client_state::remote_list::RemoteListStatus::Connected {
+                        p.remote_hue(row.entry.hue.unwrap_or(0))
+                    } else {
+                        p.overlay0
+                    },
+                ),
             ),
             Span::styled(format!("{name:<16} "), base),
             Span::styled(format!("{target:<22} "), Style::default().fg(p.subtext0)),
@@ -486,7 +490,10 @@ pub(crate) fn render_remote_list_overlay(
     if let Some(footer) = areas.footer {
         let hint = |key: &'static str, label: &'static str| {
             vec![
-                Span::styled(key, Style::default().fg(p.accent).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    key,
+                    Style::default().fg(p.accent).add_modifier(Modifier::BOLD),
+                ),
                 Span::styled(format!(" {label}  "), Style::default().fg(p.overlay0)),
             ]
         };
@@ -732,8 +739,7 @@ mod tests {
     #[test]
     fn a_tiny_sidebar_drops_the_strip_rather_than_the_sections() {
         let area = Rect::new(0, 0, 26, 7);
-        let (layout, rest) =
-            split_sidebar_for_chip_strip(&[chip("a"), chip("b")], area, false);
+        let (layout, rest) = split_sidebar_for_chip_strip(&[chip("a"), chip("b")], area, false);
         assert_eq!(layout.strip_rect, Rect::default());
         assert_eq!(rest, area);
     }

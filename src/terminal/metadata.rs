@@ -861,7 +861,11 @@ mod tests {
             clear_title: false,
             clear_display_agent: false,
             clear_state_labels: false,
-            ttl: Some(Duration::from_millis(1)),
+            // Long enough that a loaded test run cannot expire it before the
+            // assertions below. This test forces expiry through
+            // `expire_agent_metadata_at`, so the TTL only has to outlive the
+            // wall clock, never elapse on it.
+            ttl: Some(Duration::from_secs(60)),
             seq: None,
         });
         let old_deadline = terminal.next_agent_metadata_expiry().unwrap();

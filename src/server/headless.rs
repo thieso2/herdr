@@ -4185,6 +4185,20 @@ impl HeadlessServer {
         // exit-on-empty logic; we are already going.
         self.app.state.exit_on_empty_suppressed = true;
 
+        // Tell framed sessions before the legacy broadcast, so both client
+        // kinds learn about the stop inside the same flush window. Without
+        // this a pure client sees only EOF and cannot tell a deliberate stop
+        // from a crash, so it walks its reconnect ladder against a server
+        // that is never coming back.
+        if let Some(api_server) = &self.api_server {
+            let reason = if self.app.state.exit_requested_because_empty {
+                crate::api::StopReason::Empty
+            } else {
+                crate::api::StopReason::Requested
+            };
+            api_server.begin_stopping(reason);
+        }
+
         // Clear client-local host graphics, then send ServerShutdown to all connected clients.
         self.send_all_clients_graphics_cleanup();
         let shutdown_msg = ServerMessage::ServerShutdown {

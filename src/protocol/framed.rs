@@ -202,6 +202,29 @@ pub const CATALOG_EVENT: &str = "catalog.event";
 /// on sessions that negotiated the `catalog` capability.
 pub const CATALOG_RESYNC_EVENT: &str = "catalog.resync_required";
 
+/// Event frame telling a framed client that its server is going away on
+/// purpose, sent before the session ends on server stop.
+///
+/// Deliberately **not** capability-gated. The other events are data feeds a
+/// client opts into; this one is about the session itself, and a client that
+/// never asked for the catalog still needs to know its server is going away.
+/// Without it a deliberate stop is indistinguishable from a crash: the
+/// client sees only EOF and walks its reconnect ladder against a server that
+/// is never coming back.
+///
+/// `data.reason` is [`SERVER_STOPPING_REASON_EMPTY`] or
+/// [`SERVER_STOPPING_REASON_REQUESTED`]. Both are terminal for the client;
+/// an unrecognised value must be treated as `requested`, so a newer server
+/// can add reasons without stranding an older client.
+pub const SERVER_STOPPING_EVENT: &str = "server.stopping";
+
+/// `server.stopping` reason: the catalog went empty, so there was nothing
+/// left to keep the server alive.
+pub const SERVER_STOPPING_REASON_EMPTY: &str = "empty";
+
+/// `server.stopping` reason: someone asked the server to stop.
+pub const SERVER_STOPPING_REASON_REQUESTED: &str = "requested";
+
 /// Error code answering a `stream.open` that asked for write mode without
 /// takeover while another live stream holds the pane's write grant.
 pub const PANE_WRITE_LOCKED_ERROR: &str = "pane_write_locked";

@@ -38,8 +38,8 @@ use crate::protocol::framed::{
     session_snapshot_request, stream_close_request, stream_open_request, stream_resize_request,
     write_frame, Frame, FrameType, FramedCodecError, HelloRemedy, SessionWelcome, StreamMode,
     CAPABILITY_CATALOG, CAPABILITY_PANE_STREAM, CATALOG_EVENT, CATALOG_RESYNC_EVENT,
-    CONTROL_STREAM_ID, FRAMED_MAGIC, PANE_WRITE_LOCKED_ERROR, STREAM_CLOSED_EVENT,
-    STREAM_REVOKED_EVENT,
+    CONTROL_STREAM_ID, FRAMED_MAGIC, PANE_WRITE_LOCKED_ERROR, SERVER_STOPPING_EVENT,
+    STREAM_CLOSED_EVENT, STREAM_REVOKED_EVENT,
 };
 use crate::terminal::TerminalId;
 
@@ -1827,6 +1827,39 @@ fn handle_server_frame(remote: usize, frame: Frame, ctx: &mut LoopCtx<'_>) {
                                 session.read_only.remove(&stream_id);
                             }
                         }
+                    }
+                    SERVER_STOPPING_EVENT => {
+                        // The server is going away on purpose. Go straight to
+                        // Stopped rather than through the retry ladder: the
+                        // ladder is for transports that might come back, and
+                        // this one told us it will not.
+                        //
+                        // Setting `Link::Stopped` here also matters for the
+                        // EOF that follows immediately after: `drop_link`
+                        // early-returns on a stopped link, so the deliberate
+                        // stop is not overwritten with `Offline`.
+                        let reason = payload
+                            .get("data")
+                            .and_then(|data| data.get("reason"))
+                            .and_then(|value| value.as_str())
+                            .unwrap_or(
+                                crate::protocol::framed::SERVER_STOPPING_REASON_REQUESTED,
+                            );
+                        let status = crate::fleet::connection::announced_stop_status_line(
+                            &mirror.name,
+                            reason,
+                        );
+                        info!(remote, reason, "fleet remote server announced a stop");
+                        mirror.connection.stopped(status.clone());
+                        ctx.chrome.connection_status = Some(status.clone());
+                        ctx.chrome.remote_start = Some(super::remote_start::RemoteStartPrompt {
+                            remote,
+                            name: mirror.name.clone(),
+                            status,
+                            error: None,
+                            starting: false,
+                        });
+                        ctx.links.insert(remote, Link::Stopped);
                     }
                     _ => {}
                 }
@@ -3772,6 +3805,99 @@ mod tests {
             assert_eq!(reoffered.remote, 1);
             assert!(!reoffered.starting);
             assert!(reoffered.status.contains("remote start buildbox"));
+        });
+    }
+
+    fn server_stopping_frame(reason: &str) -> Frame {
+        let payload = serde_json::to_vec(&serde_json::json!({
+            "event": SERVER_STOPPING_EVENT,
+            "data": { "reason": reason },
+        }))
+        .expect("encode");
+        Frame {
+            frame_type: FrameType::Control,
+            stream_id: CONTROL_STREAM_ID,
+            payload,
+        }
+    }
+
+    #[tokio::test]
+    async fn an_announced_server_stop_parks_the_remote_without_running_the_ladder() {
+        with_test_ctx(three_descriptors(), |ctx| {
+            ctx.links.insert(1, Link::Pending { generation: 1 });
+
+            handle_server_frame(
+                1,
+                server_stopping_frame(crate::protocol::framed::SERVER_STOPPING_REASON_EMPTY),
+                ctx,
+            );
+
+            // Straight to Stopped: a server that said it is going away is not
+            // a transport that might come back.
+            assert!(
+                matches!(ctx.links.get(&1), Some(Link::Stopped)),
+                "an announced stop must not be scheduled for retry"
+            );
+            let connection = ctx
+                .mirrors
+                .get(1)
+                .map(|mirror| mirror.connection.clone())
+                .expect("mirror");
+            assert!(connection.is_stopped(), "{connection:?}");
+            assert!(!connection.may_retry());
+
+            // The status line is written from the reason, not from
+            // connect-failure text.
+            let prompt = ctx.chrome.remote_start.as_ref().expect("start prompt");
+            assert_eq!(prompt.name, "buildbox");
+            assert!(prompt.status.contains("no panes left"), "{prompt:?}");
+
+            // The EOF that follows the announcement must not downgrade the
+            // deliberate stop back into the offline retry ladder.
+            drop_link(1, ctx, "connection closed");
+            assert!(
+                matches!(ctx.links.get(&1), Some(Link::Stopped)),
+                "the EOF after an announced stop must not overwrite it"
+            );
+            assert!(ctx
+                .mirrors
+                .get(1)
+                .is_some_and(|mirror| mirror.connection.is_stopped()));
+        });
+    }
+
+    #[tokio::test]
+    async fn an_unrecognised_stop_reason_is_treated_as_stopped_by_request() {
+        // Version skew must degrade gracefully: a newer server can add a
+        // reason without stranding this client retrying a server that is gone.
+        with_test_ctx(three_descriptors(), |ctx| {
+            ctx.links.insert(1, Link::Pending { generation: 1 });
+
+            handle_server_frame(1, server_stopping_frame("hibernated"), ctx);
+
+            assert!(matches!(ctx.links.get(&1), Some(Link::Stopped)));
+            let prompt = ctx.chrome.remote_start.as_ref().expect("start prompt");
+            assert!(prompt.status.contains("stopped by request"), "{prompt:?}");
+        });
+    }
+
+    #[tokio::test]
+    async fn a_plain_disconnect_still_walks_the_retry_ladder() {
+        // The contrast: an unannounced drop is exactly what the ladder is
+        // for, so the new event must not make every disconnect terminal.
+        with_test_ctx(three_descriptors(), |ctx| {
+            ctx.links.insert(1, Link::Pending { generation: 1 });
+
+            drop_link(1, ctx, "connection closed");
+
+            assert!(
+                matches!(ctx.links.get(&1), Some(Link::Down { .. })),
+                "an unannounced disconnect keeps retrying"
+            );
+            assert!(ctx
+                .mirrors
+                .get(1)
+                .is_some_and(|mirror| mirror.connection.may_retry()));
         });
     }
 

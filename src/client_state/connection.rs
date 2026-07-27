@@ -172,6 +172,48 @@ mod tests {
     }
 
     #[test]
+    fn an_announced_stop_lands_on_stopped_straight_from_connected() {
+        // A server that announces its stop must not be walked through the
+        // retry ladder: the ladder is for transports that might come back.
+        for reason in [
+            crate::protocol::framed::SERVER_STOPPING_REASON_EMPTY,
+            crate::protocol::framed::SERVER_STOPPING_REASON_REQUESTED,
+            "a-reason-from-a-newer-server",
+        ] {
+            let mut state = ClientConnectionState::new();
+            state.connect_started();
+            state.connected(negotiated());
+            state.stopped(crate::fleet::connection::announced_stop_status_line(
+                "gpu-01", reason,
+            ));
+
+            assert!(!state.may_retry(), "{reason}: stopped refuses auto-retry");
+            assert!(!state.is_connected());
+            assert!(state.is_stopped());
+        }
+    }
+
+    #[test]
+    fn the_stopped_status_line_is_written_from_the_reason() {
+        use crate::fleet::connection::announced_stop_status_line;
+        use crate::protocol::framed::{
+            SERVER_STOPPING_REASON_EMPTY, SERVER_STOPPING_REASON_REQUESTED,
+        };
+
+        let empty = announced_stop_status_line("gpu-01", SERVER_STOPPING_REASON_EMPTY);
+        assert!(empty.contains("no panes left"), "{empty}");
+        assert!(empty.contains("gpu-01"), "{empty}");
+
+        let requested = announced_stop_status_line("gpu-01", SERVER_STOPPING_REASON_REQUESTED);
+        assert!(requested.contains("stopped by request"), "{requested}");
+
+        // An unrecognised reason from a newer server reads as "by request"
+        // rather than stranding the user with no explanation.
+        let unknown = announced_stop_status_line("gpu-01", "hibernated");
+        assert_eq!(unknown, requested);
+    }
+
+    #[test]
     fn incompatible_is_terminal_for_this_config() {
         let mut state = ClientConnectionState::new();
         state.connect_started();

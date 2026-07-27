@@ -1276,8 +1276,41 @@ pub(crate) struct TabPressState {
     pub start_row: u16,
 }
 
+/// One of the three sidebar sections whose header opens a menu.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SidebarSection {
+    Remotes,
+    Spaces,
+    Agents,
+}
+
+/// The agent view override in force, as far as the agents section menu needs
+/// to know: what to call it, who applied it, and whether it takes the
+/// ordering away from the user's chosen sort.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActiveAgentView {
+    /// The view's own label, or a fallback when it supplied none.
+    pub label: String,
+    /// The plugin that applied it, so the user knows what to go turn off.
+    pub source: String,
+    /// True when the view carries its own sort spec, which wins outright
+    /// over the panel ordering. A filter-only view leaves the user's sort
+    /// in force, and the radio stays live.
+    pub owns_sort: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ContextMenuKind {
+    /// A sidebar section header. Carries the facts its contents depend on,
+    /// the way every other kind does, so the menu stays derivable from the
+    /// kind alone.
+    SidebarSection {
+        section: SidebarSection,
+        /// Agents only: the active ordering, marked as a radio pair.
+        sort: AgentPanelSort,
+        /// Agents only: the active view override, when there is one.
+        view: Option<ActiveAgentView>,
+    },
     Workspace {
         ws_idx: usize,
     },
@@ -1308,9 +1341,147 @@ pub struct ContextMenuState {
     pub list: MenuListState,
 }
 
+/// What a row of a sidebar section menu does when chosen.
+///
+/// Typed rather than matched on the row's text: three dispatch tails read
+/// these, and a label typo in any one of them would be a silent no-op.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SectionMenuAction {
+    AddRemote,
+    EditRemotes,
+    NewSpace,
+    SetAgentSort(AgentPanelSort),
+    ClearAgentView,
+}
+
+/// One row of a section menu: what it reads as, and what it does. A row with
+/// no action is a readout, dimmed and unselectable.
+struct SectionMenuRow {
+    label: String,
+    action: Option<SectionMenuAction>,
+}
+
+impl SectionMenuRow {
+    fn action(label: impl Into<String>, action: SectionMenuAction) -> Self {
+        Self {
+            label: label.into(),
+            action: Some(action),
+        }
+    }
+
+    fn readout(label: impl Into<String>) -> Self {
+        Self {
+            label: label.into(),
+            action: None,
+        }
+    }
+}
+
 impl ContextMenuState {
-    pub fn items(&self) -> &'static [&'static str] {
+    /// The rows of a sidebar section menu, or empty for any other kind.
+    fn section_rows(&self) -> Vec<SectionMenuRow> {
+        let ContextMenuKind::SidebarSection {
+            section,
+            sort,
+            view,
+        } = &self.kind
+        else {
+            return Vec::new();
+        };
+        match section {
+            // `new ...` is a named action rather than the two-character
+            // `add` label it replaces. The whole menu is suppressed for an
+            // ephemeral fleet, so no row here can silently do nothing.
+            SidebarSection::Remotes => vec![
+                SectionMenuRow::action("new ...", SectionMenuAction::AddRemote),
+                SectionMenuRow::action("edit remotes...", SectionMenuAction::EditRemotes),
+            ],
+            SidebarSection::Spaces => vec![SectionMenuRow::action(
+                "new ...",
+                SectionMenuAction::NewSpace,
+            )],
+            SidebarSection::Agents => {
+                // A radio pair rather than a toggle: both the current value
+                // and the alternative are visible, so choosing is a decision
+                // instead of a cycle.
+                let radio = |active: bool| if active { "●" } else { "○" };
+                let mut rows = vec![SectionMenuRow::readout("sort by")];
+                for (label, value) in [
+                    ("grouped", AgentPanelSort::Spaces),
+                    ("priority", AgentPanelSort::Priority),
+                ] {
+                    let text = format!("{} {label}", radio(*sort == value));
+                    // A view that supplies its own ordering wins outright,
+                    // so the radio dims. A filter-only view leaves the
+                    // user's sort in force and the radio stays live.
+                    rows.push(match view {
+                        Some(view) if view.owns_sort => SectionMenuRow::readout(text),
+                        _ => SectionMenuRow::action(
+                            text,
+                            SectionMenuAction::SetAgentSort(value),
+                        ),
+                    });
+                }
+                if let Some(view) = view {
+                    // Names the source so the user knows which plugin to go
+                    // turn off, and gives them the first user-facing way to
+                    // clear a view - today it is clearable only over the API.
+                    rows.push(SectionMenuRow::readout(format!("view: {}", view.label)));
+                    rows.push(SectionMenuRow::action(
+                        "clear filter",
+                        SectionMenuAction::ClearAgentView,
+                    ));
+                }
+                rows
+            }
+        }
+    }
+
+    /// Whether row `idx` can be chosen. Readout rows - the `sort by` header,
+    /// the `view:` line, and a dimmed sort radio - are labels, not actions.
+    pub fn item_selectable(&self, idx: usize) -> bool {
+        match &self.kind {
+            ContextMenuKind::SidebarSection { .. } => self
+                .section_rows()
+                .get(idx)
+                .is_some_and(|row| row.action.is_some()),
+            _ => true,
+        }
+    }
+
+    /// The typed action behind row `idx` of a section menu.
+    pub fn section_action(&self, idx: usize) -> Option<SectionMenuAction> {
+        self.section_rows().get(idx).and_then(|row| row.action)
+    }
+
+    /// The active agent view override this menu was opened over, when any.
+    pub fn active_view(&self) -> Option<&ActiveAgentView> {
+        match &self.kind {
+            ContextMenuKind::SidebarSection { view, .. } => view.as_ref(),
+            _ => None,
+        }
+    }
+
+    /// Menu rows, derived from the kind.
+    ///
+    /// Owned rather than static slices: the agents section menu names the
+    /// active view and marks the active sort, so its rows are not knowable
+    /// at compile time.
+    pub fn items(&self) -> Vec<String> {
+        if matches!(self.kind, ContextMenuKind::SidebarSection { .. }) {
+            return self
+                .section_rows()
+                .into_iter()
+                .map(|row| row.label)
+                .collect();
+        }
+        self.static_items().iter().map(|item| item.to_string()).collect()
+    }
+
+    fn static_items(&self) -> &'static [&'static str] {
         match self.kind {
+            // Handled by `section_rows`; never reached through `items`.
+            ContextMenuKind::SidebarSection { .. } => &[],
             ContextMenuKind::Workspace { .. } => &["Rename", "Close"],
             ContextMenuKind::GitWorkspace {
                 is_linked_worktree: false,
@@ -1511,6 +1682,11 @@ pub struct AppState {
     /// Mirrors the server's shutdown-in-progress and live-handoff windows,
     /// during which emptying the catalog must not request another exit.
     pub(crate) exit_on_empty_suppressed: bool,
+    /// True when `should_quit` was set because the catalog went empty rather
+    /// than because someone asked. Distinguishes the two reasons told to
+    /// framed clients, so a stop reads as "no panes left" rather than
+    /// "stopped by request".
+    pub(crate) exit_requested_because_empty: bool,
     /// True when this AppState is composed by the pure fleet client: menu
     /// entries whose effects only exist server-side (settings, reload
     /// config) are omitted, and detach means "exit the fleet client".
@@ -1750,6 +1926,7 @@ impl AppState {
     pub(crate) fn request_exit_if_catalog_empty(&mut self) -> bool {
         if self.should_exit_because_catalog_empty() {
             self.should_quit = true;
+            self.exit_requested_because_empty = true;
             true
         } else {
             false
@@ -2111,6 +2288,7 @@ impl AppState {
             should_quit: false,
             catalog_ever_held_space: false,
             exit_on_empty_suppressed: false,
+            exit_requested_because_empty: false,
             pure_client: false,
             fleet_config_backed: false,
             detach_exits: false,
@@ -2583,6 +2761,9 @@ impl AppState {
         }
         if let Some(menu) = &self.context_menu {
             match menu.kind {
+                // A section menu carries no workspace, tab or pane index,
+                // so there is nothing here to validate.
+                ContextMenuKind::SidebarSection { .. } => {}
                 ContextMenuKind::Workspace { ws_idx }
                 | ContextMenuKind::GitWorkspace { ws_idx, .. } => {
                     assert_workspace_index(ws_idx, "context menu workspace")

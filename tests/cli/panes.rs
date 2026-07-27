@@ -81,6 +81,20 @@ fn pane_close_removes_the_workspace_when_it_closes_the_last_pane() {
         .unwrap()
         .to_string();
 
+    // A second space keeps the catalog non-empty across the close. A server
+    // with nothing left now exits, and its socket goes with it - which is
+    // its own behaviour, not what this test is about.
+    let survivor = run_cli(
+        &socket_path,
+        &["workspace", "create", "--cwd", base.to_str().unwrap()],
+    );
+    assert!(survivor.status.success());
+    let survivor_json: serde_json::Value = serde_json::from_slice(&survivor.stdout).unwrap();
+    let survivor_id = survivor_json["result"]["workspace"]["workspace_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
     let closed = run_cli(&socket_path, &["pane", "close", &root_pane_id]);
     assert!(closed.status.success());
     let closed_json: serde_json::Value = serde_json::from_slice(&closed.stdout).unwrap();
@@ -89,10 +103,9 @@ fn pane_close_removes_the_workspace_when_it_closes_the_last_pane() {
     let workspaces = run_cli(&socket_path, &["workspace", "list"]);
     assert!(workspaces.status.success());
     let workspaces_json: serde_json::Value = serde_json::from_slice(&workspaces.stdout).unwrap();
-    assert!(workspaces_json["result"]["workspaces"]
-        .as_array()
-        .unwrap()
-        .is_empty());
+    let listed = workspaces_json["result"]["workspaces"].as_array().unwrap();
+    assert_eq!(listed.len(), 1, "closing the last pane removed its space");
+    assert_eq!(listed[0]["workspace_id"], survivor_id);
 
     cleanup_spawned_herdr(herdr, base);
 }
@@ -318,6 +331,15 @@ fn closing_workspace_terminates_processes_inside_it() {
         &["workspace", "create", "--cwd", base.to_str().unwrap()],
     );
     assert!(created.status.success());
+
+    // A second space keeps the catalog non-empty across the close, so the
+    // server stays up to answer. This test is about the processes inside a
+    // closed space, not about the server exiting when nothing is left.
+    let survivor = run_cli(
+        &socket_path,
+        &["workspace", "create", "--cwd", base.to_str().unwrap()],
+    );
+    assert!(survivor.status.success());
 
     let pid_file = base.join("workspace-close.pid");
     let command = format!(

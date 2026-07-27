@@ -1140,10 +1140,17 @@ mod tests {
         let transport = ScriptedTransport::new(vec![FakeBehavior::ServeWelcomeAndPongs]);
         let reseeds = Arc::new(AtomicUsize::new(0));
         let hook_reseeds = Arc::clone(&reseeds);
+        // Keep the ping cadence short - the point is to cross several
+        // heartbeat intervals - but give the pong a deadline a loaded runner
+        // cannot trip. This asserts a *healthy* session stays up; a CI box
+        // descheduling the manager thread past the shared 120ms deadline
+        // would otherwise fake a timeout that says nothing about the code.
+        let mut tuning = tuning(Duration::from_millis(10));
+        tuning.pong_timeout = Duration::from_secs(5);
         let mut manager = FleetManager::start(
             vec![entry("a")],
             Arc::clone(&transport) as Arc<dyn FleetTransport>,
-            tuning(Duration::from_millis(10)),
+            tuning,
             Arc::new(move |_| {
                 hook_reseeds.fetch_add(1, Ordering::SeqCst);
             }),

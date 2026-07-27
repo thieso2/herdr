@@ -11,6 +11,11 @@
 //! individually through the transactional fleet-config update, so there is
 //! no draft to reconcile and closing never discards work.
 
+// Every item here is driven by the pure-client run loop, which is unix-only,
+// so a Windows build compiles the module but reaches none of it. Same reason
+// the modal's geometry and render helpers carry this in `crate::ui`.
+#![cfg_attr(windows, allow(dead_code))]
+
 use crossterm::event::{KeyCode, KeyModifiers};
 
 use crate::fleet::config::{MoveDirection, RemoteEntry};

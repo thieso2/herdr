@@ -52,21 +52,21 @@ fn remote_list_reads_config_offline_when_no_server_is_running() {
 
     let response = run_named_cli_json(&config_home, &runtime_dir, &["remote", "list", "--json"]);
     let remotes = response["result"]["remotes"].as_array().unwrap();
-    assert_eq!(remotes.len(), 3);
+    // The file is the whole fleet: there is no implicit local runtime to
+    // prepend. A local runtime is an ordinary target-less entry, and this
+    // fixture configures none.
+    assert_eq!(remotes.len(), 2);
 
     assert_eq!(remotes[0]["index"], 0);
-    assert_eq!(remotes[0]["name"], "local");
-    assert_eq!(remotes[0]["state"], "local");
+    assert_eq!(remotes[0]["name"], "gpu1");
+    assert_eq!(remotes[0]["target"], "can@gpu1.example");
+    assert_eq!(remotes[0]["session"], "default");
+    assert_eq!(remotes[0]["enabled"], true);
+    assert_eq!(remotes[0]["state"], "unknown");
 
-    assert_eq!(remotes[1]["name"], "gpu1");
-    assert_eq!(remotes[1]["target"], "can@gpu1.example");
-    assert_eq!(remotes[1]["session"], "default");
-    assert_eq!(remotes[1]["enabled"], true);
-    assert_eq!(remotes[1]["state"], "unknown");
-
-    assert_eq!(remotes[2]["name"], "gpu2");
-    assert_eq!(remotes[2]["session"], "work");
-    assert_eq!(remotes[2]["state"], "disabled");
+    assert_eq!(remotes[1]["name"], "gpu2");
+    assert_eq!(remotes[1]["session"], "work");
+    assert_eq!(remotes[1]["state"], "disabled");
 
     // The human-readable table works offline too.
     let output = run_named_cli(&config_home, &runtime_dir, &["remote", "list"]);
@@ -86,12 +86,11 @@ fn remote_list_and_reset_work_against_a_running_server() {
     let spawned = spawn_herdr(&config_home, &runtime_dir, &socket_path);
     wait_for_socket(&socket_path, Duration::from_secs(10));
 
-    // No remotes.toml: the running fleet reports only the implicit local row.
+    // No remotes.toml: the running fleet is empty. There is no implicit
+    // local runtime to fall back on - the file is the whole fleet.
     let response = run_cli_json(&socket_path, &["remote", "list", "--json"]);
     let remotes = response["result"]["remotes"].as_array().unwrap();
-    assert_eq!(remotes.len(), 1);
-    assert_eq!(remotes[0]["name"], "local");
-    assert_eq!(remotes[0]["state"], "local");
+    assert!(remotes.is_empty(), "unexpected remotes: {remotes:?}");
 
     // Resetting an unknown remote is a clean API error.
     let output = run_cli(&socket_path, &["remote", "reset", "missing", "--json"]);
@@ -99,9 +98,12 @@ fn remote_list_and_reset_work_against_a_running_server() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("remote_not_found"), "stderr: {stderr}");
 
-    // Explicit reload succeeds and returns the fleet.
+    // Explicit reload succeeds and returns the fleet, still empty.
     let response = run_cli_json(&socket_path, &["remote", "reload", "--json"]);
-    assert_eq!(response["result"]["remotes"].as_array().unwrap().len(), 1);
+    assert!(response["result"]["remotes"]
+        .as_array()
+        .expect("remotes array")
+        .is_empty());
 
     cleanup_spawned_herdr(spawned, base);
 }
@@ -114,6 +116,11 @@ fn bridge_subcommand_pumps_the_framed_protocol_to_the_api_socket() {
     let socket_path = base.join("herdr.sock");
     let spawned = spawn_herdr(&config_home, &runtime_dir, &socket_path);
     wait_for_socket(&socket_path, Duration::from_secs(10));
+    // The bridge decides a server is running by probing the *client* socket,
+    // which the server binds after the API socket. Waiting only for the API
+    // socket races it: a bridge that wins reports "no server" and exits, and
+    // its stderr is discarded here, so the failure reads as a bare EOF.
+    wait_for_socket(&base.join("herdr-client.sock"), Duration::from_secs(10));
 
     let mut bridge = Command::new(env!("CARGO_BIN_EXE_herdr"))
         .arg("bridge")

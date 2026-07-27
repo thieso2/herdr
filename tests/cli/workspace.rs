@@ -81,6 +81,15 @@ fn workspace_and_pane_management_commands_work() {
     let focused = run_cli(&socket_path, &["workspace", "focus", &workspace_id]);
     assert!(focused.status.success());
 
+    // A second space keeps the catalog non-empty across the close: a server
+    // with nothing left exits, and racing its shutdown proves nothing about
+    // the close itself.
+    let survivor = run_cli(
+        &socket_path,
+        &["workspace", "create", "--cwd", base.to_str().unwrap()],
+    );
+    assert!(survivor.status.success());
+
     let closed_workspace = run_cli(&socket_path, &["workspace", "close", &workspace_id]);
     assert!(closed_workspace.status.success());
     let closed_workspace_json: serde_json::Value =

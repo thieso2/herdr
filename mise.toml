@@ -1,0 +1,25 @@
+# Fork-owned mise tasks. Upstream has no mise config, so this file cannot
+# conflict on a merge. Task logic lives in scripts/overherdr_build_dist.sh.
+#
+# Everyday development still goes through `just` (see justfile); mise only owns
+# the local cross-build of release binaries.
+
+[tasks."build:dist"]
+description = "Cross-build every release binary with zig into dist/ (no docker)"
+run = "scripts/overherdr_build_dist.sh"
+
+[tasks."build:dist:linux-x86_64"]
+description = "Cross-build dist/overherdr-linux-x86_64 (musl, static)"
+run = "scripts/overherdr_build_dist.sh linux-x86_64"
+
+[tasks."build:dist:linux-aarch64"]
+description = "Cross-build dist/overherdr-linux-aarch64 (musl, static)"
+run = "scripts/overherdr_build_dist.sh linux-aarch64"
+
+[tasks."build:dist:macos-aarch64"]
+description = "Cross-build dist/overherdr-macos-aarch64 (fetches a pinned macOS SDK off macOS)"
+run = "scripts/overherdr_build_dist.sh macos-aarch64"
+
+[tasks."macos-sdk"]
+description = "Download and unpack the pinned macOS SDK used for cross-builds"
+run = "scripts/overherdr_fetch_macos_sdk.sh"

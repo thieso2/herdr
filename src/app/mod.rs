@@ -21,7 +21,7 @@ pub(crate) use input::MouseAction;
 #[cfg(unix)]
 pub(crate) use input::{
     handle_global_menu_key, handle_keybind_help_key, insert_rename_input_text,
-    is_retained_selection_copy_key, open_keybind_help, pure_client_modal_key,
+    is_retained_selection_copy_key, open_global_menu, open_keybind_help, pure_client_modal_key,
     pure_client_modal_mouse, PureModalIds,
 };
 mod popup;

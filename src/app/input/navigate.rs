@@ -189,6 +189,9 @@ impl App {
                 // no menu - remotes, for an ephemeral fleet - does nothing.
                 self.state.open_sidebar_section_menu(section);
             }
+            NavigateAction::OpenGlobalMenu => {
+                super::modal::open_global_menu(&mut self.state);
+            }
             NavigateAction::NewWorkspace => {
                 self.begin_tui_workspace_create("tui.key.workspace.create");
             }
@@ -1331,8 +1334,11 @@ pub(crate) enum NavigateAction {
     LastPane,
     /// Open one of the three sidebar section menus. The menus are otherwise
     /// mouse-only, which leaves the sidebar unreachable with mouse capture
-    /// off; these are the opt-in way in.
+    /// off; these are the keyboard way in.
     OpenSidebarSectionMenu(crate::app::state::SidebarSection),
+    /// Open the global menu. Its launcher is a click target only, so this is
+    /// the keyboard route to everything the menu hosts.
+    OpenGlobalMenu,
     Help,
     Settings,
     ReloadConfig,
@@ -1470,6 +1476,7 @@ fn non_indexed_action_for_key(
             &kb.open_agents_menu,
             NavigateAction::OpenSidebarSectionMenu(crate::app::state::SidebarSection::Agents),
         ),
+        (&kb.global_menu, NavigateAction::OpenGlobalMenu),
         (&kb.cycle_pane_next, NavigateAction::CyclePaneNext),
         (&kb.cycle_pane_previous, NavigateAction::CyclePanePrevious),
         (&kb.split_vertical, NavigateAction::SplitVertical),
@@ -1554,6 +1561,9 @@ pub(super) fn execute_navigate_action_in_context(
     match action {
         NavigateAction::OpenSidebarSectionMenu(section) => {
             state.open_sidebar_section_menu(section);
+        }
+        NavigateAction::OpenGlobalMenu => {
+            super::modal::open_global_menu(state);
         }
         NavigateAction::NewWorkspace => {
             state.request_new_workspace = true;
@@ -3083,8 +3093,8 @@ navigate_pane_down = "ctrl+j"
             release_path.display(),
         );
         app.state.keybinds.custom_commands = vec![crate::config::CustomCommandKeybind {
-            bindings: crate::config::ActionKeybinds::prefix("m"),
-            label: "prefix+m".into(),
+            bindings: crate::config::ActionKeybinds::prefix("u"),
+            label: "prefix+u".into(),
             command,
             action: crate::config::CustomCommandAction::Shell,
             description: None,
@@ -3100,7 +3110,7 @@ navigate_pane_down = "ctrl+j"
         assert_eq!(app.state.mode, Mode::Prefix);
 
         let launch_started = std::time::Instant::now();
-        app.handle_key(TerminalKey::new(KeyCode::Char('m'), KeyModifiers::empty()))
+        app.handle_key(TerminalKey::new(KeyCode::Char('u'), KeyModifiers::empty()))
             .await;
         assert!(launch_started.elapsed() < Duration::from_secs(2));
 
@@ -3177,8 +3187,8 @@ navigate_pane_down = "ctrl+j"
         let output_path = unique_temp_path("custom-pane-command");
         let command = format!("printf done > '{}'", output_path.display());
         app.state.keybinds.custom_commands = vec![crate::config::CustomCommandKeybind {
-            bindings: crate::config::ActionKeybinds::prefix("m"),
-            label: "prefix+m".into(),
+            bindings: crate::config::ActionKeybinds::prefix("u"),
+            label: "prefix+u".into(),
             command,
             action: crate::config::CustomCommandAction::Pane,
             description: None,
@@ -3191,7 +3201,7 @@ navigate_pane_down = "ctrl+j"
             app.state.prefix_mods,
         ))
         .await;
-        app.handle_key(TerminalKey::new(KeyCode::Char('m'), KeyModifiers::empty()))
+        app.handle_key(TerminalKey::new(KeyCode::Char('u'), KeyModifiers::empty()))
             .await;
 
         assert_eq!(app.state.workspaces[0].tabs[0].layout.pane_count(), 2);

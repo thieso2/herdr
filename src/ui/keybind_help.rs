@@ -162,8 +162,9 @@ pub(super) fn keybind_help_groups(app: &AppState) -> Vec<HelpGroup> {
     // Listed even while unbound, so the users most likely to want them can
     // discover that they exist and what to set.
     groups.push((
-        "sidebar menus",
+        "menus",
         vec![
+            help_entry(keybind_label(&kb.global_menu), "global menu"),
             help_entry(keybind_label(&kb.open_remotes_menu), "remotes menu"),
             help_entry(keybind_label(&kb.open_spaces_menu), "spaces menu"),
             help_entry(keybind_label(&kb.open_agents_menu), "agents menu"),

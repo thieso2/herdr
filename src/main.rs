@@ -217,6 +217,10 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # zoom = "prefix+z"       # legacy alias: fullscreen
 # resize_mode = "prefix+r"
 # toggle_sidebar = "prefix+b"
+# global_menu = "prefix+m"              # settings, keybinds, add remote, detach
+# open_remotes_menu = "prefix+shift+m"  # new remote, edit remotes
+# open_spaces_menu = "prefix+shift+s"
+# open_agents_menu = "prefix+shift+a"
 
 # Navigate-mode movement. These local shortcuts win while navigate mode is open.
 # They are independent from focus_pane_*. Do not include prefix+, esc, enter, tab, or 1..9 here.

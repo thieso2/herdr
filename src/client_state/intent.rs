@@ -51,9 +51,16 @@ pub(super) fn dispatch_prefix_intent(
         return;
     }
 
+    // The global menu is client chrome, and its launcher is a click target
+    // only. Without a key here the fleet client's "add remote" entry - the
+    // one route to a first remote on a fresh install - was mouse-only.
+    if app.keybinds.global_menu.matches_prefix_key(key) {
+        crate::app::open_global_menu(app);
+        return;
+    }
+
     // Section menus are client chrome as well: the menu opens over the
     // composed view and its items dispatch through the existing modal path.
-    // Unbound by default, so this is a no-op for anyone who has not asked.
     let section_menu = [
         (
             app.keybinds.open_remotes_menu.matches_prefix_key(key),
@@ -670,6 +677,71 @@ mod tests {
         assert_eq!(app.mode, crate::app::Mode::KeybindHelp);
         // Client chrome only: nothing was sent to any remote.
         assert!(links.is_empty(), "opening help must not hit the wire");
+    }
+
+    /// Regression: a fresh install has an empty `remotes.toml`, so the only
+    /// two routes to the add-remote dialog are the remotes section menu and
+    /// the global menu - and both were mouse-only. With mouse reporting off
+    /// or unavailable there was no way to add a first remote at all.
+    #[test]
+    fn a_first_remote_can_be_added_with_no_remotes_and_no_mouse() {
+        use crate::app::state::SidebarSection;
+
+        for (key, expected) in [
+            (
+                TerminalKey::new(KeyCode::Char('M'), KeyModifiers::SHIFT),
+                crate::app::Mode::ContextMenu,
+            ),
+            (
+                TerminalKey::new(KeyCode::Char('m'), KeyModifiers::empty()),
+                crate::app::Mode::GlobalMenu,
+            ),
+        ] {
+            let mut mirrors = RemoteMirrors::with_local();
+            let mut ids = ComposeIds::new();
+            let mut app = AppState::test_new();
+            let mut links = Links::new();
+            let mut chrome = GlobalChrome::new();
+            app.keybinds = crate::config::Config::default().keybinds();
+            // The state a fresh fleet client starts in: config-backed, no
+            // remotes composed, and no mouse capture to click with.
+            app.pure_client = true;
+            app.fleet_config_backed = true;
+            app.mouse_capture = false;
+            // The empty fleet still lays out its remotes header; the menu
+            // anchors under it, and compute_view does not run here.
+            app.view.sidebar_remotes_header_rect = ratatui::layout::Rect::new(0, 0, 20, 1);
+
+            dispatch_prefix_intent(
+                key,
+                &mut links,
+                &mut mirrors,
+                &mut ids,
+                &[],
+                &mut app,
+                &mut chrome,
+            );
+
+            assert_eq!(app.mode, expected);
+            assert!(links.is_empty(), "opening a menu must not hit the wire");
+            let reaches_add_remote = match expected {
+                crate::app::Mode::ContextMenu => app
+                    .context_menu
+                    .as_ref()
+                    .expect("remotes menu")
+                    .items()
+                    .iter()
+                    .any(|item| item.contains("new")),
+                _ => crate::app::AppState::global_menu_labels(&app).contains(&"add remote"),
+            };
+            assert!(reaches_add_remote, "menu must offer adding a remote");
+        }
+
+        // And the header advertises the keyboard route now that one exists.
+        let mut app = AppState::test_new();
+        app.keybinds = crate::config::Config::default().keybinds();
+        app.mouse_capture = false;
+        assert!(app.sidebar_section_menu_key_bound(SidebarSection::Remotes));
     }
 
     fn key(code: KeyCode) -> TerminalKey {

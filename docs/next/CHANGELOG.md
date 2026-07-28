@@ -2,7 +2,11 @@
 
 ## Unreleased
 
+### Added
+- Added `keys.global_menu` (default `prefix+m`) so the global menu, previously reachable only by clicking its sidebar launcher, has a keyboard route.
+
 ### Changed
+- `keys.open_remotes_menu`, `keys.open_spaces_menu`, and `keys.open_agents_menu` now ship bound by default (`prefix+shift+m`, `prefix+shift+s`, `prefix+shift+a`). Adding a first remote to an empty fleet no longer requires a working mouse.
 - Relicensed Herdr from AGPL-3.0-or-later to Apache-2.0.
 - `terminal attach`, `agent attach`, and `terminal session control|observe` now speak the framed runtime protocol on the API socket, streaming the pane snapshot and raw output tail instead of server-rendered frames. Writable attach ownership is a pane write grant that reports `pane_write_locked` instead of dropping the connection; `--takeover` revokes the previous holder without disturbing its connection. Older servers keep working through the previous attach path.
 

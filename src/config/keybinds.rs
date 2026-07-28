@@ -350,12 +350,15 @@ pub struct Keybinds {
     pub cycle_pane_next: ActionKeybinds,
     pub cycle_pane_previous: ActionKeybinds,
     pub last_pane: ActionKeybinds,
-    /// Open a sidebar section's menu. Unbound by default; with mouse
-    /// capture off these are the only way in, which is why the header's
-    /// `▾` marker keys off them.
+    /// Open a sidebar section's menu. With mouse capture off these are the
+    /// only way in, which is why the header's `▾` marker keys off them.
     pub open_remotes_menu: ActionKeybinds,
     pub open_spaces_menu: ActionKeybinds,
     pub open_agents_menu: ActionKeybinds,
+    /// Open the global menu. The launcher that opens it is a click target
+    /// only, so without this the menu's own entries - "add remote" among
+    /// them - had no keyboard route.
+    pub global_menu: ActionKeybinds,
     pub split_vertical: ActionKeybinds,
     pub split_horizontal: ActionKeybinds,
     pub close_pane: ActionKeybinds,
@@ -521,6 +524,7 @@ impl Config {
             open_remotes_menu: empty_action!(),
             open_spaces_menu: empty_action!(),
             open_agents_menu: empty_action!(),
+            global_menu: empty_action!(),
             split_vertical: empty_action!(),
             split_horizontal: empty_action!(),
             close_pane: empty_action!(),
@@ -663,6 +667,7 @@ impl Config {
             apply_action!(keybinds.open_remotes_menu, open_remotes_menu, source);
             apply_action!(keybinds.open_spaces_menu, open_spaces_menu, source);
             apply_action!(keybinds.open_agents_menu, open_agents_menu, source);
+            apply_action!(keybinds.global_menu, global_menu, source);
             apply_action!(keybinds.cycle_pane_next, cycle_pane_next, source);
             apply_action!(keybinds.cycle_pane_previous, cycle_pane_previous, source);
             apply_action!(keybinds.split_vertical, split_vertical, source);

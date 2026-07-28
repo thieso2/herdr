@@ -496,20 +496,26 @@
         {
           "key": "keys.open_remotes_menu",
           "type": "keybinding",
-          "default": "unset",
-          "description": "Open the sidebar's remotes section menu. Unset by default."
+          "default": "\"prefix+shift+m\"",
+          "description": "Open the sidebar's remotes section menu."
         },
         {
           "key": "keys.open_spaces_menu",
           "type": "keybinding",
-          "default": "unset",
-          "description": "Open the sidebar's spaces section menu. Unset by default."
+          "default": "\"prefix+shift+s\"",
+          "description": "Open the sidebar's spaces section menu."
         },
         {
           "key": "keys.open_agents_menu",
           "type": "keybinding",
-          "default": "unset",
-          "description": "Open the sidebar's agents section menu. Unset by default."
+          "default": "\"prefix+shift+a\"",
+          "description": "Open the sidebar's agents section menu."
+        },
+        {
+          "key": "keys.global_menu",
+          "type": "keybinding",
+          "default": "\"prefix+m\"",
+          "description": "Open the global menu (the sidebar launcher menu)."
         },
         {
           "key": "keys.split_vertical",

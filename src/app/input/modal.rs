@@ -111,7 +111,7 @@ pub(super) fn global_menu_actions(state: &AppState) -> Vec<GlobalMenuAction> {
     actions
 }
 
-pub(super) fn open_global_menu(state: &mut AppState) {
+pub(crate) fn open_global_menu(state: &mut AppState) {
     state.global_menu = MenuListState::new(0);
     state.mode = Mode::GlobalMenu;
 }

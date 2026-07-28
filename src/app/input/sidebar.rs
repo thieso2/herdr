@@ -222,6 +222,15 @@ impl AppState {
     pub(crate) fn global_menu_rect(&self) -> Rect {
         let screen = self.screen_rect();
         let launcher = self.global_launcher_rect();
+        // A collapsed sidebar has no footer and so no launcher to anchor
+        // under. The menu is reachable by key from there, so fall back to
+        // the screen corner the launcher occupies when the sidebar is open
+        // instead of piling the menu into the top-left.
+        let launcher = if launcher.height == 0 {
+            Rect::new(screen.x, screen.y + screen.height.saturating_sub(1), 0, 1)
+        } else {
+            launcher
+        };
         let labels = self.global_menu_labels();
         let content_width = labels
             .iter()
@@ -477,10 +486,23 @@ impl AppState {
         if section == SidebarSection::Remotes && !self.fleet_config_backed {
             return false;
         }
+        // A collapsed sidebar draws no headers, so there is no anchor to
+        // hang the menu under. The key must not die there - it is the
+        // keyboard's only way into these menus - so expand the sidebar and
+        // anchor at its top edge; the next frame draws the headers back
+        // under it.
+        if self.sidebar_collapsed {
+            self.sidebar_collapsed = false;
+        }
         let anchor = match section {
             SidebarSection::Remotes => self.view.sidebar_remotes_header_rect,
             SidebarSection::Spaces => self.view.sidebar_spaces_header_rect,
             SidebarSection::Agents => self.view.sidebar_agents_header_rect,
+        };
+        let anchor = if anchor.width == 0 {
+            self.view.sidebar_rect
+        } else {
+            anchor
         };
         if anchor.width == 0 {
             return false;
@@ -1039,10 +1061,10 @@ mod tests {
         app.state.workspaces = vec![Workspace::test_new("test")];
         app.state.active = Some(0);
 
-        // Unbound by default: the prefix namespace is contested and herdr
-        // is mouse-first, so these ship for the users who want them.
-        assert!(app.state.keybinds.open_agents_menu.bindings.is_empty());
-        assert!(!app
+        // Bound by default now: the menus host actions with no other
+        // keyboard route, so a mouseless session must still reach them.
+        assert!(!app.state.keybinds.open_agents_menu.bindings.is_empty());
+        assert!(app
             .state
             .sidebar_section_menu_key_bound(SidebarSection::Agents));
 
@@ -1058,6 +1080,22 @@ mod tests {
         let menu = app.state.context_menu.as_ref().expect("agents menu");
         assert_eq!((menu.x, menu.y), (header.x, header.y + 1));
         assert_eq!(app.state.mode, Mode::ContextMenu);
+    }
+
+    #[test]
+    fn a_collapsed_sidebar_expands_rather_than_swallowing_the_menu_key() {
+        use crate::app::state::SidebarSection;
+        let mut app = app_for_mouse_test();
+        app.state.workspaces = vec![Workspace::test_new("test")];
+        app.state.active = Some(0);
+
+        // Collapsed draws no headers, so the anchor the click path relies on
+        // is gone - and the key is the only way in from here.
+        app.state.sidebar_collapsed = true;
+        assert!(app.state.open_sidebar_section_menu(SidebarSection::Agents));
+        assert!(!app.state.sidebar_collapsed);
+        assert_eq!(app.state.mode, Mode::ContextMenu);
+        assert!(app.state.context_menu.is_some());
     }
 
     #[test]
@@ -1078,8 +1116,12 @@ mod tests {
         }
 
         // With mouse capture off and nothing bound there is genuinely no
-        // way in, so the headers must not advertise one.
+        // way in, so the headers must not advertise one. The defaults do
+        // bind all three, so clear them to reach that state.
         app.state.mouse_capture = false;
+        app.state.keybinds.open_remotes_menu = crate::config::ActionKeybinds::default();
+        app.state.keybinds.open_spaces_menu = crate::config::ActionKeybinds::default();
+        app.state.keybinds.open_agents_menu = crate::config::ActionKeybinds::default();
         for section in [
             SidebarSection::Remotes,
             SidebarSection::Spaces,

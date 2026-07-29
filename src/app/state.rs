@@ -2648,9 +2648,20 @@ impl AppState {
                 self.tab_press.is_none(),
                 "empty app state must not keep tab press state"
             );
+            // A *section* menu is legal here and load-bearing: with no
+            // workspaces the remotes header menu is where the first remote
+            // gets added. Only workspace-targeted menus are impossible.
             assert!(
-                self.context_menu.is_none(),
-                "empty app state must not keep context menu"
+                !matches!(
+                    self.context_menu.as_ref().map(|menu| &menu.kind),
+                    Some(
+                        ContextMenuKind::Workspace { .. }
+                            | ContextMenuKind::GitWorkspace { .. }
+                            | ContextMenuKind::Tab { .. }
+                            | ContextMenuKind::Pane { .. }
+                    )
+                ),
+                "empty app state must not keep a workspace-targeted context menu"
             );
             return;
         }

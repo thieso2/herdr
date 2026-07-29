@@ -229,13 +229,30 @@ fn apply_composition(
     // workspace at `app.selected`, which can differ from the focused
     // workspace (right-click on a non-focused row). A recompose while such
     // a modal is open must not clobber that target, so remember it by id.
+    //
+    // A sidebar *section* menu targets a section, not a workspace, so it is
+    // deliberately not in this set. Treating it as workspace-targeted drops
+    // it on the very next recompose whenever there is no workspace to
+    // remember - the empty fleet a fresh install starts in - which made
+    // every section menu unopenable by mouse there, including the one
+    // holding "add remote".
     let modal_targets_selection = matches!(
         app.mode,
-        crate::app::Mode::ContextMenu
-            | crate::app::Mode::ConfirmClose
+        crate::app::Mode::ConfirmClose
             | crate::app::Mode::RenameWorkspace
             | crate::app::Mode::RenameTab
             | crate::app::Mode::RenamePane
+    ) || matches!(
+        (app.mode, app.context_menu.as_ref().map(|menu| &menu.kind)),
+        (
+            crate::app::Mode::ContextMenu,
+            Some(
+                crate::app::state::ContextMenuKind::Workspace { .. }
+                    | crate::app::state::ContextMenuKind::GitWorkspace { .. }
+                    | crate::app::state::ContextMenuKind::Tab { .. }
+                    | crate::app::state::ContextMenuKind::Pane { .. }
+            )
+        )
     );
     let selected_workspace_id = modal_targets_selection
         .then(|| app.workspaces.get(app.selected).map(|ws| ws.id.clone()))
@@ -1004,6 +1021,44 @@ mod tests {
         compose_into(&shrunk, &chrome, &mut ids, &mut app);
         assert_eq!(app.mode, crate::app::Mode::Navigate, "modal dropped");
         assert_eq!(app.selected, 0);
+        app.assert_invariants_for_test();
+    }
+
+    /// Regression: a section menu targets a *section*, not a workspace, but
+    /// it was treated as workspace-targeted. On a fresh install - empty
+    /// `remotes.toml`, so no workspaces to remember - the very next
+    /// recompose read that as "the target vanished" and dropped the menu
+    /// before it could be drawn. Every section header, including the one
+    /// holding "add remote", was unclickable.
+    #[tokio::test]
+    async fn a_section_menu_survives_a_recompose_with_no_workspaces() {
+        use crate::app::state::{
+            AgentPanelSort, ContextMenuKind, ContextMenuState, MenuListState, SidebarSection,
+        };
+
+        let mirror = super::RemoteMirror::new(0, "local");
+        let chrome = GlobalChrome::new();
+        let mut ids = ComposeIds::new();
+        let mut app = AppState::test_new();
+        compose_into(&mirror, &chrome, &mut ids, &mut app);
+        assert!(app.workspaces.is_empty(), "the empty-fleet starting state");
+
+        app.mode = crate::app::Mode::ContextMenu;
+        app.context_menu = Some(ContextMenuState {
+            kind: ContextMenuKind::SidebarSection {
+                section: SidebarSection::Remotes,
+                sort: AgentPanelSort::default(),
+                view: None,
+            },
+            x: 0,
+            y: 1,
+            list: MenuListState::new(0),
+        });
+
+        compose_into(&mirror, &chrome, &mut ids, &mut app);
+
+        assert_eq!(app.mode, crate::app::Mode::ContextMenu, "menu survives");
+        assert!(app.context_menu.is_some());
         app.assert_invariants_for_test();
     }
 

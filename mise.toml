@@ -1,8 +1,13 @@
 # Fork-owned mise tasks. Upstream has no mise config, so this file cannot
 # conflict on a merge. Task logic lives in scripts/overherdr_build_dist.sh.
 #
-# Everyday development still goes through `just` (see justfile); mise only owns
-# the local cross-build of release binaries.
+# Everyday development still goes through `just` (see justfile); mise owns the
+# local cross-build of release binaries plus the host-arch debug build.
+
+# Note: `just build` is the *release* build. This one is debug, host arch only.
+[tasks."build"]
+description = "Debug build for this machine's architecture into target/debug/herdr"
+run = "cargo build --locked"
 
 [tasks."build:dist"]
 description = "Cross-build every release binary with zig into dist/ (no docker)"

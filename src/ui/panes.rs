@@ -912,37 +912,113 @@ fn color_to_rgb(color: Color) -> Option<Rgb> {
     }
 }
 
+/// Why a fleet client cannot create a workspace right now.
+///
+/// A workspace is created *on* a remote, over that remote's live session, so
+/// the "press this to create one" hint is only true when some remote can
+/// receive the request. Without one the key is a silent no-op — the worst
+/// kind of instruction, since the user reads it as broken software.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EmptyFleetBlocker {
+    /// Nothing configured. A fresh install starts here.
+    NoRemotes,
+    /// Remotes exist, but none that is both connected and in view — the
+    /// two conditions creation resolves its target through.
+    NoConnectedRemote,
+}
+
+/// What blocks workspace creation, for a fleet client with no workspaces.
+///
+/// `None` means creation would land somewhere, which is also the only case
+/// the workspace hint is honest in. Pure over composed state, so the empty
+/// screen and its tests read the same facts.
+pub(crate) fn empty_fleet_blocker(app: &AppState) -> Option<EmptyFleetBlocker> {
+    if !app.pure_client {
+        return None;
+    }
+    if app.remote_chips.is_empty() {
+        return Some(EmptyFleetBlocker::NoRemotes);
+    }
+    let reachable = app.remote_chips.iter().any(|chip| {
+        chip.in_view
+            && matches!(
+                chip.connection,
+                crate::app::state::RemoteChipConnection::Connected
+            )
+    });
+    (!reachable).then_some(EmptyFleetBlocker::NoConnectedRemote)
+}
+
 pub(super) fn render_empty(app: &AppState, frame: &mut Frame, area: Rect) {
     let p = &app.palette;
-    let lines = vec![
-        Line::from(""),
-        Line::from(""),
+    let headline = |text: &str| {
         Line::from(Span::styled(
-            "  No workspaces yet",
+            format!("  {text}"),
             Style::default().fg(p.overlay0),
-        )),
-        Line::from(""),
+        ))
+    };
+    let body = |text: &str| {
         Line::from(Span::styled(
-            "  A workspace is one project context.",
+            format!("  {text}"),
             Style::default().fg(p.overlay1),
-        )),
-        Line::from(Span::styled(
-            "  Its root pane (top-left) sets the default repo or folder name.",
-            Style::default().fg(p.overlay1),
-        )),
-        Line::from(""),
+        ))
+    };
+    let action = |lead: &str, key: String, tail: &str| {
         Line::from(vec![
-            Span::styled("  Press ", Style::default().fg(p.overlay0)),
+            Span::styled(format!("  {lead}"), Style::default().fg(p.overlay0)),
             Span::styled(
-                app.keybinds
-                    .new_workspace
-                    .label()
-                    .unwrap_or_else(|| "unset".to_string()),
+                key,
                 Style::default().fg(p.accent).add_modifier(Modifier::BOLD),
             ),
-            Span::styled(" to create one", Style::default().fg(p.overlay0)),
-        ]),
-    ];
+            Span::styled(tail.to_owned(), Style::default().fg(p.overlay0)),
+        ])
+    };
+    let key = |bindings: &crate::config::ActionKeybinds| {
+        bindings.label().unwrap_or_else(|| "unset".to_string())
+    };
+
+    let lines = match empty_fleet_blocker(app) {
+        // Creation needs a remote to create *on*, so that is what the empty
+        // screen asks for instead of naming a key that would do nothing.
+        Some(EmptyFleetBlocker::NoRemotes) => vec![
+            Line::from(""),
+            Line::from(""),
+            headline("No remotes yet"),
+            Line::from(""),
+            body("A remote is one machine to run spaces on - including this one."),
+            body("Spaces live on a remote, so a fleet needs one before anything else."),
+            Line::from(""),
+            action(
+                "Press ",
+                key(&app.keybinds.open_remotes_menu),
+                " for the remotes menu",
+            ),
+        ],
+        Some(EmptyFleetBlocker::NoConnectedRemote) => vec![
+            Line::from(""),
+            Line::from(""),
+            headline("No connected remote"),
+            Line::from(""),
+            body("Spaces live on a remote, and none of yours is connected."),
+            body("A stopped remote starts from its chip or the remotes menu."),
+            Line::from(""),
+            action(
+                "Press ",
+                key(&app.keybinds.open_remotes_menu),
+                " for the remotes menu",
+            ),
+        ],
+        None => vec![
+            Line::from(""),
+            Line::from(""),
+            headline("No workspaces yet"),
+            Line::from(""),
+            body("A workspace is one project context."),
+            body("Its root pane (top-left) sets the default repo or folder name."),
+            Line::from(""),
+            action("Press ", key(&app.keybinds.new_workspace), " to create one"),
+        ],
+    };
     frame.render_widget(
         Paragraph::new(lines).block(
             Block::default()
@@ -971,6 +1047,60 @@ mod tests {
             &app.view.split_borders,
             frame,
         );
+    }
+
+    /// Regression: the empty screen told every fleet client to press the
+    /// new-workspace key, including the two states where that key cannot do
+    /// anything. Creation is sent over a remote's live session, so with no
+    /// remote configured - or none connected and in view - it resolved no
+    /// target and dropped silently, which reads as a broken keybind.
+    #[test]
+    fn the_empty_screen_only_names_the_workspace_key_when_it_would_work() {
+        use crate::app::state::{RemoteChipConnection, RemoteChipState};
+
+        let chip = |connection, in_view| RemoteChipState {
+            name: "buildbox".into(),
+            hue_index: 0,
+            in_view,
+            connection,
+        };
+
+        // Not a fleet client: this screen is the single-server one, where
+        // creation is local and always available.
+        let mut app = AppState::test_new();
+        assert_eq!(empty_fleet_blocker(&app), None);
+
+        app.pure_client = true;
+        assert_eq!(
+            empty_fleet_blocker(&app),
+            Some(EmptyFleetBlocker::NoRemotes),
+            "a fresh install has nothing to create on"
+        );
+
+        for connection in [
+            RemoteChipConnection::Stopped,
+            RemoteChipConnection::Offline,
+            RemoteChipConnection::Connecting,
+            RemoteChipConnection::Incompatible,
+        ] {
+            app.remote_chips = vec![chip(connection, true)];
+            assert_eq!(
+                empty_fleet_blocker(&app),
+                Some(EmptyFleetBlocker::NoConnectedRemote),
+                "{connection:?} cannot receive a create"
+            );
+        }
+
+        // Connected but filtered out of view: creation resolves its target
+        // through the in-view set, so this one cannot receive it either.
+        app.remote_chips = vec![chip(RemoteChipConnection::Connected, false)];
+        assert_eq!(
+            empty_fleet_blocker(&app),
+            Some(EmptyFleetBlocker::NoConnectedRemote)
+        );
+
+        app.remote_chips = vec![chip(RemoteChipConnection::Connected, true)];
+        assert_eq!(empty_fleet_blocker(&app), None, "now the key works");
     }
 
     #[test]

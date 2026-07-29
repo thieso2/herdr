@@ -315,8 +315,21 @@ pub(crate) fn render_remote_start_overlay(
             format!("could not start it: {error}"),
             Style::default().fg(p.red),
         ),
+        // Which machine the daemon lands on is the whole question this
+        // prompt asks, so it must not name the wrong one: a local runtime
+        // starts here, by re-running this program.
+        None if prompt.local => (
+            format!(
+                "Starting one runs a {} daemon on this machine.",
+                crate::identity::BRAND
+            ),
+            Style::default().fg(p.subtext0),
+        ),
         None => (
-            "Starting one runs a herdr daemon on that machine.".to_owned(),
+            format!(
+                "Starting one runs a {} daemon on that machine.",
+                crate::identity::BRAND
+            ),
             Style::default().fg(p.subtext0),
         ),
     };
@@ -633,27 +646,46 @@ pub(crate) fn render_remote_edit_overlay(
     };
     super::widgets::render_modal_header(frame, rows[0], title, p);
 
+    // ssh is a transport, not the definition of a remote: an entry with no
+    // target is a runtime on this machine, reached over its API socket. The
+    // placeholder is where that is discoverable - the field is otherwise
+    // indistinguishable from one the user simply has not filled in yet.
     let fields = [
-        ("name", &dialog.name, rows[1], rows[2]),
-        ("ssh target", &dialog.target, rows[3], rows[4]),
-        ("session", &dialog.session, rows[5], rows[6]),
+        ("name", &dialog.name, "", rows[1], rows[2]),
+        (
+            "ssh target",
+            &dialog.target,
+            "this machine (no ssh)",
+            rows[3],
+            rows[4],
+        ),
+        ("session", &dialog.session, "", rows[5], rows[6]),
     ];
-    for (field_idx, (label, value, label_rect, input_rect)) in fields.into_iter().enumerate() {
+    for (field_idx, (label, value, placeholder, label_rect, input_rect)) in
+        fields.into_iter().enumerate()
+    {
         frame.render_widget(
             Paragraph::new(format!(" {label}")).style(Style::default().fg(p.overlay0)),
             label_rect,
         );
         let focused = dialog.focused_field == field_idx;
         let cursor = if focused { "█" } else { "" };
+        let input_style = Style::default()
+            .fg(if focused { p.text } else { p.subtext0 })
+            .bg(p.surface0);
         frame.render_widget(Clear, input_rect);
-        frame.render_widget(
-            Paragraph::new(format!(" {value}{cursor}")).style(
-                Style::default()
-                    .fg(if focused { p.text } else { p.subtext0 })
-                    .bg(p.surface0),
-            ),
-            input_rect,
-        );
+        let line = if value.is_empty() && !placeholder.is_empty() {
+            Line::from(vec![
+                Span::styled(format!(" {cursor}"), input_style),
+                Span::styled(
+                    placeholder.to_owned(),
+                    input_style.fg(p.overlay0).add_modifier(Modifier::DIM),
+                ),
+            ])
+        } else {
+            Line::from(Span::styled(format!(" {value}{cursor}"), input_style))
+        };
+        frame.render_widget(Paragraph::new(line).style(input_style), input_rect);
     }
 
     if let Some(error) = &dialog.error {
@@ -663,10 +695,14 @@ pub(crate) fn render_remote_edit_overlay(
                 .wrap(Wrap { trim: false }),
             rows[7],
         );
-    } else if dialog.is_edit() {
+    } else {
+        let hint = if dialog.is_edit() {
+            " ctrl-d removes this remote"
+        } else {
+            " leave ssh target blank for a local runtime"
+        };
         frame.render_widget(
-            Paragraph::new(" ctrl-d removes this remote")
-                .style(Style::default().fg(p.overlay0).add_modifier(Modifier::DIM)),
+            Paragraph::new(hint).style(Style::default().fg(p.overlay0).add_modifier(Modifier::DIM)),
             rows[7],
         );
     }

@@ -94,6 +94,10 @@ session = "default"
 
 Because a local entry names its own session, two local entries that differ only by session are two independent runtimes with their own servers and their own state. An empty `target = ""` is rejected rather than treated as local — omit the key instead.
 
+A local entry with no server listening on its session socket shows as **stopped**, exactly like an SSH remote whose host has no server, and offers the same start prompt. Starting one re-executes the binary you are already running, with the session named in the child's environment — there is no transport in the way and no second `herdr` to resolve, so a local runtime always comes up on the same build as the client that asked for it. Nothing starts on its own: a server outlives the client that spawns it, so it stays an explicit answer.
+
+The add-remote dialog writes both kinds. Open it from the remotes header menu (`prefix+shift+m`, or click the header) or from the global menu (`prefix+m`), then **leave the ssh target field blank** for a local runtime; the field shows `this machine (no ssh)` while it is empty. SSH is only the transport for entries that need one.
+
 `herdr remote upgrade` skips local entries: they have no SSH target, and this machine's binary rolls forward with `herdr update`.
 
 ### Saved fleet remotes

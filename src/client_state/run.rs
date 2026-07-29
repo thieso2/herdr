@@ -87,6 +87,11 @@ pub(crate) fn pure_client_enabled(config: &crate::config::Config) -> bool {
 const CHIP_DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(350);
 /// How long a chip status flash (refused toggle) stays visible.
 const STATUS_FLASH_TTL: Duration = Duration::from_millis(2500);
+/// How long a local runtime waits for the server it just spawned to bind its
+/// socket. Shorter than the launch path's budget: a fleet member that is slow
+/// to come up should keep spinning its own chip and retry on backoff rather
+/// than hold its connect thread for the full launch timeout.
+const LOCAL_SERVER_READY_TIMEOUT: Duration = Duration::from_secs(10);
 /// Handshake deadline for a fleet remote's `session.hello` answer, matching
 /// the fleet manager's tuning. A watchdog kills the bridge child at the
 /// deadline so the connect thread's blocking read always returns.
@@ -267,6 +272,9 @@ enum ConnectOutcome {
         remedy: HelloRemedy,
         message: String,
     },
+    /// This machine has no server for the entry's session. Parks the runtime
+    /// as stopped rather than retrying: only an explicit start changes it.
+    Stopped,
     Failed(String),
 }
 
@@ -342,6 +350,38 @@ fn fresh_session(writer: SessionWriter, guard: Option<BridgeChild>, generation: 
     }
 }
 
+/// Whether a failed local connect means "no server for this session" rather
+/// than a genuine fault.
+///
+/// A missing socket file is a session that has never run; a refused connect
+/// is a stale socket left by one that has. Anything else - a permission
+/// problem, an unexpected kernel error - is a real failure and keeps the
+/// retry ladder, because an explicit start would not fix it.
+fn local_server_is_stopped(err: &std::io::Error) -> bool {
+    matches!(
+        err.kind(),
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+    )
+}
+
+/// Starts this machine's server for `session` and waits for its socket.
+///
+/// Only ever reached from the start prompt. A local runtime is this machine:
+/// there is no transport to reach it over and no second binary to resolve,
+/// so starting it is a fork and exec of the program the user is already
+/// running, with the session named in the child's environment.
+fn start_local_server(session: &str) -> Result<(), String> {
+    let socket_path = if session == crate::session::DEFAULT_SESSION_NAME {
+        crate::api::socket_path()
+    } else {
+        crate::session::api_socket_path_for(Some(session))
+    };
+    crate::server::autodetect::spawn_server_daemon_for_session(session)
+        .map_err(|err| err.to_string())?;
+    crate::server::autodetect::wait_for_server_socket(&socket_path, LOCAL_SERVER_READY_TIMEOUT)
+        .map_err(|err| err.to_string())
+}
+
 /// Connects to the local API socket and negotiates a catalog session.
 fn connect(session: &str) -> ConnectOutcome {
     // A local runtime names its session like any other fleet entry, so two
@@ -355,6 +395,13 @@ fn connect(session: &str) -> ConnectOutcome {
     };
     let mut stream = match crate::ipc::connect_local_stream(&socket_path) {
         Ok(stream) => stream,
+        // Nobody listening on this session's socket is not an outage to
+        // retry: this machine is plainly reachable, it simply has no server
+        // for this session. That is the same fact `Stopped` already carries
+        // for an ssh remote, and it must stay an explicit start - a local
+        // server outlives the client that spawns it, so it never happens
+        // behind the user's back.
+        Err(err) if local_server_is_stopped(&err) => return ConnectOutcome::Stopped,
         Err(err) => return ConnectOutcome::Failed(format!("api socket unreachable: {err}")),
     };
     if let Err(err) = stream
@@ -1151,7 +1198,12 @@ fn establish_local(
     // config puts it, and carries its own session.
     let remote = descriptor.index;
     let session = descriptor.session.clone();
-    std::thread::spawn(move || local_connect_and_read(remote, &session, generation, tx, quit));
+    // Carried for the stopped status line, which names the runtime the way
+    // the user does rather than by index.
+    let name = descriptor.name.clone();
+    std::thread::spawn(move || {
+        local_connect_and_read(remote, &session, &name, generation, tx, quit)
+    });
     Link::Pending { generation }
 }
 
@@ -1161,6 +1213,7 @@ fn establish_local(
 fn local_connect_and_read(
     remote: usize,
     session_name: &str,
+    display_name: &str,
     generation: u64,
     event_tx: mpsc::SyncSender<LoopEvent>,
     should_quit: Arc<AtomicBool>,
@@ -1191,6 +1244,11 @@ fn local_connect_and_read(
         }
         ConnectOutcome::Incompatible { remedy, message } => {
             RemoteEstablished::Incompatible { remedy, message }
+        }
+        // The same status line an ssh remote with no server gets: the
+        // difference is only in how it is started, not in what it is.
+        ConnectOutcome::Stopped => {
+            RemoteEstablished::Stopped(crate::fleet::connection::stopped_status_line(display_name))
         }
         ConnectOutcome::Failed(error) => RemoteEstablished::Failed(error),
     };
@@ -1382,6 +1440,7 @@ fn handle_established(
                 status,
                 error: None,
                 starting: false,
+                local: is_local,
             });
             ctx.links.insert(remote, Link::Stopped);
         }
@@ -1724,6 +1783,13 @@ fn socket_reader_loop(
 /// Applies one server frame to its remote's mirror.
 fn handle_server_frame(remote: usize, frame: Frame, ctx: &mut LoopCtx<'_>) {
     let scrollback_limit = ctx.scrollback_limit;
+    // Read before the mirror borrow: an announced stop opens the start
+    // prompt, and how that runtime is started follows its transport.
+    let is_local = ctx
+        .descriptors
+        .iter()
+        .find(|descriptor| descriptor.index == remote)
+        .is_none_or(|descriptor| descriptor.target.is_none());
     let Some(mirror) = ctx.mirrors.get_mut(remote) else {
         return;
     };
@@ -1879,6 +1945,7 @@ fn handle_server_frame(remote: usize, frame: Frame, ctx: &mut LoopCtx<'_>) {
                             status,
                             error: None,
                             starting: false,
+                            local: is_local,
                         });
                         ctx.links.insert(remote, Link::Stopped);
                     }
@@ -2413,6 +2480,7 @@ fn start_or_stop_listed_remote(name: &str, ctx: &mut LoopCtx<'_>) {
             status: crate::fleet::connection::stopped_status_line(&descriptor.name),
             error: None,
             starting: false,
+            local: descriptor.target.is_none(),
         });
     }
 }
@@ -2470,11 +2538,7 @@ fn start_stopped_remote(ctx: &mut LoopCtx<'_>) {
         ctx.chrome.remote_start = None;
         return;
     };
-    // A local runtime has no remote daemon to start.
-    let Some(target) = descriptor.target.clone() else {
-        ctx.chrome.remote_start = None;
-        return;
-    };
+    let target = descriptor.target.clone();
     let session = descriptor.session.clone();
     // The same binary this remote connects with: starting a different one is
     // how a host ends up serving a version nobody asked for.
@@ -2489,7 +2553,14 @@ fn start_stopped_remote(ctx: &mut LoopCtx<'_>) {
     }
     let tx = ctx.event_tx.clone();
     std::thread::spawn(move || {
-        let result = crate::fleet::bridge_child::start_remote_server(&target, &session, &program);
+        // A local runtime is started by re-executing this binary; only an
+        // entry with a target needs a bridge to carry the start across.
+        let result = match target {
+            Some(target) => {
+                crate::fleet::bridge_child::start_remote_server(&target, &session, &program)
+            }
+            None => start_local_server(&session),
+        };
         let _ = tx.send(LoopEvent::RemoteStarted(remote, result));
     });
 }
@@ -3317,6 +3388,7 @@ fn handle_chip_click(
                         status,
                         error: None,
                         starting: false,
+                        local: descriptor.target.is_none(),
                     });
                     return;
                 }
@@ -4252,6 +4324,50 @@ mod tests {
         });
     }
 
+    /// A local runtime with no server for its session is *stopped*, not
+    /// broken and not something to start behind the user's back: this
+    /// machine is plainly reachable, it just has nothing running. It parks
+    /// on the same terminal link an ssh remote gets and offers the same
+    /// prompt — flagged local, because the start is a fork and exec of this
+    /// binary rather than a daemon written to another host.
+    #[tokio::test]
+    async fn a_local_runtime_with_no_server_is_stopped_and_never_starts_itself() {
+        // Nobody listening is stopped; a real fault keeps the retry ladder,
+        // because starting a server would not fix it.
+        for kind in [
+            std::io::ErrorKind::NotFound,
+            std::io::ErrorKind::ConnectionRefused,
+        ] {
+            assert!(local_server_is_stopped(&std::io::Error::new(kind, "x")));
+        }
+        for kind in [
+            std::io::ErrorKind::PermissionDenied,
+            std::io::ErrorKind::TimedOut,
+        ] {
+            assert!(!local_server_is_stopped(&std::io::Error::new(kind, "x")));
+        }
+
+        with_test_ctx(three_descriptors(), |ctx| {
+            // Descriptor 0 is the target-less local entry.
+            ctx.links.insert(0, Link::Pending { generation: 1 });
+            handle_established(
+                0,
+                1,
+                RemoteEstablished::Stopped(crate::fleet::connection::stopped_status_line("local")),
+                ctx,
+            );
+
+            assert!(
+                matches!(ctx.links.get(&0), Some(Link::Stopped)),
+                "a stopped local runtime must not be scheduled for retry"
+            );
+            let prompt = ctx.chrome.remote_start.as_ref().expect("start prompt");
+            assert_eq!(prompt.remote, 0);
+            assert!(prompt.local, "the prompt must name this machine");
+            assert!(!prompt.starting, "nothing starts without an answer");
+        });
+    }
+
     fn server_stopping_frame(reason: &str) -> Frame {
         let payload = serde_json::to_vec(&serde_json::json!({
             "event": SERVER_STOPPING_EVENT,
@@ -4421,6 +4537,7 @@ mod tests {
                 status: "no server".into(),
                 error: None,
                 starting: false,
+                local: false,
             });
             // A chip right-click would normally open the edit dialog; while
             // the prompt is open `handle_mouse` routes to the prompt alone,

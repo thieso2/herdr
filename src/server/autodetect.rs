@@ -220,6 +220,61 @@ pub fn spawn_server_daemon() -> io::Result<u32> {
     Ok(pid)
 }
 
+/// Spawns a server daemon for one named session by re-executing this binary.
+///
+/// A local fleet runtime is this machine: there is no transport to reach it
+/// over and no second binary to resolve, so "start its server" is a fork and
+/// exec of `current_exe()` with the session named in the child's
+/// environment. That is the same program the user already launched, which is
+/// also what makes it correct — a runtime this build talks to is started by
+/// this build, never by some other `herdr` that happens to be on `PATH`.
+///
+/// Unlike [`spawn_server_daemon`], the session is explicit rather than
+/// ambient, so the child never inherits this process's socket paths: those
+/// point at *our* session's sockets.
+// Consumed only by the unix-only pure-client fleet path; the function itself
+// is platform-neutral, so it is gated by `allow` rather than `cfg`.
+#[cfg_attr(windows, allow(dead_code))]
+pub fn spawn_server_daemon_for_session(session: &str) -> io::Result<u32> {
+    let exe = std::env::current_exe().map_err(|err| {
+        io::Error::new(
+            err.kind(),
+            format!("failed to determine herdr executable path: {err}"),
+        )
+    })?;
+
+    info!(exe = %exe.display(), session, "spawning server daemon for session");
+
+    let mut command = build_server_daemon_command_for_session(exe, session);
+
+    let child = command.spawn().map_err(|err: io::Error| {
+        io::Error::new(err.kind(), format!("failed to spawn herdr server: {err}"))
+    })?;
+
+    let pid = child.id();
+    info!(pid, session, "server daemon spawned");
+
+    Ok(pid)
+}
+
+/// [`build_server_daemon_command`] with the session named outright.
+///
+/// Every socket override this process carries is dropped: they name *our*
+/// session's sockets, and the child must derive its own from its name.
+#[cfg_attr(windows, allow(dead_code))]
+fn build_server_daemon_command_for_session(exe: PathBuf, session: &str) -> Command {
+    let mut command = build_server_daemon_command(exe);
+    if session == crate::session::DEFAULT_SESSION_NAME {
+        command.env_remove(crate::session::SESSION_ENV_VAR);
+    } else {
+        command.env(crate::session::SESSION_ENV_VAR, session);
+    }
+    command
+        .env_remove(crate::api::SOCKET_PATH_ENV_VAR)
+        .env_remove("HERDR_CLIENT_SOCKET_PATH");
+    command
+}
+
 fn build_server_daemon_command(exe: PathBuf) -> Command {
     let mut command = Command::new(&exe);
     command
@@ -376,6 +431,50 @@ mod tests {
         std::env::remove_var(crate::api::SOCKET_PATH_ENV_VAR);
         std::env::remove_var("HERDR_CLIENT_SOCKET_PATH");
         std::env::remove_var(crate::session::SESSION_ENV_VAR);
+        crate::session::clear_explicit_session_for_test();
+    }
+
+    /// A local fleet runtime is started by re-executing this binary, so the
+    /// only thing that decides *which* runtime comes up is the child's
+    /// environment: its session name, and the absence of the socket paths
+    /// that name ours.
+    #[test]
+    fn session_server_daemon_command_names_its_session_and_drops_our_sockets() {
+        let _guard = env_lock().lock().unwrap();
+        std::env::set_var(crate::api::SOCKET_PATH_ENV_VAR, "/tmp/inherited.sock");
+        std::env::set_var("HERDR_CLIENT_SOCKET_PATH", "/tmp/inherited-client.sock");
+        std::env::remove_var(crate::session::SESSION_ENV_VAR);
+        crate::session::clear_explicit_session_for_test();
+
+        let command =
+            build_server_daemon_command_for_session(PathBuf::from("/tmp/herdr-test"), "scratch");
+        let envs: Vec<_> = command.get_envs().collect();
+        assert!(envs.iter().any(|(key, value)| {
+            *key == OsStr::new(crate::session::SESSION_ENV_VAR)
+                && value == &Some(OsStr::new("scratch"))
+        }));
+        // Inherited overrides point at *our* session's sockets; a child that
+        // kept them would bind the wrong runtime.
+        for var in [crate::api::SOCKET_PATH_ENV_VAR, "HERDR_CLIENT_SOCKET_PATH"] {
+            assert!(
+                envs.iter()
+                    .any(|(key, value)| *key == OsStr::new(var) && value.is_none()),
+                "{var} must be cleared"
+            );
+        }
+
+        // The default session is named by *absence*: `HERDR_SESSION=default`
+        // and no variable at all resolve to the same paths, and the unset
+        // form is the one the rest of the code writes.
+        let command =
+            build_server_daemon_command_for_session(PathBuf::from("/tmp/herdr-test"), "default");
+        let envs: Vec<_> = command.get_envs().collect();
+        assert!(envs.iter().any(|(key, value)| {
+            *key == OsStr::new(crate::session::SESSION_ENV_VAR) && value.is_none()
+        }));
+
+        std::env::remove_var(crate::api::SOCKET_PATH_ENV_VAR);
+        std::env::remove_var("HERDR_CLIENT_SOCKET_PATH");
         crate::session::clear_explicit_session_for_test();
     }
 

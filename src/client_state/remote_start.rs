@@ -29,6 +29,11 @@ pub(crate) struct RemoteStartPrompt {
     /// A start is in flight. The prompt stays open and refuses a second
     /// approval, so an impatient double-press cannot spawn two daemons.
     pub(crate) starting: bool,
+    /// Whether this runtime is on this machine. Only the wording differs -
+    /// a local start is a fork and exec of this binary, not a daemon
+    /// written to someone else's host - but that is the whole reason the
+    /// prompt exists, so it must not claim the wrong machine.
+    pub(crate) local: bool,
 }
 
 /// What a key did to the prompt.
@@ -83,6 +88,7 @@ mod tests {
 
     fn prompt(starting: bool) -> RemoteStartPrompt {
         RemoteStartPrompt {
+            local: false,
             remote: 1,
             name: "gpu-1".into(),
             status: "no server running".into(),

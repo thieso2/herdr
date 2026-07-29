@@ -11,6 +11,9 @@
 - `terminal attach`, `agent attach`, and `terminal session control|observe` now speak the framed runtime protocol on the API socket, streaming the pane snapshot and raw output tail instead of server-rendered frames. Writable attach ownership is a pane write grant that reports `pane_write_locked` instead of dropping the connection; `--takeover` revokes the previous holder without disturbing its connection. Older servers keep working through the previous attach path.
 
 ### Fixed
+- A local fleet runtime with no server for its session now reports as stopped and can be started from the same prompt an SSH remote uses; the start re-executes the running binary rather than resolving a second one. Previously it retried as an outage forever: only the launch session's server was ever started, and a local entry naming another session had no start path at all.
+- Sidebar section menus (remotes, spaces, agents) now open in the fleet client when no workspaces exist. A recompose treated every context menu as workspace-targeted and dropped it before it was drawn, so on a fresh install with an empty fleet the section headers did not respond to clicks at all — including the remotes header that holds "add remote".
+- The add-remote dialog now says an empty ssh target means a local runtime on this machine, instead of leaving the only no-SSH path in the config file.
 - `ui.copy_on_select = false` now retains drag and double-click word selections without copying; `Ctrl+C`, or `Cmd+C` when the host terminal forwards it, copies and clears the selection.
 - Pane and agent read responses now report `truncated: true` when older terminal rows were omitted. (#1717)
 - Pane applications that query OSC 4 palette colors now inherit the host terminal palette. (#1752)
